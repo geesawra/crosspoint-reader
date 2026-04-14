@@ -2,12 +2,22 @@
 
 #include <HalStorage.h>
 
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "CssStyle.h"
+
+/**
+ * Index entry for lazy CSS rule loading.
+ * Maps a selector hash to its file offset in the cache.
+ */
+struct CssIndexEntry {
+  uint32_t selectorHash;
+  uint32_t fileOffset;
+};
 
 /**
  * Lightweight CSS parser for EPUB stylesheets
@@ -31,10 +41,10 @@
 class CssParser {
  public:
   // Bump when CSS cache format or rules change; section caches are invalidated when this changes
-  static constexpr uint8_t CSS_CACHE_VERSION = 4;
+  static constexpr uint8_t CSS_CACHE_VERSION = 5;
 
   explicit CssParser(std::string cachePath) : cachePath(std::move(cachePath)) {}
-  ~CssParser() = default;
+  ~CssParser() { clear(); }
 
   // Non-copyable
   CssParser(const CssParser&) = delete;
@@ -66,19 +76,19 @@ class CssParser {
   [[nodiscard]] static CssStyle parseInlineStyle(const std::string& styleValue);
 
   /**
-   * Check if any rules have been loaded
+   * Check if any rules have been loaded (includes indexed rules)
    */
-  [[nodiscard]] bool empty() const { return rulesBySelector_.empty(); }
+  [[nodiscard]] bool empty() const { return rulesBySelector_.empty() && index_.empty(); }
 
   /**
-   * Get count of loaded rule sets
+   * Get count of loaded rule sets (includes indexed rules)
    */
-  [[nodiscard]] size_t ruleCount() const { return rulesBySelector_.size(); }
+  [[nodiscard]] size_t ruleCount() const { return index_.empty() ? rulesBySelector_.size() : index_.size(); }
 
   /**
-   * Clear all loaded rules
+   * Clear all loaded rules and close cache file
    */
-  void clear() { rulesBySelector_.clear(); }
+  void clear();
 
   /**
    * Check if CSS rules cache file exists
@@ -105,9 +115,32 @@ class CssParser {
 
  private:
   // Storage: maps normalized selector -> style properties
+  // In lazy mode, this is only used during initial parsing before cache is written
   std::unordered_map<std::string, CssStyle> rulesBySelector_;
 
   std::string cachePath;
+
+  // Index-based lazy loading (version 5+ cache format)
+  std::vector<CssIndexEntry> index_;          // Sorted by selectorHash for binary search
+  mutable FsFile cacheFile_;                  // Kept open for random-access reads
+  mutable uint32_t rulesDataOffset_ = 0;      // Offset to rules data section in cache file
+
+  // LRU cache for frequently accessed rules
+  static constexpr size_t LRU_CAPACITY = 256;
+  struct LruEntry {
+    std::string selector;
+    CssStyle style;
+    uint32_t lastAccess = 0;
+  };
+  mutable std::vector<LruEntry> lruCache_;
+  mutable uint32_t accessCounter_ = 0;
+
+  // Lazy loading helpers
+  [[nodiscard]] static uint32_t hashSelector(const std::string& selector);
+  [[nodiscard]] CssStyle* lruLookup(const std::string& selector) const;
+  void lruInsert(const std::string& selector, const CssStyle& style) const;
+  [[nodiscard]] std::optional<CssStyle> loadRuleBySelector(const std::string& selector) const;
+  void prewarmCommonSelectors();
 
   // Internal parsing helpers
   void processRuleBlockWithStyle(const std::string& selectorGroup, const CssStyle& style);
