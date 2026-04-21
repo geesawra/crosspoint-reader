@@ -69,9 +69,10 @@ void InstapaperFolderActivity::render(RenderLock&&) {
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_INSTAPAPER));
 
   if (state == NO_TOKENS) {
-    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 20, tr(STR_INSTAPAPER_NO_TOKENS), true,
+    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 40, tr(STR_INSTAPAPER_NO_TOKENS), true,
                               EpdFontFamily::BOLD);
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 10, tr(STR_INSTAPAPER_TOKENS_HINT));
+    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 5, tr(STR_INSTAPAPER_TOKENS_HINT));
+    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 20, tr(STR_INSTAPAPER_TOKENS_PATH));
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     renderer.displayBuffer();

@@ -182,9 +182,10 @@ void InstapaperActionsActivity::render(RenderLock&&) {
   }
 
   if (state == FAILED) {
-    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 20, tr(STR_INSTAPAPER_AUTH_FAILED), true,
+    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 30, tr(STR_INSTAPAPER_AUTH_FAILED), true,
                               EpdFontFamily::BOLD);
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 10, message.c_str());
+    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_INSTAPAPER_AUTH_HINT));
+    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 25, message.c_str());
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     renderer.displayBuffer();

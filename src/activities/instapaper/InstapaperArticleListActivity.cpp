@@ -6,7 +6,6 @@
 #include <InstapaperStateCache.h>
 #include <Logging.h>
 #include <WiFi.h>
-#include <esp_sntp.h>
 #include <time.h>
 
 #include "InstapaperActionsActivity.h"
@@ -19,30 +18,6 @@
 
 namespace {
 constexpr int LIST_LIMIT = 50;
-
-// OAuth 1.0a requires a reasonably accurate timestamp. The ESP32-C3 has no
-// battery-backed RTC, so after a cold boot the clock sits at epoch 0 until
-// NTP syncs it. Block briefly the first time we come online.
-void syncTimeOnce() {
-  if (::time(nullptr) > 1600000000) {
-    return;  // already synced (post-2020)
-  }
-  if (esp_sntp_enabled()) {
-    esp_sntp_stop();
-  }
-  esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
-  esp_sntp_setservername(0, "pool.ntp.org");
-  esp_sntp_init();
-  for (int i = 0; i < 50; i++) {  // ~5 s max
-    if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) break;
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-  }
-  if (::time(nullptr) < 1600000000) {
-    LOG_ERR("INSTA", "NTP sync timed out; OAuth signatures may be rejected");
-  } else {
-    LOG_DBG("INSTA", "NTP synced, epoch=%lld", static_cast<long long>(::time(nullptr)));
-  }
-}
 
 const char* folderLabelKey(InstapaperFolder f) {
   switch (f) {
@@ -106,8 +81,6 @@ void InstapaperArticleListActivity::performFetch() {
     state = FETCHING;
   }
   requestUpdateAndWait();
-
-  syncTimeOnce();
 
   std::vector<InstapaperArticle> fresh;
   const auto r = InstapaperClient::listBookmarks(folder, LIST_LIMIT, fresh);
@@ -239,9 +212,10 @@ void InstapaperArticleListActivity::render(RenderLock&&) {
   }
 
   if (state == FETCH_FAILED) {
-    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 20, tr(STR_INSTAPAPER_AUTH_FAILED), true,
+    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 30, tr(STR_INSTAPAPER_AUTH_FAILED), true,
                               EpdFontFamily::BOLD);
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 10, errorMessage.c_str());
+    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_INSTAPAPER_AUTH_HINT));
+    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 25, errorMessage.c_str());
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     renderer.displayBuffer();

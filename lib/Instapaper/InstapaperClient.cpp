@@ -5,6 +5,8 @@
 #include <Logging.h>
 #include <NetworkClientSecure.h>
 #include <WiFi.h>
+#include <esp_sntp.h>
+#include <time.h>
 
 #include <cstdio>
 #include <cstring>
@@ -23,6 +25,29 @@ constexpr char URL_UNSTAR[] = "https://www.instapaper.com/api/1/bookmarks/unstar
 constexpr char URL_ARCHIVE[] = "https://www.instapaper.com/api/1/bookmarks/archive";
 constexpr char URL_UNARCHIVE[] = "https://www.instapaper.com/api/1/bookmarks/unarchive";
 constexpr char URL_DELETE[] = "https://www.instapaper.com/api/1/bookmarks/delete";
+
+// OAuth 1.0a signatures embed a unix timestamp; Instapaper rejects anything
+// more than ~5 minutes off. The ESP32-C3 has no RTC so time() is 0 until NTP
+// syncs. Every signed call flows through signedPost(), so gating sync here
+// catches every entry point (listBookmarks, getText, star/archive/…).
+void ensureTimeSynced() {
+  if (::time(nullptr) > 1600000000) return;  // post-2020 = synced
+  if (esp_sntp_enabled()) {
+    esp_sntp_stop();
+  }
+  esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+  esp_sntp_setservername(0, "pool.ntp.org");
+  esp_sntp_init();
+  for (int i = 0; i < 50; i++) {  // ~5 s max
+    if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) break;
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+  if (::time(nullptr) < 1600000000) {
+    LOG_ERR("INSTA", "NTP sync timed out; OAuth signatures may be rejected");
+  } else {
+    LOG_DBG("INSTA", "NTP synced, epoch=%lld", static_cast<long long>(::time(nullptr)));
+  }
+}
 
 const char* folderId(InstapaperFolder f) {
   switch (f) {
@@ -56,6 +81,8 @@ int signedPost(const char* url, const std::vector<OAuth1Signer::Param>& bodyPara
   if (!INSTAPAPER_TOKENS.hasTokens()) {
     return -1;
   }
+
+  ensureTimeSynced();
 
   const std::string authHeader = OAuth1Signer::buildAuthHeader(
       "POST", url, bodyParams, INSTAPAPER_TOKENS.getConsumerKey().c_str(),
@@ -105,6 +132,8 @@ int signedPostStreaming(const char* url, const std::vector<OAuth1Signer::Param>&
   if (!INSTAPAPER_TOKENS.hasTokens()) {
     return -1;
   }
+
+  ensureTimeSynced();
 
   const std::string authHeader = OAuth1Signer::buildAuthHeader(
       "POST", url, bodyParams, INSTAPAPER_TOKENS.getConsumerKey().c_str(),

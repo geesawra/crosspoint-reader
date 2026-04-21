@@ -140,9 +140,10 @@ void InstapaperFetchActivity::render(RenderLock&&) {
     std::snprintf(pctStr, sizeof(pctStr), "%d%%", buildPercent);
     renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 40, pctStr);
   } else if (state == FAILED) {
-    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 20, tr(STR_INSTAPAPER_AUTH_FAILED), true,
+    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 30, tr(STR_INSTAPAPER_AUTH_FAILED), true,
                               EpdFontFamily::BOLD);
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 10, errorMessage.c_str());
+    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_INSTAPAPER_AUTH_HINT));
+    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 25, errorMessage.c_str());
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
