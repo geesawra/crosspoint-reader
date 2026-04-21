@@ -159,14 +159,18 @@ void InstapaperArticleListActivity::loop() {
   }
   if (state != SHOWING_LIST) return;
 
-  buttonNavigator.onNext([this] {
+  // Nav uses Up/Down only — NOT ButtonNavigator's Up/Left/Down/Right, because
+  // Left and Right are bound to per-article actions and bulk-download here.
+  if (mappedInput.wasPressed(MappedInputManager::Button::Down)) {
     selectedIndex = ButtonNavigator::nextIndex(selectedIndex, static_cast<int>(articles.size()));
     requestUpdate();
-  });
-  buttonNavigator.onPrevious([this] {
+    return;
+  }
+  if (mappedInput.wasPressed(MappedInputManager::Button::Up)) {
     selectedIndex = ButtonNavigator::previousIndex(selectedIndex, static_cast<int>(articles.size()));
     requestUpdate();
-  });
+    return;
+  }
   if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
     openSelected();
     return;
@@ -175,12 +179,19 @@ void InstapaperArticleListActivity::loop() {
   // Left: per-article actions menu (star/archive/delete).
   if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
     if (articles.empty()) return;
+    const int savedIndex = selectedIndex;
     const InstapaperArticle a = articles[selectedIndex];
     startActivityForResult(std::make_unique<InstapaperActionsActivity>(renderer, mappedInput, a, folder),
-                           [this](const ActivityResult& r) {
-                             (void)r;
-                             // Always refetch on return — the list may have changed (star, archive, delete).
-                             performFetch();
+                           [this, savedIndex](const ActivityResult& r) {
+                             const bool changed = !r.isCancelled;
+                             if (changed) {
+                               // Article may have moved folders — refetch, keep index within bounds.
+                               performFetch();
+                             } else {
+                               // Cancelled: restore the cursor exactly and just redraw.
+                               selectedIndex = savedIndex;
+                               requestUpdate();
+                             }
                            });
     return;
   }
@@ -254,7 +265,7 @@ void InstapaperArticleListActivity::render(RenderLock&&) {
       [this](int index) { return std::string(articles[index].domain); }, nullptr);
 
   const auto labels =
-      mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_INSTAPAPER_ACTIONS), tr(STR_INSTAPAPER_DOWNLOAD_ALL));
+      mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_INSTAPAPER_ACTIONS), tr(STR_INSTAPAPER_GET_ALL));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer();
 }
