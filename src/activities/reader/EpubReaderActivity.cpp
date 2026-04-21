@@ -757,6 +757,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     // Step 2: Re-render with images and display again (images appear clean)
     int16_t imgX, imgY, imgW, imgH;
     if (page->getImageBoundingBox(imgX, imgY, imgW, imgH)) {
+      LOG_DBG("ERS", "Refresh: image-page double-FAST");
       renderer.fillRect(imgX + orientedMarginLeft, imgY + orientedMarginTop, imgW, imgH, false);
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 
@@ -765,10 +766,13 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
     } else {
+      LOG_DBG("ERS", "Refresh: AA-with-images-no-bbox HALF");
       renderer.displayBuffer(HalDisplay::HALF_REFRESH);
     }
     // Double FAST_REFRESH handles ghosting for image pages; don't count toward full refresh cadence
   } else {
+    LOG_DBG("ERS", "Refresh: cycle (counter=%d hasImages=%d AA=%d)", pagesUntilFullRefresh,
+            page->hasImages() ? 1 : 0, SETTINGS.textAntiAliasing ? 1 : 0);
     ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
   }
   const auto tDisplay = millis();
