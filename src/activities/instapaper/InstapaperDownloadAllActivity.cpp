@@ -6,10 +6,12 @@
 #include <InstapaperClient.h>
 #include <InstapaperEpubBuilder.h>
 #include <Logging.h>
+#include <WiFi.h>
 
 #include <cstdio>
 
 #include "MappedInputManager.h"
+#include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -19,6 +21,28 @@ void InstapaperDownloadAllActivity::onEnter() {
   skipped = 0;
   failed = 0;
   cancelRequested = false;
+
+  // WiFi is mandatory here — launching straight into getText() without it
+  // triggers a null-mutex assert deep in lwIP because the TCPIP core lock is
+  // only initialized on the first WiFi.begin().
+  if (WiFi.status() != WL_CONNECTED) {
+    state = WIFI_SELECTION;
+    requestUpdate();
+    startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
+                           [this](const ActivityResult& r) { onWifiSelectionComplete(!r.isCancelled); });
+    return;
+  }
+
+  state = RUNNING;
+  requestUpdate();
+  performDownloads();
+}
+
+void InstapaperDownloadAllActivity::onWifiSelectionComplete(bool success) {
+  if (!success) {
+    finish();
+    return;
+  }
   state = RUNNING;
   requestUpdate();
   performDownloads();
@@ -97,7 +121,9 @@ void InstapaperDownloadAllActivity::render(RenderLock&&) {
   const int total = static_cast<int>(articles.size());
 
   char status[64];
-  if (state == RUNNING) {
+  if (state == WIFI_SELECTION) {
+    std::snprintf(status, sizeof(status), "Waiting for WiFi...");
+  } else if (state == RUNNING) {
     std::snprintf(status, sizeof(status), "%d / %d", completed, total);
   } else if (state == DONE) {
     std::snprintf(status, sizeof(status), "Done: %d OK, %d skipped, %d failed", completed - failed - skipped, skipped,

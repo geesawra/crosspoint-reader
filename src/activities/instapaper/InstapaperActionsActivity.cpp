@@ -5,8 +5,10 @@
 #include <I18n.h>
 #include <InstapaperEpubBuilder.h>
 #include <Logging.h>
+#include <WiFi.h>
 
 #include "MappedInputManager.h"
+#include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -52,6 +54,19 @@ const char* InstapaperActionsActivity::labelFor(Action a) const {
 }
 
 void InstapaperActionsActivity::runSelectedAction() {
+  // Same guard as the other network activities — starting a signed POST
+  // without lwIP up faults inside ESP-IDF.
+  if (WiFi.status() != WL_CONNECTED) {
+    {
+      RenderLock lock(*this);
+      state = WIFI_SELECTION;
+    }
+    requestUpdate();
+    startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
+                           [this](const ActivityResult& r) { onWifiSelectionComplete(!r.isCancelled); });
+    return;
+  }
+
   {
     RenderLock lock(*this);
     state = RUNNING;
@@ -99,6 +114,16 @@ void InstapaperActionsActivity::runSelectedAction() {
   requestUpdate(true);
 }
 
+void InstapaperActionsActivity::onWifiSelectionComplete(bool success) {
+  if (!success) {
+    RenderLock lock(*this);
+    state = MENU;
+    requestUpdate();
+    return;
+  }
+  runSelectedAction();
+}
+
 void InstapaperActionsActivity::loop() {
   if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
     finish();
@@ -141,7 +166,7 @@ void InstapaperActionsActivity::render(RenderLock&&) {
 
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, article.title);
 
-  if (state == RUNNING) {
+  if (state == RUNNING || state == WIFI_SELECTION) {
     renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2, labelFor(actions[selectedIndex]), true,
                               EpdFontFamily::BOLD);
     renderer.displayBuffer();

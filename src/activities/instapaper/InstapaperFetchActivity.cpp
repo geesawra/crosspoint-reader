@@ -6,8 +6,10 @@
 #include <InstapaperClient.h>
 #include <InstapaperEpubBuilder.h>
 #include <Logging.h>
+#include <WiFi.h>
 
 #include "MappedInputManager.h"
+#include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -23,6 +25,27 @@ void InstapaperFetchActivity::onEnter() {
     return;
   }
 
+  // Network work ahead — require WiFi. Without it, the lwIP core mutex may
+  // not be initialized yet (cached-list path lets the user reach here
+  // offline), and any DNS lookup would assert inside lwIP.
+  if (WiFi.status() != WL_CONNECTED) {
+    state = WIFI_SELECTION;
+    requestUpdate();
+    startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
+                           [this](const ActivityResult& r) { onWifiSelectionComplete(!r.isCancelled); });
+    return;
+  }
+
+  state = FETCHING_TEXT;
+  requestUpdate();
+  performWork();
+}
+
+void InstapaperFetchActivity::onWifiSelectionComplete(bool success) {
+  if (!success) {
+    finish();
+    return;
+  }
   state = FETCHING_TEXT;
   requestUpdate();
   performWork();
@@ -99,7 +122,9 @@ void InstapaperFetchActivity::render(RenderLock&&) {
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
 
-  if (state == FETCHING_TEXT) {
+  if (state == WIFI_SELECTION) {
+    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2, tr(STR_INSTAPAPER_FETCHING), true, EpdFontFamily::BOLD);
+  } else if (state == FETCHING_TEXT) {
     renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2, tr(STR_INSTAPAPER_FETCHING), true, EpdFontFamily::BOLD);
   } else if (state == BUILDING_EPUB) {
     // Phase label, then centered progress bar. A static "Building EPUB..."

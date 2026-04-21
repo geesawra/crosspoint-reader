@@ -27,6 +27,7 @@ class InstapaperDownloadAllActivity final : public Activity {
 
  private:
   enum State : uint8_t {
+    WIFI_SELECTION,
     RUNNING,
     DONE,
     CANCELLED,
@@ -40,4 +41,5 @@ class InstapaperDownloadAllActivity final : public Activity {
   int failed = 0;
 
   void performDownloads();
+  void onWifiSelectionComplete(bool success);
 };

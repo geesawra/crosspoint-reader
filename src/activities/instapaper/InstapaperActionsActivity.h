@@ -42,6 +42,7 @@ class InstapaperActionsActivity final : public Activity {
   };
   enum State : uint8_t {
     MENU,
+    WIFI_SELECTION,
     RUNNING,
     DONE,
     FAILED,
@@ -57,5 +58,6 @@ class InstapaperActionsActivity final : public Activity {
 
   void buildActions();
   void runSelectedAction();
+  void onWifiSelectionComplete(bool success);
   const char* labelFor(Action a) const;
 };

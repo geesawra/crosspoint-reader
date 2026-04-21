@@ -23,6 +23,7 @@ class InstapaperFetchActivity final : public Activity {
 
  private:
   enum State : uint8_t {
+    WIFI_SELECTION,
     FETCHING_TEXT,
     BUILDING_EPUB,
     FAILED,
@@ -36,5 +37,6 @@ class InstapaperFetchActivity final : public Activity {
   std::string buildLabel;
 
   void performWork();
+  void onWifiSelectionComplete(bool success);
   static void onBuildProgress(void* ctx, int percent, const char* label);
 };
