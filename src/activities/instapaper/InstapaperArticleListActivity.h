@@ -2,6 +2,7 @@
 #include <InstapaperArticle.h>
 #include <InstapaperClient.h>
 
+#include <ctime>
 #include <vector>
 
 #include "activities/Activity.h"
@@ -41,6 +42,8 @@ class InstapaperArticleListActivity final : public Activity {
   ButtonNavigator buttonNavigator;
   std::vector<InstapaperArticle> articles;
   std::string errorMessage;
+  time_t lastSyncedAt = 0;
+  bool offline = false;  // true when the list is shown from cache w/o a live refresh
 
   void onWifiSelectionComplete(bool success);
   void performFetch();

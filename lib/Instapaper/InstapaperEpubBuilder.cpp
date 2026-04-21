@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "InstapaperCoverAsset.h"
+#include "InstapaperImageFetcher.h"
 #include "StoredZipWriter.h"
 
 namespace {
@@ -35,10 +36,7 @@ constexpr size_t ALLOWED_TAG_COUNT = sizeof(ALLOWED_TAGS) / sizeof(ALLOWED_TAGS[
 const char* const DROP_TAGS[] = {"script", "style", "iframe", "noscript", "form", "input", "button"};
 constexpr size_t DROP_TAG_COUNT = sizeof(DROP_TAGS) / sizeof(DROP_TAGS[0]);
 
-// XML-void tags we render self-closed. `img` is omitted on purpose so remote
-// images fall into the unknown-tag branch and get stripped entirely — this
-// avoids creating ImageBlock entries that would force a full screen refresh
-// on every page turn.
+// XML-void tags we render self-closed.
 const char* const VOID_TAGS[] = {"br", "hr"};
 constexpr size_t VOID_TAG_COUNT = sizeof(VOID_TAGS) / sizeof(VOID_TAGS[0]);
 
@@ -94,6 +92,62 @@ void appendEscapedText(std::string& out, const char* s, size_t len) {
   }
 }
 
+// Extract <img src="..."> URLs from a raw HTML fragment. Caps output at
+// `maxUrls`. Simple attribute scan — no HTML parser — so weird quoting is
+// silently skipped. Used by build() to pre-fetch images before the sanitizer
+// rewrites their references.
+std::vector<std::string> extractImageUrls(const char* html, size_t maxUrls) {
+  std::vector<std::string> urls;
+  if (!html) return urls;
+  const size_t n = std::strlen(html);
+  size_t i = 0;
+  while (i + 4 < n && urls.size() < maxUrls) {
+    if (!((html[i] == '<') && ((html[i + 1] | 0x20) == 'i') && ((html[i + 2] | 0x20) == 'm') &&
+          ((html[i + 3] | 0x20) == 'g'))) {
+      i++;
+      continue;
+    }
+    size_t end = i + 4;
+    while (end < n && html[end] != '>') end++;
+    if (end >= n) break;
+    for (size_t p = i + 4; p + 4 < end; p++) {
+      if ((html[p] | 0x20) == 's' && (html[p + 1] | 0x20) == 'r' && (html[p + 2] | 0x20) == 'c' && html[p + 3] == '=') {
+        size_t vs = p + 4;
+        char quote = 0;
+        if (vs < end && (html[vs] == '"' || html[vs] == '\'')) {
+          quote = html[vs];
+          vs++;
+        }
+        size_t ve = vs;
+        while (ve < end && html[ve] != (quote ? quote : ' ') && html[ve] != '>') ve++;
+        if (ve > vs) {
+          urls.emplace_back(html + vs, ve - vs);
+        }
+        break;
+      }
+    }
+    i = end + 1;
+  }
+  return urls;
+}
+
+// Read the entire contents of an SD file into a std::string. Used by the
+// ZIP build step to fold downloaded image files into the archive. Returns
+// empty on failure.
+bool readFileBytes(const char* path, std::string& out) {
+  FsFile f;
+  if (!Storage.openFileForRead("INSTA", path, f)) return false;
+  const size_t sz = f.fileSize();
+  out.resize(sz);
+  const int n = f.read(&out[0], sz);
+  f.close();
+  if (n != static_cast<int>(sz)) {
+    out.clear();
+    return false;
+  }
+  return true;
+}
+
 // Replace non-XML named entities with numeric equivalents so expat accepts them.
 // Only &nbsp; is common enough to matter.
 void replaceNonXmlEntities(std::string& s) {
@@ -105,7 +159,8 @@ void replaceNonXmlEntities(std::string& s) {
 }
 }  // namespace
 
-std::string InstapaperEpubBuilder::sanitizeHtmlBody(const char* rawHtml) {
+std::string InstapaperEpubBuilder::sanitizeHtmlBody(const char* rawHtml,
+                                                    const std::unordered_map<std::string, std::string>* imageMap) {
   if (!rawHtml) return {};
 
   std::string out;
@@ -185,6 +240,40 @@ std::string InstapaperEpubBuilder::sanitizeHtmlBody(const char* rawHtml) {
       }
       i = close ? static_cast<size_t>(close - rawHtml) + needle.size() : inLen;
       continue;
+    }
+
+    // <img>: emit only if we have a local replacement path for its remote src.
+    // This block runs before the allow/void check so an img without a match
+    // can be dropped cleanly instead of falling through to the void-tag
+    // emission path.
+    if (!isClose && nameLen == 3 && caseInsensitiveEquals(name, "img", 3)) {
+      if (imageMap && !imageMap->empty()) {
+        const char* tagStart = rawHtml + i;
+        const char* srcAt = nullptr;
+        for (const char* p = tagStart; p + 4 < rawHtml + end; p++) {
+          if ((p[0] | 0x20) == 's' && (p[1] | 0x20) == 'r' && (p[2] | 0x20) == 'c' && p[3] == '=') {
+            srcAt = p + 4;
+            break;
+          }
+        }
+        if (srcAt) {
+          char quote = 0;
+          if (*srcAt == '"' || *srcAt == '\'') {
+            quote = *srcAt;
+            srcAt++;
+          }
+          const char* ve = srcAt;
+          while (ve < rawHtml + end && *ve != (quote ? quote : ' ') && *ve != '>') ve++;
+          std::string src(srcAt, ve - srcAt);
+          auto it = imageMap->find(src);
+          if (it != imageMap->end()) {
+            out.append("<img src=\"");
+            out.append(it->second);
+            out.append("\"/>");
+          }
+        }
+      }
+      goto nextTag;
     }
 
     if (!matchesAny(name, nameLen, ALLOWED_TAGS, ALLOWED_TAG_COUNT) &&
@@ -309,12 +398,46 @@ std::string InstapaperEpubBuilder::build(uint64_t articleId, const char* title, 
 
   const std::string titleEsc = escapeXml(title && *title ? title : "Untitled");
   const std::string authorEsc = escapeXml(author && *author ? author : "");
-  const std::string body = sanitizeHtmlBody(rawHtml);
 
-  // Build OPF.
-  char opfBuf[1024];
-  const int opfLen = std::snprintf(
-      opfBuf, sizeof(opfBuf),
+  // Download inline article images so the reader can render them offline.
+  // Capped at MAX_IMAGES to avoid long downloads over slow networks and
+  // bounded per-article SD usage. Failures are silently skipped — the img
+  // tag is then stripped by sanitizeHtmlBody.
+  constexpr size_t MAX_IMAGES = 5;
+  const std::vector<std::string> imageUrls = extractImageUrls(rawHtml, MAX_IMAGES);
+  std::unordered_map<std::string, std::string> imageMap;  // URL → zip-relative filename
+  struct DownloadedImage {
+    std::string tempPath;
+    std::string zipName;    // e.g. "img_0.jpg"
+    std::string mediaType;  // "image/jpeg"
+  };
+  std::vector<DownloadedImage> downloaded;
+  downloaded.reserve(imageUrls.size());
+
+  for (size_t idx = 0; idx < imageUrls.size(); idx++) {
+    char base[96];
+    std::snprintf(base, sizeof(base), "%s/tmp_img_%llu_%zu", EPUB_DIR, static_cast<unsigned long long>(articleId), idx);
+    const auto result = InstapaperImageFetcher::download(imageUrls[idx], base);
+    if (result.localPath.empty()) continue;
+    char zipName[32];
+    std::snprintf(zipName, sizeof(zipName), "img_%zu.%s", idx, result.extension.c_str());
+    DownloadedImage d;
+    d.tempPath = result.localPath;
+    d.zipName = zipName;
+    d.mediaType = (result.extension == "png") ? "image/png" : "image/jpeg";
+    imageMap[imageUrls[idx]] = zipName;
+    downloaded.push_back(std::move(d));
+  }
+
+  const std::string body = sanitizeHtmlBody(rawHtml, &imageMap);
+
+  // Build OPF. Start with the fixed header + core manifest, then append image
+  // items as they were downloaded.
+  std::string opf;
+  opf.reserve(1024 + downloaded.size() * 128);
+  char opfHead[1024];
+  const int opfHeadLen = std::snprintf(
+      opfHead, sizeof(opfHead),
       "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
       "<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"3.0\" unique-identifier=\"bookid\">\n"
       "  <metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n"
@@ -327,18 +450,26 @@ std::string InstapaperEpubBuilder::build(uint64_t articleId, const char* title, 
       "  <manifest>\n"
       "    <item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>\n"
       "    <item id=\"cover\" href=\"cover.png\" media-type=\"image/png\" properties=\"cover-image\"/>\n"
-      "    <item id=\"article\" href=\"article.xhtml\" media-type=\"application/xhtml+xml\"/>\n"
+      "    <item id=\"article\" href=\"article.xhtml\" media-type=\"application/xhtml+xml\"/>\n",
+      static_cast<unsigned long long>(articleId), titleEsc.c_str(),
+      authorEsc.empty() ? "Instapaper" : authorEsc.c_str());
+  if (opfHeadLen <= 0 || opfHeadLen >= static_cast<int>(sizeof(opfHead))) {
+    LOG_ERR("INSTA", "OPF buffer overflow");
+    return {};
+  }
+  opf.append(opfHead, opfHeadLen);
+  for (size_t idx = 0; idx < downloaded.size(); idx++) {
+    char line[192];
+    std::snprintf(line, sizeof(line), "    <item id=\"img%zu\" href=\"%s\" media-type=\"%s\"/>\n", idx,
+                  downloaded[idx].zipName.c_str(), downloaded[idx].mediaType.c_str());
+    opf.append(line);
+  }
+  opf.append(
       "  </manifest>\n"
       "  <spine>\n"
       "    <itemref idref=\"article\"/>\n"
       "  </spine>\n"
-      "</package>\n",
-      static_cast<unsigned long long>(articleId), titleEsc.c_str(),
-      authorEsc.empty() ? "Instapaper" : authorEsc.c_str());
-  if (opfLen <= 0 || opfLen >= static_cast<int>(sizeof(opfBuf))) {
-    LOG_ERR("INSTA", "OPF buffer overflow");
-    return {};
-  }
+      "</package>\n");
 
   // Build NAV document (EPUB 3 TOC). The reader uses this to label the
   // status-bar chapter name — without it the title reads "Unnamed".
@@ -396,13 +527,28 @@ std::string InstapaperEpubBuilder::build(uint64_t articleId, const char* title, 
   // mimetype must be first and STORED per EPUB spec.
   if (!zip.addFile("mimetype", MIMETYPE, sizeof(MIMETYPE) - 1)) return {};
   if (!zip.addFile("META-INF/container.xml", CONTAINER_XML, sizeof(CONTAINER_XML) - 1)) return {};
-  if (!zip.addFile("OEBPS/content.opf", opfBuf, static_cast<size_t>(opfLen))) return {};
+  if (!zip.addFile("OEBPS/content.opf", opf.data(), opf.size())) return {};
   if (!zip.addFile("OEBPS/nav.xhtml", navDoc.data(), navDoc.size())) return {};
   if (!zip.addFile("OEBPS/cover.png", INSTAPAPER_COVER_PNG, INSTAPAPER_COVER_PNG_LEN)) return {};
   if (!zip.addFile("OEBPS/article.xhtml", xhtml.data(), xhtml.size())) return {};
 
+  // Add downloaded images. Each is loaded into a short-lived buffer so the
+  // ZIP writer can CRC and copy it, then the buffer is freed and the temp
+  // file deleted before moving to the next — bounding peak heap at one image.
+  for (const DownloadedImage& img : downloaded) {
+    std::string bytes;
+    const bool ok = readFileBytes(img.tempPath.c_str(), bytes);
+    if (ok) {
+      const std::string zipPath = std::string("OEBPS/") + img.zipName;
+      zip.addFile(zipPath.c_str(), bytes.data(), bytes.size());
+    } else {
+      LOG_ERR("INSTA", "Could not read image temp file %s", img.tempPath.c_str());
+    }
+    Storage.remove(img.tempPath.c_str());
+  }
+
   if (!zip.finish()) return {};
 
-  LOG_DBG("INSTA", "Built EPUB: %s", outPath.c_str());
+  LOG_DBG("INSTA", "Built EPUB: %s (+%zu images)", outPath.c_str(), downloaded.size());
   return outPath;
 }

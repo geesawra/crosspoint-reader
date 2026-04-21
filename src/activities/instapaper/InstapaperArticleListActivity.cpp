@@ -3,6 +3,7 @@
 #include <GfxRenderer.h>
 #include <I18n.h>
 #include <InstapaperEpubBuilder.h>
+#include <InstapaperStateCache.h>
 #include <Logging.h>
 #include <WiFi.h>
 #include <esp_sntp.h>
@@ -59,10 +60,23 @@ const char* folderLabelKey(InstapaperFolder f) {
 void InstapaperArticleListActivity::onEnter() {
   Activity::onEnter();
 
-  if (WiFi.status() == WL_CONNECTED) {
-    state = FETCHING;
+  // Populate from SD cache first so the list appears instantly, even if the
+  // follow-up live refresh is slow or fails entirely (offline re-entry).
+  const bool hadCache = InstapaperStateCache::load(folder, articles, &lastSyncedAt);
+  if (hadCache && !articles.empty()) {
+    state = SHOWING_LIST;
+    selectedIndex = 0;
+    offline = true;
     requestUpdate();
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
     performFetch();
+    return;
+  }
+
+  if (hadCache) {
+    // Stay on cached data; don't force the user onto the WiFi picker.
     return;
   }
 
@@ -84,7 +98,10 @@ void InstapaperArticleListActivity::onWifiSelectionComplete(bool success) {
 }
 
 void InstapaperArticleListActivity::performFetch() {
-  {
+  // If we already have cached data on screen, keep showing it while the
+  // refresh runs rather than blanking to a "fetching" spinner.
+  const bool hadCachedList = (state == SHOWING_LIST && !articles.empty());
+  if (!hadCachedList) {
     RenderLock lock(*this);
     state = FETCHING;
   }
@@ -92,17 +109,38 @@ void InstapaperArticleListActivity::performFetch() {
 
   syncTimeOnce();
 
-  const auto r = InstapaperClient::listBookmarks(folder, LIST_LIMIT, articles);
+  std::vector<InstapaperArticle> fresh;
+  const auto r = InstapaperClient::listBookmarks(folder, LIST_LIMIT, fresh);
+
+  if (r == InstapaperClient::OK) {
+    InstapaperStateCache::save(folder, fresh);
+    {
+      RenderLock lock(*this);
+      articles = std::move(fresh);
+      offline = false;
+      lastSyncedAt = ::time(nullptr);
+      if (articles.empty()) {
+        state = EMPTY_LIST;
+      } else {
+        state = SHOWING_LIST;
+        if (selectedIndex >= static_cast<int>(articles.size())) {
+          selectedIndex = 0;
+        }
+      }
+    }
+    requestUpdate(true);
+    return;
+  }
+
   {
     RenderLock lock(*this);
-    if (r != InstapaperClient::OK) {
+    if (hadCachedList) {
+      // Stay on cached data, just mark as offline.
+      offline = true;
+      errorMessage = InstapaperClient::errorString(r);
+    } else {
       state = FETCH_FAILED;
       errorMessage = InstapaperClient::errorString(r);
-    } else if (articles.empty()) {
-      state = EMPTY_LIST;
-    } else {
-      state = SHOWING_LIST;
-      selectedIndex = 0;
     }
   }
   requestUpdate(true);
@@ -163,7 +201,23 @@ void InstapaperArticleListActivity::render(RenderLock&&) {
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
 
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, folderLabelKey(folder));
+  char subtitleBuf[48];
+  const char* subtitle = nullptr;
+  if (offline && lastSyncedAt > 0) {
+    const time_t age = ::time(nullptr) - lastSyncedAt;
+    if (age < 120) {
+      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · updated just now");
+    } else if (age < 3600) {
+      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · %dm ago", static_cast<int>(age / 60));
+    } else if (age < 86400) {
+      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · %dh ago", static_cast<int>(age / 3600));
+    } else {
+      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · %dd ago", static_cast<int>(age / 86400));
+    }
+    subtitle = subtitleBuf;
+  }
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, folderLabelKey(folder),
+                 subtitle);
 
   if (state == FETCHING || state == WIFI_SELECTION) {
     renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2, tr(STR_INSTAPAPER_FETCHING), true, EpdFontFamily::BOLD);
