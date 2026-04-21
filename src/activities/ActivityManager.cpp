@@ -6,6 +6,9 @@
 #include "boot_sleep/SleepActivity.h"
 #include "browser/OpdsBookBrowserActivity.h"
 #include "home/CrashActivity.h"
+#ifdef INSTAPAPER_ENABLED
+#include "instapaper/InstapaperFolderActivity.h"
+#endif
 #include "home/FileBrowserActivity.h"
 #include "home/HomeActivity.h"
 #include "home/RecentBooksActivity.h"
@@ -180,6 +183,14 @@ void ActivityManager::goToRecentBooks() {
 
 void ActivityManager::goToBrowser() {
   replaceActivity(std::make_unique<OpdsBookBrowserActivity>(renderer, mappedInput));
+}
+
+void ActivityManager::goToInstapaper() {
+#ifdef INSTAPAPER_ENABLED
+  replaceActivity(std::make_unique<InstapaperFolderActivity>(renderer, mappedInput));
+#else
+  LOG_ERR("ACT", "Instapaper disabled in this build");
+#endif
 }
 
 void ActivityManager::goToReader(std::string path) {
