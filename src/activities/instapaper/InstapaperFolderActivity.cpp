@@ -83,7 +83,7 @@ void InstapaperFolderActivity::render(RenderLock&&) {
 
   static constexpr StrId folderLabels[MENU_ITEM_COUNT] = {StrId::STR_INSTAPAPER_UNREAD, StrId::STR_INSTAPAPER_STARRED,
                                                           StrId::STR_INSTAPAPER_ARCHIVE};
-  static constexpr UIIcon folderIcons[MENU_ITEM_COUNT] = {UIIcon::Recent, UIIcon::File, UIIcon::Folder};
+  static constexpr UIIcon folderIcons[MENU_ITEM_COUNT] = {UIIcon::Instapaper, UIIcon::Instapaper, UIIcon::Instapaper};
 
   GUI.drawList(
       renderer, Rect{0, contentTop, pageWidth, contentHeight}, MENU_ITEM_COUNT, selectedIndex,

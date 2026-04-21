@@ -17,6 +17,9 @@
 #include "EpubReaderPercentSelectionActivity.h"
 #include "KOReaderCredentialStore.h"
 #include "KOReaderSyncActivity.h"
+#ifdef INSTAPAPER_ENABLED
+#include "InstapaperProgressSync.h"
+#endif
 #include "MappedInputManager.h"
 #include "QrDisplayActivity.h"
 #include "ReaderUtils.h"
@@ -92,6 +95,23 @@ void EpubReaderActivity::onEnter() {
 
 void EpubReaderActivity::onExit() {
   Activity::onExit();
+
+#ifdef INSTAPAPER_ENABLED
+  // Push final read-progress back to Instapaper when closing a synthesized
+  // article EPUB. Best-effort: silently skipped if WiFi is down or the file
+  // is not an Instapaper article. Must run BEFORE `epub.reset()` because
+  // we need the progress helper.
+  if (epub && section) {
+    const uint64_t bookmarkId = InstapaperProgressSync::extractBookmarkId(epub->getPath());
+    if (bookmarkId != 0) {
+      const int pageCount = section->pageCount;
+      const float chapterProg =
+          (pageCount > 0) ? (static_cast<float>(section->currentPage + 1) / static_cast<float>(pageCount)) : 0.0f;
+      const float bookProgress = epub->calculateProgress(currentSpineIndex, chapterProg);
+      InstapaperProgressSync::pushProgress(bookmarkId, bookProgress);
+    }
+  }
+#endif
 
   // Reset orientation back to portrait for the rest of the UI
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);

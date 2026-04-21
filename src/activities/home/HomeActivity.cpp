@@ -252,7 +252,7 @@ void HomeActivity::render(RenderLock&&) {
     // Insert Instapaper before File Transfer (index depends on OPDS presence).
     const size_t pos = hasOpdsUrl ? 3 : 2;
     menuItems.insert(menuItems.begin() + pos, tr(STR_INSTAPAPER));
-    menuIcons.insert(menuIcons.begin() + pos, Recent);
+    menuIcons.insert(menuIcons.begin() + pos, Instapaper);
   }
 #endif
 

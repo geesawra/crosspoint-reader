@@ -8,6 +8,7 @@
 #include <cstring>
 #include <vector>
 
+#include "InstapaperCoverAsset.h"
 #include "StoredZipWriter.h"
 
 namespace {
@@ -325,6 +326,7 @@ std::string InstapaperEpubBuilder::build(uint64_t articleId, const char* title, 
       "  </metadata>\n"
       "  <manifest>\n"
       "    <item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\" properties=\"nav\"/>\n"
+      "    <item id=\"cover\" href=\"cover.png\" media-type=\"image/png\" properties=\"cover-image\"/>\n"
       "    <item id=\"article\" href=\"article.xhtml\" media-type=\"application/xhtml+xml\"/>\n"
       "  </manifest>\n"
       "  <spine>\n"
@@ -396,6 +398,7 @@ std::string InstapaperEpubBuilder::build(uint64_t articleId, const char* title, 
   if (!zip.addFile("META-INF/container.xml", CONTAINER_XML, sizeof(CONTAINER_XML) - 1)) return {};
   if (!zip.addFile("OEBPS/content.opf", opfBuf, static_cast<size_t>(opfLen))) return {};
   if (!zip.addFile("OEBPS/nav.xhtml", navDoc.data(), navDoc.size())) return {};
+  if (!zip.addFile("OEBPS/cover.png", INSTAPAPER_COVER_PNG, INSTAPAPER_COVER_PNG_LEN)) return {};
   if (!zip.addFile("OEBPS/article.xhtml", xhtml.data(), xhtml.size())) return {};
 
   if (!zip.finish()) return {};

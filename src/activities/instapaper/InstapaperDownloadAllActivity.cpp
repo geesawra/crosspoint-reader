@@ -1,0 +1,117 @@
+#include "InstapaperDownloadAllActivity.h"
+
+#include <GfxRenderer.h>
+#include <HalStorage.h>
+#include <I18n.h>
+#include <InstapaperClient.h>
+#include <InstapaperEpubBuilder.h>
+#include <Logging.h>
+
+#include <cstdio>
+
+#include "MappedInputManager.h"
+#include "components/UITheme.h"
+#include "fontIds.h"
+
+void InstapaperDownloadAllActivity::onEnter() {
+  Activity::onEnter();
+  completed = 0;
+  skipped = 0;
+  failed = 0;
+  cancelRequested = false;
+  state = RUNNING;
+  requestUpdate();
+  performDownloads();
+}
+
+void InstapaperDownloadAllActivity::onExit() { Activity::onExit(); }
+
+void InstapaperDownloadAllActivity::performDownloads() {
+  for (size_t i = 0; i < articles.size(); i++) {
+    if (cancelRequested) {
+      RenderLock lock(*this);
+      state = CANCELLED;
+      requestUpdate(true);
+      return;
+    }
+
+    const InstapaperArticle& a = articles[i];
+
+    // Skip if already cached.
+    const std::string epubPath = InstapaperEpubBuilder::pathFor(a.id);
+    if (Storage.exists(epubPath.c_str())) {
+      skipped++;
+      {
+        RenderLock lock(*this);
+        completed = static_cast<int>(i + 1);
+      }
+      requestUpdate();
+      continue;
+    }
+
+    std::string html;
+    const auto r = InstapaperClient::getText(a.id, html);
+    if (r != InstapaperClient::OK) {
+      LOG_ERR("INSTA", "Download-all: %s failed (%s)", a.title, InstapaperClient::errorString(r));
+      failed++;
+    } else {
+      const std::string out = InstapaperEpubBuilder::build(a.id, a.title, a.author, html.c_str());
+      if (out.empty()) {
+        failed++;
+      }
+    }
+    html.clear();
+    html.shrink_to_fit();
+
+    {
+      RenderLock lock(*this);
+      completed = static_cast<int>(i + 1);
+    }
+    requestUpdate();
+  }
+
+  RenderLock lock(*this);
+  state = DONE;
+  requestUpdate(true);
+}
+
+void InstapaperDownloadAllActivity::loop() {
+  if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+    if (state == RUNNING) {
+      cancelRequested = true;
+    } else {
+      finish();
+    }
+  }
+}
+
+void InstapaperDownloadAllActivity::render(RenderLock&&) {
+  renderer.clearScreen();
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const auto pageWidth = renderer.getScreenWidth();
+  const auto pageHeight = renderer.getScreenHeight();
+
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight},
+                 tr(STR_INSTAPAPER_DOWNLOAD_ALL));
+
+  const int total = static_cast<int>(articles.size());
+
+  char status[64];
+  if (state == RUNNING) {
+    std::snprintf(status, sizeof(status), "%d / %d", completed, total);
+  } else if (state == DONE) {
+    std::snprintf(status, sizeof(status), "Done: %d OK, %d skipped, %d failed", completed - failed - skipped, skipped,
+                  failed);
+  } else {
+    std::snprintf(status, sizeof(status), "Cancelled (%d / %d)", completed, total);
+  }
+
+  renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 30, status, true, EpdFontFamily::BOLD);
+
+  const int barWidth = pageWidth - 80;
+  GUI.drawProgressBar(renderer, Rect{40, pageHeight / 2, barWidth, 12}, completed, total > 0 ? total : 1);
+
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
+  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  renderer.displayBuffer();
+}

@@ -8,6 +8,8 @@
 #include <esp_sntp.h>
 #include <time.h>
 
+#include "InstapaperActionsActivity.h"
+#include "InstapaperDownloadAllActivity.h"
 #include "InstapaperFetchActivity.h"
 #include "MappedInputManager.h"
 #include "activities/network/WifiSelectionActivity.h"
@@ -129,6 +131,28 @@ void InstapaperArticleListActivity::loop() {
   });
   if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
     openSelected();
+    return;
+  }
+
+  // Left: per-article actions menu (star/archive/delete).
+  if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
+    if (articles.empty()) return;
+    const InstapaperArticle a = articles[selectedIndex];
+    startActivityForResult(std::make_unique<InstapaperActionsActivity>(renderer, mappedInput, a, folder),
+                           [this](const ActivityResult& r) {
+                             (void)r;
+                             // Always refetch on return — the list may have changed (star, archive, delete).
+                             performFetch();
+                           });
+    return;
+  }
+
+  // Right: bulk download of the current folder.
+  if (mappedInput.wasPressed(MappedInputManager::Button::Right)) {
+    if (articles.empty()) return;
+    startActivityForResult(std::make_unique<InstapaperDownloadAllActivity>(renderer, mappedInput, articles),
+                           [this](const ActivityResult&) { requestUpdate(); });
+    return;
   }
 }
 
@@ -175,7 +199,8 @@ void InstapaperArticleListActivity::render(RenderLock&&) {
       [this](int index) { return std::string(articles[index].title); },
       [this](int index) { return std::string(articles[index].domain); }, nullptr);
 
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
+  const auto labels =
+      mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_INSTAPAPER_ACTIONS), tr(STR_INSTAPAPER_DOWNLOAD_ALL));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer();
 }
