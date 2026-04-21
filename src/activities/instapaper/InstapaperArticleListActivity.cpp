@@ -73,6 +73,22 @@ void InstapaperArticleListActivity::onWifiSelectionComplete(bool success) {
 }
 
 void InstapaperArticleListActivity::performFetch() {
+  // Defense in depth: callers other than onEnter have historically reached
+  // here without verifying WiFi, which faults lwIP (Invalid mbox) when the
+  // radio was never initialized on this boot.
+  if (WiFi.status() != WL_CONNECTED) {
+    LOG_DBG("INSTA", "performFetch skipped: WiFi not connected");
+    RenderLock lock(*this);
+    if (state == SHOWING_LIST && !articles.empty()) {
+      offline = true;
+    } else {
+      state = FETCH_FAILED;
+      errorMessage = "No WiFi";
+    }
+    requestUpdate();
+    return;
+  }
+
   // If we already have cached data on screen, keep showing it while the
   // refresh runs rather than blanking to a "fetching" spinner.
   const bool hadCachedList = (state == SHOWING_LIST && !articles.empty());

@@ -126,6 +126,12 @@ void InstapaperActionsActivity::onWifiSelectionComplete(bool success) {
 
 void InstapaperActionsActivity::loop() {
   if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+    // ActivityResult defaults to isCancelled=false — we have to mark cancel
+    // explicitly, or the parent's callback treats Back as success and runs
+    // performFetch(), which crashes lwIP when we're offline.
+    ActivityResult cancelled;
+    cancelled.isCancelled = true;
+    setResult(std::move(cancelled));
     finish();
     return;
   }
@@ -136,6 +142,10 @@ void InstapaperActionsActivity::loop() {
     if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
       if (state == DONE) {
         setResult(PercentResult{1});  // reusing a simple result — non-zero = changed
+      } else {
+        ActivityResult cancelled;
+        cancelled.isCancelled = true;
+        setResult(std::move(cancelled));
       }
       finish();
     }
