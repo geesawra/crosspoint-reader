@@ -17,10 +17,14 @@ void InstapaperFetchActivity::onEnter() {
   Activity::onEnter();
 
   // If the article is already cached on SD, skip the API call and jump
-  // straight to the reader.
+  // straight to the reader. Flush button state first so the Confirm that
+  // got us here doesn't ride through to the reader's first loop.
   const std::string cached = InstapaperEpubBuilder::pathFor(article.id);
   if (Storage.exists(cached.c_str())) {
     LOG_DBG("INSTA", "Using cached EPUB: %s", cached.c_str());
+    mappedInput.update();
+    delay(10);
+    mappedInput.update();
     activityManager.goToReader(cached);
     return;
   }
@@ -92,6 +96,15 @@ void InstapaperFetchActivity::performWork() {
   // for the EPUB indexing pass.
   html.clear();
   html.shrink_to_fit();
+
+  // Drain any button-edge events accumulated while fetch+build blocked.
+  // Without this, the Confirm press→release edge from the user tapping to
+  // open the article fires on the reader's first loop() and immediately
+  // opens the reader menu. Two updates settle prev==curr so no fresh edge
+  // is visible to the reader.
+  mappedInput.update();
+  delay(10);
+  mappedInput.update();
 
   epubPath = path;
   activityManager.goToReader(epubPath);

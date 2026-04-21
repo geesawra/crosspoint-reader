@@ -369,8 +369,13 @@ std::string InstapaperEpubBuilder::escapeXml(const char* s) {
 }
 
 std::string InstapaperEpubBuilder::pathFor(uint64_t articleId) {
+  // Versioned filename — bumping this forces every cached article to be
+  // re-synthesized with the current builder. Bumped from v1 to v2 when
+  // inline image embedding landed, since v1-cached EPUBs were built with
+  // `<img>` stripped and would never show pictures even after the image
+  // code shipped.
   char buf[96];
-  std::snprintf(buf, sizeof(buf), "%s/article_%llu.epub", EPUB_DIR, static_cast<unsigned long long>(articleId));
+  std::snprintf(buf, sizeof(buf), "%s/article_v2_%llu.epub", EPUB_DIR, static_cast<unsigned long long>(articleId));
   return std::string(buf);
 }
 
