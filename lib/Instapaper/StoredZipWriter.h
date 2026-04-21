@@ -39,6 +39,14 @@ class StoredZipWriter {
   // Returns false on SD failure or if the archive is not open.
   bool addFile(const char* zipPath, const void* data, size_t size);
 
+  // Streaming variant: appends an entry whose payload lives in another file
+  // on SD. Reads the source file twice (once for CRC32, once to copy bytes)
+  // in small chunks, so peak heap stays bounded no matter how large the
+  // input. Needed for embedding article images without loading them fully
+  // into memory (they routinely exceed 100 KB, which is near our free-heap
+  // ceiling during EPUB synthesis).
+  bool addFileFromPath(const char* zipPath, const char* localPath);
+
   // Write the central directory + EOCD and close the file. Must be called to
   // produce a valid ZIP. After this, the writer is in a closed state.
   bool finish();

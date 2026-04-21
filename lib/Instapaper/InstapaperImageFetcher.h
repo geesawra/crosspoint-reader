@@ -21,6 +21,6 @@ struct Result {
 // Download `url` to `localPathHint` (extension will be overridden with the
 // detected one). Caps body size at `maxBytes`. Returns Result with empty
 // strings on any failure.
-Result download(const std::string& url, const std::string& localPathBase, size_t maxBytes = 300 * 1024);
+Result download(const std::string& url, const std::string& localPathBase, size_t maxBytes = 150 * 1024);
 
 }  // namespace InstapaperImageFetcher

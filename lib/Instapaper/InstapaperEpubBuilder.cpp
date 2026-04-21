@@ -131,23 +131,6 @@ std::vector<std::string> extractImageUrls(const char* html, size_t maxUrls) {
   return urls;
 }
 
-// Read the entire contents of an SD file into a std::string. Used by the
-// ZIP build step to fold downloaded image files into the archive. Returns
-// empty on failure.
-bool readFileBytes(const char* path, std::string& out) {
-  FsFile f;
-  if (!Storage.openFileForRead("INSTA", path, f)) return false;
-  const size_t sz = f.fileSize();
-  out.resize(sz);
-  const int n = f.read(&out[0], sz);
-  f.close();
-  if (n != static_cast<int>(sz)) {
-    out.clear();
-    return false;
-  }
-  return true;
-}
-
 // Replace non-XML named entities with numeric equivalents so expat accepts them.
 // Only &nbsp; is common enough to matter.
 void replaceNonXmlEntities(std::string& s) {
@@ -403,7 +386,7 @@ std::string InstapaperEpubBuilder::build(uint64_t articleId, const char* title, 
   // Capped at MAX_IMAGES to avoid long downloads over slow networks and
   // bounded per-article SD usage. Failures are silently skipped — the img
   // tag is then stripped by sanitizeHtmlBody.
-  constexpr size_t MAX_IMAGES = 5;
+  constexpr size_t MAX_IMAGES = 3;
   const std::vector<std::string> imageUrls = extractImageUrls(rawHtml, MAX_IMAGES);
   std::unordered_map<std::string, std::string> imageMap;  // URL → zip-relative filename
   struct DownloadedImage {
@@ -532,17 +515,13 @@ std::string InstapaperEpubBuilder::build(uint64_t articleId, const char* title, 
   if (!zip.addFile("OEBPS/cover.png", INSTAPAPER_COVER_PNG, INSTAPAPER_COVER_PNG_LEN)) return {};
   if (!zip.addFile("OEBPS/article.xhtml", xhtml.data(), xhtml.size())) return {};
 
-  // Add downloaded images. Each is loaded into a short-lived buffer so the
-  // ZIP writer can CRC and copy it, then the buffer is freed and the temp
-  // file deleted before moving to the next — bounding peak heap at one image.
+  // Add downloaded images. Stream from SD into the ZIP in small chunks —
+  // loading a 300 KB image fully into heap alongside the sanitized body and
+  // the OPF would push peak DRAM into bad_alloc territory on ESP32-C3.
   for (const DownloadedImage& img : downloaded) {
-    std::string bytes;
-    const bool ok = readFileBytes(img.tempPath.c_str(), bytes);
-    if (ok) {
-      const std::string zipPath = std::string("OEBPS/") + img.zipName;
-      zip.addFile(zipPath.c_str(), bytes.data(), bytes.size());
-    } else {
-      LOG_ERR("INSTA", "Could not read image temp file %s", img.tempPath.c_str());
+    const std::string zipPath = std::string("OEBPS/") + img.zipName;
+    if (!zip.addFileFromPath(zipPath.c_str(), img.tempPath.c_str())) {
+      LOG_ERR("INSTA", "Failed to embed image %s", img.tempPath.c_str());
     }
     Storage.remove(img.tempPath.c_str());
   }

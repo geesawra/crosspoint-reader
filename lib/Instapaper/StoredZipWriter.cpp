@@ -107,6 +107,90 @@ bool StoredZipWriter::addFile(const char* zipPath, const void* data, size_t size
   return true;
 }
 
+bool StoredZipWriter::addFileFromPath(const char* zipPath, const char* localPath) {
+  if (!opened) {
+    LOG_ERR("ZIPW", "addFileFromPath before open");
+    return false;
+  }
+  if (!crcTableReady) {
+    buildCrcTable();
+  }
+
+  // Pass 1: size + CRC32, streaming.
+  FsFile src;
+  if (!Storage.openFileForRead("ZIPW", localPath, src)) {
+    LOG_ERR("ZIPW", "Cannot open source %s", localPath);
+    return false;
+  }
+  const uint32_t totalSize = static_cast<uint32_t>(src.fileSize());
+  uint8_t chunk[256];
+  uint32_t crc = 0xFFFFFFFFu;
+  uint32_t scanned = 0;
+  while (scanned < totalSize) {
+    const uint32_t want = totalSize - scanned > sizeof(chunk) ? sizeof(chunk) : totalSize - scanned;
+    const int got = src.read(chunk, want);
+    if (got <= 0) {
+      src.close();
+      LOG_ERR("ZIPW", "Short read scanning %s", localPath);
+      return false;
+    }
+    for (int j = 0; j < got; j++) {
+      crc = crcTable[(crc ^ chunk[j]) & 0xFF] ^ (crc >> 8);
+    }
+    scanned += got;
+  }
+  crc ^= 0xFFFFFFFFu;
+  src.close();
+
+  Entry e;
+  e.path = zipPath;
+  e.size = totalSize;
+  e.crc32 = crc;
+  e.localOffset = static_cast<uint32_t>(file.position());
+
+  const uint16_t nameLen = static_cast<uint16_t>(e.path.size());
+
+  // Local file header.
+  if (!writeLE32(file, LOCAL_FILE_SIG)) return false;
+  if (!writeLE16(file, VERSION_NEEDED)) return false;
+  if (!writeLE16(file, 0)) return false;
+  if (!writeLE16(file, METHOD_STORED)) return false;
+  if (!writeLE16(file, 0)) return false;
+  if (!writeLE16(file, 0)) return false;
+  if (!writeLE32(file, e.crc32)) return false;
+  if (!writeLE32(file, e.size)) return false;
+  if (!writeLE32(file, e.size)) return false;
+  if (!writeLE16(file, nameLen)) return false;
+  if (!writeLE16(file, 0)) return false;
+  if (file.write(e.path.data(), nameLen) != nameLen) return false;
+
+  // Pass 2: copy bytes.
+  if (!Storage.openFileForRead("ZIPW", localPath, src)) {
+    LOG_ERR("ZIPW", "Cannot reopen source %s", localPath);
+    return false;
+  }
+  uint32_t copied = 0;
+  while (copied < totalSize) {
+    const uint32_t want = totalSize - copied > sizeof(chunk) ? sizeof(chunk) : totalSize - copied;
+    const int got = src.read(chunk, want);
+    if (got <= 0) {
+      src.close();
+      LOG_ERR("ZIPW", "Short read copying %s", localPath);
+      return false;
+    }
+    if (file.write(chunk, got) != static_cast<size_t>(got)) {
+      src.close();
+      LOG_ERR("ZIPW", "Short write copying %s", localPath);
+      return false;
+    }
+    copied += got;
+  }
+  src.close();
+
+  entries.push_back(std::move(e));
+  return true;
+}
+
 bool StoredZipWriter::finish() {
   if (!opened) {
     return false;
