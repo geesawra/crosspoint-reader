@@ -399,6 +399,10 @@ std::string InstapaperEpubBuilder::build(uint64_t articleId, const char* title, 
   // tag is then stripped by sanitizeHtmlBody.
   constexpr size_t MAX_IMAGES = 3;
   const std::vector<std::string> imageUrls = extractImageUrls(rawHtml, MAX_IMAGES);
+  LOG_DBG("INSTA", "Article has %zu image URL(s) to fetch", imageUrls.size());
+  for (size_t idx = 0; idx < imageUrls.size(); idx++) {
+    LOG_DBG("INSTA", "  [%zu] %s", idx, imageUrls[idx].c_str());
+  }
   std::unordered_map<std::string, std::string> imageMap;  // URL → zip-relative filename
   struct DownloadedImage {
     std::string tempPath;

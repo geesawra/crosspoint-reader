@@ -44,6 +44,12 @@ InstapaperImageFetcher::Result InstapaperImageFetcher::download(const std::strin
     if (!http.begin(plain, url.c_str())) return out;
   }
 
+  // CDNs frequently 301/302 images; without redirect following we'd give up
+  // at the first hop and embed nothing. Some origins also serve a 403 to
+  // bare requests — a plausible User-Agent keeps them happy.
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.setUserAgent("Mozilla/5.0 (compatible; CrossPoint/1.2)");
+
   const char* kCollectHeaders[] = {"Content-Type"};
   http.collectHeaders(kCollectHeaders, 1);
 
@@ -57,7 +63,7 @@ InstapaperImageFetcher::Result InstapaperImageFetcher::download(const std::strin
   const String ct = http.header("Content-Type");
   const char* ext = extensionFromContentType(ct);
   if (!ext) {
-    LOG_DBG("INSTA", "Skipping image (Content-Type %s)", ct.c_str());
+    LOG_DBG("INSTA", "Skipping image (Content-Type '%s') for %s", ct.c_str(), url.c_str());
     http.end();
     return out;
   }
@@ -107,10 +113,12 @@ InstapaperImageFetcher::Result InstapaperImageFetcher::download(const std::strin
   http.end();
 
   if (written < 100) {  // suspiciously tiny → discard
+    LOG_ERR("INSTA", "Image too small (%zu bytes), discarding %s", written, path.c_str());
     Storage.remove(path.c_str());
     return out;
   }
 
+  LOG_DBG("INSTA", "Image saved: %s (%zu bytes, Content-Type '%s')", path.c_str(), written, ct.c_str());
   out.localPath = path;
   out.extension = ext;
   return out;
