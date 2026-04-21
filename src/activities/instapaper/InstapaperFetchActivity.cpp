@@ -50,10 +50,13 @@ void InstapaperFetchActivity::performWork() {
   {
     RenderLock lock(*this);
     state = BUILDING_EPUB;
+    buildPercent = 0;
+    buildLabel = tr(STR_INSTAPAPER_BUILDING);
   }
   requestUpdateAndWait();
 
-  const std::string path = InstapaperEpubBuilder::build(article.id, article.title, article.author, html.c_str());
+  const std::string path =
+      InstapaperEpubBuilder::build(article.id, article.title, article.author, html.c_str(), &onBuildProgress, this);
   if (path.empty()) {
     RenderLock lock(*this);
     state = FAILED;
@@ -71,6 +74,18 @@ void InstapaperFetchActivity::performWork() {
   activityManager.goToReader(epubPath);
 }
 
+void InstapaperFetchActivity::onBuildProgress(void* ctx, int percent, const char* label) {
+  auto* self = static_cast<InstapaperFetchActivity*>(ctx);
+  {
+    RenderLock lock(*self);
+    self->buildPercent = percent;
+    if (label) {
+      self->buildLabel = label;
+    }
+  }
+  self->requestUpdate(true);
+}
+
 void InstapaperFetchActivity::loop() {
   if (state == FAILED) {
     if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
@@ -81,12 +96,24 @@ void InstapaperFetchActivity::loop() {
 
 void InstapaperFetchActivity::render(RenderLock&&) {
   renderer.clearScreen();
+  const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
 
   if (state == FETCHING_TEXT) {
     renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2, tr(STR_INSTAPAPER_FETCHING), true, EpdFontFamily::BOLD);
   } else if (state == BUILDING_EPUB) {
-    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2, tr(STR_INSTAPAPER_BUILDING), true, EpdFontFamily::BOLD);
+    // Phase label, then centered progress bar. A static "Building EPUB..."
+    // screen looked hung on slow SD cards / articles with several images —
+    // the bar gives the user a clear "still working" signal.
+    const char* label = buildLabel.empty() ? tr(STR_INSTAPAPER_BUILDING) : buildLabel.c_str();
+    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 20, label, true, EpdFontFamily::BOLD);
+
+    const int barWidth = pageWidth - 80;
+    GUI.drawProgressBar(renderer, Rect{40, pageHeight / 2 + 10, barWidth, 12}, buildPercent, 100);
+
+    char pctStr[8];
+    std::snprintf(pctStr, sizeof(pctStr), "%d%%", buildPercent);
+    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 40, pctStr);
   } else if (state == FAILED) {
     renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 20, tr(STR_INSTAPAPER_AUTH_FAILED), true,
                               EpdFontFamily::BOLD);

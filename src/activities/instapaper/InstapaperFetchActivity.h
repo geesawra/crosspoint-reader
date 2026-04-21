@@ -32,6 +32,9 @@ class InstapaperFetchActivity final : public Activity {
   State state = FETCHING_TEXT;
   std::string errorMessage;
   std::string epubPath;
+  int buildPercent = 0;
+  std::string buildLabel;
 
   void performWork();
+  static void onBuildProgress(void* ctx, int percent, const char* label);
 };

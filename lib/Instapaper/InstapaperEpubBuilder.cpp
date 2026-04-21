@@ -374,8 +374,14 @@ std::string InstapaperEpubBuilder::pathFor(uint64_t articleId) {
   return std::string(buf);
 }
 
-std::string InstapaperEpubBuilder::build(uint64_t articleId, const char* title, const char* author,
-                                         const char* rawHtml) {
+std::string InstapaperEpubBuilder::build(uint64_t articleId, const char* title, const char* author, const char* rawHtml,
+                                         ProgressCallback cb, void* ctx) {
+  auto report = [&](int pct, const char* label) {
+    if (cb) cb(ctx, pct, label);
+  };
+
+  report(2, "Preparing");
+
   Storage.mkdir(EPUB_DIR);
   const std::string outPath = pathFor(articleId);
 
@@ -397,7 +403,14 @@ std::string InstapaperEpubBuilder::build(uint64_t articleId, const char* title, 
   std::vector<DownloadedImage> downloaded;
   downloaded.reserve(imageUrls.size());
 
+  // Image downloads dominate wall-clock for articles with photos. Spread
+  // percentage across a generous 5..45 range so the bar moves visibly.
   for (size_t idx = 0; idx < imageUrls.size(); idx++) {
+    char label[40];
+    std::snprintf(label, sizeof(label), "Image %zu of %zu", idx + 1, imageUrls.size());
+    const int pct = 5 + static_cast<int>((idx * 40) / imageUrls.size());
+    report(pct, label);
+
     char base[96];
     std::snprintf(base, sizeof(base), "%s/tmp_img_%llu_%zu", EPUB_DIR, static_cast<unsigned long long>(articleId), idx);
     const auto result = InstapaperImageFetcher::download(imageUrls[idx], base);
@@ -412,6 +425,7 @@ std::string InstapaperEpubBuilder::build(uint64_t articleId, const char* title, 
     downloaded.push_back(std::move(d));
   }
 
+  report(50, "Sanitizing");
   const std::string body = sanitizeHtmlBody(rawHtml, &imageMap);
 
   // Build OPF. Start with the fixed header + core manifest, then append image
@@ -501,6 +515,7 @@ std::string InstapaperEpubBuilder::build(uint64_t articleId, const char* title, 
   xhtml.append(body);
   xhtml.append("\n</body>\n</html>\n");
 
+  report(65, "Writing EPUB");
   StoredZipWriter zip;
   if (!zip.open(outPath.c_str())) {
     LOG_ERR("INSTA", "Cannot open %s for write", outPath.c_str());
@@ -518,7 +533,13 @@ std::string InstapaperEpubBuilder::build(uint64_t articleId, const char* title, 
   // Add downloaded images. Stream from SD into the ZIP in small chunks —
   // loading a 300 KB image fully into heap alongside the sanitized body and
   // the OPF would push peak DRAM into bad_alloc territory on ESP32-C3.
-  for (const DownloadedImage& img : downloaded) {
+  for (size_t idx = 0; idx < downloaded.size(); idx++) {
+    const DownloadedImage& img = downloaded[idx];
+    char label[40];
+    std::snprintf(label, sizeof(label), "Embedding image %zu/%zu", idx + 1, downloaded.size());
+    const int pct = 75 + static_cast<int>((idx * 20) / (downloaded.empty() ? 1 : downloaded.size()));
+    report(pct, label);
+
     const std::string zipPath = std::string("OEBPS/") + img.zipName;
     if (!zip.addFileFromPath(zipPath.c_str(), img.tempPath.c_str())) {
       LOG_ERR("INSTA", "Failed to embed image %s", img.tempPath.c_str());
@@ -526,8 +547,10 @@ std::string InstapaperEpubBuilder::build(uint64_t articleId, const char* title, 
     Storage.remove(img.tempPath.c_str());
   }
 
+  report(97, "Finalizing");
   if (!zip.finish()) return {};
 
+  report(100, "Done");
   LOG_DBG("INSTA", "Built EPUB: %s (+%zu images)", outPath.c_str(), downloaded.size());
   return outPath;
 }

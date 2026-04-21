@@ -19,9 +19,19 @@
  */
 class InstapaperEpubBuilder {
  public:
+  // Progress reporter. Called at known checkpoints during build() so the
+  // calling activity can drive a progress bar or status label. `percent` is
+  // 0..100, `label` is a short human-readable phase name (never null). Use
+  // raw function pointer + context — std::function is avoided in this lib
+  // path per the project's memory rules.
+  using ProgressCallback = void (*)(void* ctx, int percent, const char* label);
+
   // Build the EPUB file on SD. Returns the absolute path of the created file
-  // on success, or an empty string on failure.
-  static std::string build(uint64_t articleId, const char* title, const char* author, const char* rawHtml);
+  // on success, or an empty string on failure. If `cb` is non-null it is
+  // invoked from the same thread as the caller, synchronously, at each
+  // phase transition — safe to update UI state inside.
+  static std::string build(uint64_t articleId, const char* title, const char* author, const char* rawHtml,
+                           ProgressCallback cb = nullptr, void* ctx = nullptr);
 
   // Compute the expected on-SD path for an article. Does not touch the SD.
   static std::string pathFor(uint64_t articleId);
