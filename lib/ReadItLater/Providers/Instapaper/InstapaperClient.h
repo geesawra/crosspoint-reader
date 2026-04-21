@@ -13,7 +13,7 @@
  * requestUpdateAndWait() has shown a progress screen, matching the pattern
  * used by KOReaderSyncClient.
  *
- * Pre-requisites: WiFi.status() == WL_CONNECTED and INSTAPAPER_TOKENS
+ * Pre-requisites: WiFi.status() == WL_CONNECTED and INSTAPAPER_CREDENTIALS
  * already loaded from SD.
  */
 class InstapaperClient {

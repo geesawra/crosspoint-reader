@@ -1,9 +1,8 @@
-#include "InstapaperActionsActivity.h"
+#include "ActionsActivity.h"
 
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <I18n.h>
-#include <InstapaperEpubBuilder.h>
 #include <Logging.h>
 #include <WiFi.h>
 
@@ -12,7 +11,7 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 
-void InstapaperActionsActivity::onEnter() {
+void ActionsActivity::onEnter() {
   Activity::onEnter();
   buildActions();
   selectedIndex = 0;
@@ -20,40 +19,37 @@ void InstapaperActionsActivity::onEnter() {
   requestUpdate();
 }
 
-void InstapaperActionsActivity::onExit() { Activity::onExit(); }
+void ActionsActivity::onExit() { Activity::onExit(); }
 
-void InstapaperActionsActivity::buildActions() {
+void ActionsActivity::buildActions() {
   actions.clear();
-  switch (folder) {
-    case InstapaperFolder::UNREAD:
-      actions = {article.starred ? UNSTAR : STAR, ARCHIVE, DELETE};
-      break;
-    case InstapaperFolder::STARRED:
-      actions = {UNSTAR, ARCHIVE, DELETE};
-      break;
-    case InstapaperFolder::ARCHIVE:
-      actions = {UNARCHIVE, DELETE};
-      break;
+  if (provider) {
+    actions = provider->availableActions(folder, article);
   }
 }
 
-const char* InstapaperActionsActivity::labelFor(Action a) const {
+const char* ActionsActivity::labelFor(Provider::Action a) const {
   switch (a) {
-    case STAR:
+    case Provider::Action::Star:
       return tr(STR_INSTAPAPER_STAR);
-    case UNSTAR:
+    case Provider::Action::Unstar:
       return tr(STR_INSTAPAPER_UNSTAR);
-    case ARCHIVE:
+    case Provider::Action::Archive:
       return tr(STR_INSTAPAPER_ARCHIVE_ACTION);
-    case UNARCHIVE:
+    case Provider::Action::Unarchive:
       return tr(STR_INSTAPAPER_UNARCHIVE);
-    case DELETE:
+    case Provider::Action::Delete:
       return tr(STR_INSTAPAPER_DELETE);
   }
   return "";
 }
 
-void InstapaperActionsActivity::runSelectedAction() {
+void ActionsActivity::runSelectedAction() {
+  if (!provider) {
+    finish();
+    return;
+  }
+
   // Same guard as the other network activities — starting a signed POST
   // without lwIP up faults inside ESP-IDF.
   if (WiFi.status() != WL_CONNECTED) {
@@ -73,29 +69,12 @@ void InstapaperActionsActivity::runSelectedAction() {
   }
   requestUpdateAndWait();
 
-  InstapaperClient::Result r = InstapaperClient::OK;
-  const Action action = actions[selectedIndex];
-  switch (action) {
-    case STAR:
-      r = InstapaperClient::star(article.id);
-      break;
-    case UNSTAR:
-      r = InstapaperClient::unstar(article.id);
-      break;
-    case ARCHIVE:
-      r = InstapaperClient::archive(article.id);
-      break;
-    case UNARCHIVE:
-      r = InstapaperClient::unarchive(article.id);
-      break;
-    case DELETE:
-      r = InstapaperClient::deleteBookmark(article.id);
-      break;
-  }
+  const Provider::Action action = actions[selectedIndex];
+  const auto r = provider->performAction(article.id, action);
 
   // Best-effort local cache cleanup on destructive actions.
-  if (r == InstapaperClient::OK && action == DELETE) {
-    const std::string epubPath = InstapaperEpubBuilder::pathFor(article.id);
+  if (r == Provider::Result::OK && action == Provider::Action::Delete) {
+    const std::string epubPath = provider->epubPathFor(article.id);
     if (Storage.exists(epubPath.c_str())) {
       Storage.remove(epubPath.c_str());
     }
@@ -103,18 +82,18 @@ void InstapaperActionsActivity::runSelectedAction() {
 
   {
     RenderLock lock(*this);
-    if (r == InstapaperClient::OK) {
+    if (r == Provider::Result::OK) {
       state = DONE;
       message = labelFor(action);
     } else {
       state = FAILED;
-      message = InstapaperClient::errorString(r);
+      message = provider->errorString(r);
     }
   }
   requestUpdate(true);
 }
 
-void InstapaperActionsActivity::onWifiSelectionComplete(bool success) {
+void ActionsActivity::onWifiSelectionComplete(bool success) {
   if (!success) {
     RenderLock lock(*this);
     state = MENU;
@@ -124,7 +103,7 @@ void InstapaperActionsActivity::onWifiSelectionComplete(bool success) {
   runSelectedAction();
 }
 
-void InstapaperActionsActivity::loop() {
+void ActionsActivity::loop() {
   if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
     // ActivityResult defaults to isCancelled=false — we have to mark cancel
     // explicitly, or the parent's callback treats Back as success and runs
@@ -167,7 +146,7 @@ void InstapaperActionsActivity::loop() {
   }
 }
 
-void InstapaperActionsActivity::render(RenderLock&&) {
+void ActionsActivity::render(RenderLock&&) {
   renderer.clearScreen();
 
   const auto& metrics = UITheme::getInstance().getMetrics();

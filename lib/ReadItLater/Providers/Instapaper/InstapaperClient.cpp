@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstring>
 
-#include "InstapaperTokenStore.h"
+#include "InstapaperCredentialStore.h"
 #include "OAuth1Signer.h"
 
 namespace {
@@ -78,16 +78,16 @@ std::string buildFormBody(const std::vector<OAuth1Signer::Param>& params) {
 // `outBody` (if non-null) or streams to `outStream` (if non-null). Caller
 // may pass both as null to drop the body.
 int signedPost(const char* url, const std::vector<OAuth1Signer::Param>& bodyParams, std::string* outBody) {
-  if (!INSTAPAPER_TOKENS.hasTokens()) {
+  if (!INSTAPAPER_CREDENTIALS.hasTokens()) {
     return -1;
   }
 
   ensureTimeSynced();
 
   const std::string authHeader = OAuth1Signer::buildAuthHeader(
-      "POST", url, bodyParams, INSTAPAPER_TOKENS.getConsumerKey().c_str(),
-      INSTAPAPER_TOKENS.getConsumerSecret().c_str(), INSTAPAPER_TOKENS.getOauthToken().c_str(),
-      INSTAPAPER_TOKENS.getOauthTokenSecret().c_str());
+      "POST", url, bodyParams, INSTAPAPER_CREDENTIALS.getConsumerKey().c_str(),
+      INSTAPAPER_CREDENTIALS.getConsumerSecret().c_str(), INSTAPAPER_CREDENTIALS.getOauthToken().c_str(),
+      INSTAPAPER_CREDENTIALS.getOauthTokenSecret().c_str());
   if (authHeader.empty()) {
     LOG_ERR("INSTA", "Failed to build Authorization header");
     return -1;
@@ -129,16 +129,16 @@ int signedPost(const char* url, const std::vector<OAuth1Signer::Param>& bodyPara
 // Same as signedPost but streams the response body to a std::string (no JSON
 // parsing here — used by get_text which returns raw HTML, potentially large).
 int signedPostStreaming(const char* url, const std::vector<OAuth1Signer::Param>& bodyParams, std::string& outBody) {
-  if (!INSTAPAPER_TOKENS.hasTokens()) {
+  if (!INSTAPAPER_CREDENTIALS.hasTokens()) {
     return -1;
   }
 
   ensureTimeSynced();
 
   const std::string authHeader = OAuth1Signer::buildAuthHeader(
-      "POST", url, bodyParams, INSTAPAPER_TOKENS.getConsumerKey().c_str(),
-      INSTAPAPER_TOKENS.getConsumerSecret().c_str(), INSTAPAPER_TOKENS.getOauthToken().c_str(),
-      INSTAPAPER_TOKENS.getOauthTokenSecret().c_str());
+      "POST", url, bodyParams, INSTAPAPER_CREDENTIALS.getConsumerKey().c_str(),
+      INSTAPAPER_CREDENTIALS.getConsumerSecret().c_str(), INSTAPAPER_CREDENTIALS.getOauthToken().c_str(),
+      INSTAPAPER_CREDENTIALS.getOauthTokenSecret().c_str());
   if (authHeader.empty()) return -1;
 
   const std::string body = buildFormBody(bodyParams);
@@ -228,7 +228,7 @@ const char* InstapaperClient::errorString(Result r) {
 InstapaperClient::Result InstapaperClient::listBookmarks(InstapaperFolder folder, int limit,
                                                          std::vector<InstapaperArticle>& out) {
   out.clear();
-  if (!INSTAPAPER_TOKENS.hasTokens()) return NO_TOKENS;
+  if (!INSTAPAPER_CREDENTIALS.hasTokens()) return NO_TOKENS;
   if (limit < 1) limit = 25;
   if (limit > 500) limit = 500;
 
@@ -288,7 +288,7 @@ InstapaperClient::Result InstapaperClient::listBookmarks(InstapaperFolder folder
 }
 
 InstapaperClient::Result InstapaperClient::getText(uint64_t bookmarkId, std::string& outHtml) {
-  if (!INSTAPAPER_TOKENS.hasTokens()) return NO_TOKENS;
+  if (!INSTAPAPER_CREDENTIALS.hasTokens()) return NO_TOKENS;
   outHtml.clear();
 
   char idStr[24];
@@ -303,7 +303,7 @@ InstapaperClient::Result InstapaperClient::getText(uint64_t bookmarkId, std::str
 
 namespace {
 InstapaperClient::Result actionWithBookmarkId(const char* url, uint64_t bookmarkId) {
-  if (!INSTAPAPER_TOKENS.hasTokens()) return InstapaperClient::NO_TOKENS;
+  if (!INSTAPAPER_CREDENTIALS.hasTokens()) return InstapaperClient::NO_TOKENS;
   char idStr[24];
   std::snprintf(idStr, sizeof(idStr), "%llu", static_cast<unsigned long long>(bookmarkId));
   std::vector<OAuth1Signer::Param> params;
@@ -315,7 +315,7 @@ InstapaperClient::Result actionWithBookmarkId(const char* url, uint64_t bookmark
 }  // namespace
 
 InstapaperClient::Result InstapaperClient::updateReadProgress(uint64_t bookmarkId, float progress) {
-  if (!INSTAPAPER_TOKENS.hasTokens()) return NO_TOKENS;
+  if (!INSTAPAPER_CREDENTIALS.hasTokens()) return NO_TOKENS;
   if (progress < 0.0f) progress = 0.0f;
   if (progress > 1.0f) progress = 1.0f;
 

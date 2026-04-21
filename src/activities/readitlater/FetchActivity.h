@@ -1,19 +1,21 @@
 #pragma once
-#include <InstapaperArticle.h>
+#include <ReadItLaterArticle.h>
 
+#include "Provider.h"
 #include "activities/Activity.h"
 
 /**
- * Fetches an Instapaper article's text over the API, synthesizes a minimal
+ * Fetches a Read-it-Later article's text over the provider API, synthesizes a minimal
  * EPUB on SD, and transitions to the standard EpubReaderActivity.
  *
- * Entered with WiFi already connected — launched from InstapaperArticleList
+ * Entered with WiFi already connected — launched from ArticleListActivity
  * which performs the WiFi acquisition.
  */
-class InstapaperFetchActivity final : public Activity {
+class FetchActivity final : public Activity {
  public:
-  InstapaperFetchActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, InstapaperArticle article)
-      : Activity("InstapaperFetch", renderer, mappedInput), article(article) {}
+  FetchActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, Provider* provider,
+                ReadItLaterArticle article)
+      : Activity("Fetch", renderer, mappedInput), provider(provider), article(article) {}
 
   void onEnter() override;
   void onExit() override;
@@ -29,7 +31,8 @@ class InstapaperFetchActivity final : public Activity {
     FAILED,
   };
 
-  InstapaperArticle article;
+  Provider* provider = nullptr;
+  ReadItLaterArticle article;
   State state = FETCHING_TEXT;
   std::string errorMessage;
   std::string epubPath;

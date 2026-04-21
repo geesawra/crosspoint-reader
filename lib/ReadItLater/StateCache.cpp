@@ -1,4 +1,4 @@
-#include "InstapaperStateCache.h"
+#include "StateCache.h"
 
 #include <ArduinoJson.h>
 #include <HalStorage.h>
@@ -8,34 +8,27 @@
 #include <cstring>
 
 namespace {
-constexpr char CACHE_DIR[] = "/.crosspoint/instapaper";
-
-const char* folderKey(InstapaperFolder f) {
-  switch (f) {
-    case InstapaperFolder::UNREAD:
-      return "unread";
-    case InstapaperFolder::STARRED:
-      return "starred";
-    case InstapaperFolder::ARCHIVE:
-      return "archive";
-  }
-  return "unread";
+std::string cacheDirFor(const char* providerKey) {
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "/.crosspoint/%s", providerKey);
+  return std::string(buf);
 }
 
-std::string pathFor(InstapaperFolder f) {
-  char buf[96];
-  std::snprintf(buf, sizeof(buf), "%s/list_%s.json", CACHE_DIR, folderKey(f));
+std::string pathFor(const char* providerKey, const char* folderId) {
+  char buf[128];
+  std::snprintf(buf, sizeof(buf), "/.crosspoint/%s/list_%s.json", providerKey, folderId);
   return std::string(buf);
 }
 }  // namespace
 
-bool InstapaperStateCache::save(InstapaperFolder folder, const std::vector<InstapaperArticle>& articles) {
-  Storage.mkdir(CACHE_DIR);
+bool StateCache::save(const char* providerKey, const char* folderId,
+                      const std::vector<ReadItLaterArticle>& articles) {
+  Storage.mkdir(cacheDirFor(providerKey).c_str());
 
   JsonDocument doc;
   doc["synced_at"] = static_cast<int64_t>(::time(nullptr));
   JsonArray arr = doc["articles"].to<JsonArray>();
-  for (const InstapaperArticle& a : articles) {
+  for (const ReadItLaterArticle& a : articles) {
     JsonObject o = arr.add<JsonObject>();
     o["id"] = a.id;
     o["title"] = a.title;
@@ -50,25 +43,25 @@ bool InstapaperStateCache::save(InstapaperFolder folder, const std::vector<Insta
   std::string serialized;
   serializeJson(doc, serialized);
 
-  const std::string path = pathFor(folder);
+  const std::string path = pathFor(providerKey, folderId);
   FsFile f;
-  if (!Storage.openFileForWrite("INSTA", path.c_str(), f)) {
-    LOG_ERR("INSTA", "Cache save: cannot open %s", path.c_str());
+  if (!Storage.openFileForWrite("RIL", path.c_str(), f)) {
+    LOG_ERR("RIL", "Cache save: cannot open %s", path.c_str());
     return false;
   }
   const size_t n = f.write(serialized.data(), serialized.size());
   f.close();
   if (n != serialized.size()) {
-    LOG_ERR("INSTA", "Cache save: short write %zu/%zu", n, serialized.size());
+    LOG_ERR("RIL", "Cache save: short write %zu/%zu", n, serialized.size());
     return false;
   }
   return true;
 }
 
-bool InstapaperStateCache::load(InstapaperFolder folder, std::vector<InstapaperArticle>& articles,
-                                time_t* outSyncedAt) {
+bool StateCache::load(const char* providerKey, const char* folderId,
+                      std::vector<ReadItLaterArticle>& articles, time_t* outSyncedAt) {
   articles.clear();
-  const std::string path = pathFor(folder);
+  const std::string path = pathFor(providerKey, folderId);
   if (!Storage.exists(path.c_str())) return false;
 
   const String body = Storage.readFile(path.c_str());
@@ -76,7 +69,7 @@ bool InstapaperStateCache::load(InstapaperFolder folder, std::vector<InstapaperA
 
   JsonDocument doc;
   if (deserializeJson(doc, body.c_str())) {
-    LOG_ERR("INSTA", "Cache load: JSON parse failed for %s", path.c_str());
+    LOG_ERR("RIL", "Cache load: JSON parse failed for %s", path.c_str());
     return false;
   }
 
@@ -89,7 +82,7 @@ bool InstapaperStateCache::load(InstapaperFolder folder, std::vector<InstapaperA
 
   articles.reserve(arr.size());
   for (JsonVariantConst item : arr) {
-    InstapaperArticle a;
+    ReadItLaterArticle a;
     a.id = item["id"].as<uint64_t>();
     const char* title = item["title"] | "";
     const char* domain = item["domain"] | "";
@@ -109,8 +102,8 @@ bool InstapaperStateCache::load(InstapaperFolder folder, std::vector<InstapaperA
   return true;
 }
 
-void InstapaperStateCache::invalidate(InstapaperFolder folder) {
-  const std::string path = pathFor(folder);
+void StateCache::invalidate(const char* providerKey, const char* folderId) {
+  const std::string path = pathFor(providerKey, folderId);
   if (Storage.exists(path.c_str())) {
     Storage.remove(path.c_str());
   }

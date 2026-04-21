@@ -1,17 +1,16 @@
-#include "InstapaperTokenStore.h"
+#include "InstapaperCredentialStore.h"
 
 #include <HalStorage.h>
 #include <Logging.h>
 
 #include <cstring>
 
-InstapaperTokenStore InstapaperTokenStore::instance;
+InstapaperCredentialStore InstapaperCredentialStore::instance;
 
 namespace {
-constexpr char TOKENS_PATH[] = "/.crosspoint/instapaper_tokens.txt";
+constexpr char TOKENS_PATH[] = "/.crosspoint/instapaper.txt";
 constexpr size_t MAX_FILE_BYTES = 1024;
 
-// Strip leading/trailing whitespace (space, tab, CR, LF) in place.
 void trim(std::string& s) {
   size_t start = 0;
   while (start < s.size() && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' || s[start] == '\n')) {
@@ -24,7 +23,6 @@ void trim(std::string& s) {
   s = s.substr(start, end - start);
 }
 
-// Match a line with `key=value`. On match, assign trimmed value to `out`.
 bool matchField(const std::string& line, const char* key, std::string& out) {
   const size_t keyLen = strlen(key);
   if (line.size() <= keyLen || line.compare(0, keyLen, key) != 0 || line[keyLen] != '=') {
@@ -36,7 +34,7 @@ bool matchField(const std::string& line, const char* key, std::string& out) {
 }
 }  // namespace
 
-bool InstapaperTokenStore::loadFromFile() {
+bool InstapaperCredentialStore::loadFromFile() {
   invalidate();
 
   if (!Storage.exists(TOKENS_PATH)) {
@@ -51,7 +49,6 @@ bool InstapaperTokenStore::loadFromFile() {
     return false;
   }
 
-  // Split into lines and match each key.
   size_t i = 0;
   while (i < n) {
     size_t j = i;
@@ -77,11 +74,11 @@ bool InstapaperTokenStore::loadFromFile() {
   return true;
 }
 
-bool InstapaperTokenStore::hasTokens() const {
+bool InstapaperCredentialStore::hasTokens() const {
   return !consumerKey.empty() && !consumerSecret.empty() && !oauthToken.empty() && !oauthTokenSecret.empty();
 }
 
-void InstapaperTokenStore::invalidate() {
+void InstapaperCredentialStore::invalidate() {
   consumerKey.clear();
   consumerSecret.clear();
   oauthToken.clear();

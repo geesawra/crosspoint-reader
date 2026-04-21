@@ -26,8 +26,8 @@ class HomeActivity final : public Activity {
   void onSettingsOpen();
   void onFileTransferOpen();
   void onOpdsBrowserOpen();
-#ifdef INSTAPAPER_ENABLED
-  void onInstapaperOpen();
+#ifdef READ_IT_LATER_ENABLED
+  void onReadItLaterOpen();
 #endif
 
   int getMenuItemCount() const;

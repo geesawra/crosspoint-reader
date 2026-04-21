@@ -17,8 +17,8 @@
 #include "EpubReaderPercentSelectionActivity.h"
 #include "KOReaderCredentialStore.h"
 #include "KOReaderSyncActivity.h"
-#ifdef INSTAPAPER_ENABLED
-#include "InstapaperProgressSync.h"
+#ifdef READ_IT_LATER_ENABLED
+#include "ProgressSync.h"
 #endif
 #include "MappedInputManager.h"
 #include "QrDisplayActivity.h"
@@ -96,20 +96,16 @@ void EpubReaderActivity::onEnter() {
 void EpubReaderActivity::onExit() {
   Activity::onExit();
 
-#ifdef INSTAPAPER_ENABLED
-  // Push final read-progress back to Instapaper when closing a synthesized
-  // article EPUB. Best-effort: silently skipped if WiFi is down or the file
-  // is not an Instapaper article. Must run BEFORE `epub.reset()` because
-  // we need the progress helper.
+#ifdef READ_IT_LATER_ENABLED
+  // Push final read-progress back to the Read-it-Later provider when closing
+  // a synthesized article EPUB. Best-effort: silently skipped if WiFi is down
+  // or the file is not owned by any provider. Must run BEFORE `epub.reset()`.
   if (epub && section) {
-    const uint64_t bookmarkId = InstapaperProgressSync::extractBookmarkId(epub->getPath());
-    if (bookmarkId != 0) {
-      const int pageCount = section->pageCount;
-      const float chapterProg =
-          (pageCount > 0) ? (static_cast<float>(section->currentPage + 1) / static_cast<float>(pageCount)) : 0.0f;
-      const float bookProgress = epub->calculateProgress(currentSpineIndex, chapterProg);
-      InstapaperProgressSync::pushProgress(bookmarkId, bookProgress);
-    }
+    const int pageCount = section->pageCount;
+    const float chapterProg =
+        (pageCount > 0) ? (static_cast<float>(section->currentPage + 1) / static_cast<float>(pageCount)) : 0.0f;
+    const float bookProgress = epub->calculateProgress(currentSpineIndex, chapterProg);
+    ProgressSync::pushForPath(epub->getPath(), bookProgress);
   }
 #endif
 

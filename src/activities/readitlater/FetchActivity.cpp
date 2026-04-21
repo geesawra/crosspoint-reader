@@ -1,27 +1,33 @@
-#include "InstapaperFetchActivity.h"
+#include "FetchActivity.h"
 
+#include <EpubBuilder.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <I18n.h>
-#include <InstapaperClient.h>
-#include <InstapaperEpubBuilder.h>
 #include <Logging.h>
 #include <WiFi.h>
+
+#include <cstdio>
 
 #include "MappedInputManager.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
-void InstapaperFetchActivity::onEnter() {
+void FetchActivity::onEnter() {
   Activity::onEnter();
+
+  if (!provider) {
+    finish();
+    return;
+  }
 
   // If the article is already cached on SD, skip the API call and jump
   // straight to the reader. Flush button state first so the Confirm that
   // got us here doesn't ride through to the reader's first loop.
-  const std::string cached = InstapaperEpubBuilder::pathFor(article.id);
+  const std::string cached = provider->epubPathFor(article.id);
   if (Storage.exists(cached.c_str())) {
-    LOG_DBG("INSTA", "Using cached EPUB: %s", cached.c_str());
+    LOG_DBG("RIL", "Using cached EPUB: %s", cached.c_str());
     mappedInput.update();
     delay(10);
     mappedInput.update();
@@ -45,7 +51,7 @@ void InstapaperFetchActivity::onEnter() {
   performWork();
 }
 
-void InstapaperFetchActivity::onWifiSelectionComplete(bool success) {
+void FetchActivity::onWifiSelectionComplete(bool success) {
   if (!success) {
     finish();
     return;
@@ -55,9 +61,9 @@ void InstapaperFetchActivity::onWifiSelectionComplete(bool success) {
   performWork();
 }
 
-void InstapaperFetchActivity::onExit() { Activity::onExit(); }
+void FetchActivity::onExit() { Activity::onExit(); }
 
-void InstapaperFetchActivity::performWork() {
+void FetchActivity::performWork() {
   {
     RenderLock lock(*this);
     state = FETCHING_TEXT;
@@ -65,11 +71,11 @@ void InstapaperFetchActivity::performWork() {
   requestUpdateAndWait();
 
   std::string html;
-  const auto fetchResult = InstapaperClient::getText(article.id, html);
-  if (fetchResult != InstapaperClient::OK) {
+  const auto fetchResult = provider->fetchText(article.id, html);
+  if (fetchResult != Provider::Result::OK) {
     RenderLock lock(*this);
     state = FAILED;
-    errorMessage = InstapaperClient::errorString(fetchResult);
+    errorMessage = provider->errorString(fetchResult);
     requestUpdate(true);
     return;
   }
@@ -82,8 +88,9 @@ void InstapaperFetchActivity::performWork() {
   }
   requestUpdateAndWait();
 
-  const std::string path =
-      InstapaperEpubBuilder::build(article.id, article.title, article.author, html.c_str(), &onBuildProgress, this);
+  const std::string path = EpubBuilder::build(
+      provider->cacheDirName(), provider->coverPngData(), provider->coverPngLen(), article.id, article.title,
+      article.author, html.c_str(), &onBuildProgress, this);
   if (path.empty()) {
     RenderLock lock(*this);
     state = FAILED;
@@ -98,10 +105,6 @@ void InstapaperFetchActivity::performWork() {
   html.shrink_to_fit();
 
   // Drain any button-edge events accumulated while fetch+build blocked.
-  // Without this, the Confirm press→release edge from the user tapping to
-  // open the article fires on the reader's first loop() and immediately
-  // opens the reader menu. Two updates settle prev==curr so no fresh edge
-  // is visible to the reader.
   mappedInput.update();
   delay(10);
   mappedInput.update();
@@ -110,8 +113,8 @@ void InstapaperFetchActivity::performWork() {
   activityManager.goToReader(epubPath);
 }
 
-void InstapaperFetchActivity::onBuildProgress(void* ctx, int percent, const char* label) {
-  auto* self = static_cast<InstapaperFetchActivity*>(ctx);
+void FetchActivity::onBuildProgress(void* ctx, int percent, const char* label) {
+  auto* self = static_cast<FetchActivity*>(ctx);
   {
     RenderLock lock(*self);
     self->buildPercent = percent;
@@ -122,7 +125,7 @@ void InstapaperFetchActivity::onBuildProgress(void* ctx, int percent, const char
   self->requestUpdate(true);
 }
 
-void InstapaperFetchActivity::loop() {
+void FetchActivity::loop() {
   if (state == FAILED) {
     if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
       finish();
@@ -130,7 +133,7 @@ void InstapaperFetchActivity::loop() {
   }
 }
 
-void InstapaperFetchActivity::render(RenderLock&&) {
+void FetchActivity::render(RenderLock&&) {
   renderer.clearScreen();
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();

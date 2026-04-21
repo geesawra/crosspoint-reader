@@ -1,4 +1,4 @@
-#include "InstapaperImageFetcher.h"
+#include "ImageFetcher.h"
 
 #include <HTTPClient.h>
 #include <HalStorage.h>
@@ -25,12 +25,10 @@ const char* extensionFromContentType(const String& contentType) {
 }
 }  // namespace
 
-InstapaperImageFetcher::Result InstapaperImageFetcher::download(const std::string& url,
-                                                                const std::string& localPathBase, size_t maxBytes) {
+ImageFetcher::Result ImageFetcher::download(const std::string& url,
+                                            const std::string& localPathBase, size_t maxBytes) {
   Result out;
   if (url.empty()) return out;
-  // Only accept absolute https/http URLs — relative references would require
-  // resolving against the article source, which we don't track.
   if (!startsWith(url, "http://") && !startsWith(url, "https://")) return out;
 
   HTTPClient http;
@@ -44,9 +42,6 @@ InstapaperImageFetcher::Result InstapaperImageFetcher::download(const std::strin
     if (!http.begin(plain, url.c_str())) return out;
   }
 
-  // CDNs frequently 301/302 images; without redirect following we'd give up
-  // at the first hop and embed nothing. Some origins also serve a 403 to
-  // bare requests — a plausible User-Agent keeps them happy.
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   http.setUserAgent("Mozilla/5.0 (compatible; CrossPoint/1.2)");
 
@@ -55,7 +50,7 @@ InstapaperImageFetcher::Result InstapaperImageFetcher::download(const std::strin
 
   const int code = http.GET();
   if (code != 200) {
-    LOG_ERR("INSTA", "Image GET %s → %d", url.c_str(), code);
+    LOG_ERR("IMG", "Image GET %s → %d", url.c_str(), code);
     http.end();
     return out;
   }
@@ -63,14 +58,14 @@ InstapaperImageFetcher::Result InstapaperImageFetcher::download(const std::strin
   const String ct = http.header("Content-Type");
   const char* ext = extensionFromContentType(ct);
   if (!ext) {
-    LOG_DBG("INSTA", "Skipping image (Content-Type '%s') for %s", ct.c_str(), url.c_str());
+    LOG_DBG("IMG", "Skipping image (Content-Type '%s') for %s", ct.c_str(), url.c_str());
     http.end();
     return out;
   }
 
   const int contentLen = http.getSize();
   if (contentLen > 0 && static_cast<size_t>(contentLen) > maxBytes) {
-    LOG_DBG("INSTA", "Skipping image (too large: %d > %zu)", contentLen, maxBytes);
+    LOG_DBG("IMG", "Skipping image (too large: %d > %zu)", contentLen, maxBytes);
     http.end();
     return out;
   }
@@ -78,7 +73,7 @@ InstapaperImageFetcher::Result InstapaperImageFetcher::download(const std::strin
   const std::string path = localPathBase + "." + ext;
 
   FsFile file;
-  if (!Storage.openFileForWrite("INSTA", path.c_str(), file)) {
+  if (!Storage.openFileForWrite("IMG", path.c_str(), file)) {
     http.end();
     return out;
   }
@@ -88,7 +83,7 @@ InstapaperImageFetcher::Result InstapaperImageFetcher::download(const std::strin
   uint8_t buf[CHUNK_SIZE];
   while (http.connected() && (contentLen < 0 || written < static_cast<size_t>(contentLen))) {
     if (written > maxBytes) {
-      LOG_DBG("INSTA", "Image exceeded cap, truncating");
+      LOG_DBG("IMG", "Image exceeded cap, truncating");
       break;
     }
     const int avail = stream ? stream->available() : 0;
@@ -101,7 +96,7 @@ InstapaperImageFetcher::Result InstapaperImageFetcher::download(const std::strin
     if (n <= 0) break;
     const size_t wrote = file.write(buf, n);
     if (wrote != static_cast<size_t>(n)) {
-      LOG_ERR("INSTA", "Short write during image download");
+      LOG_ERR("IMG", "Short write during image download");
       file.close();
       Storage.remove(path.c_str());
       http.end();
@@ -112,13 +107,13 @@ InstapaperImageFetcher::Result InstapaperImageFetcher::download(const std::strin
   file.close();
   http.end();
 
-  if (written < 100) {  // suspiciously tiny → discard
-    LOG_ERR("INSTA", "Image too small (%zu bytes), discarding %s", written, path.c_str());
+  if (written < 100) {
+    LOG_ERR("IMG", "Image too small (%zu bytes), discarding %s", written, path.c_str());
     Storage.remove(path.c_str());
     return out;
   }
 
-  LOG_DBG("INSTA", "Image saved: %s (%zu bytes, Content-Type '%s')", path.c_str(), written, ct.c_str());
+  LOG_DBG("IMG", "Image saved: %s (%zu bytes, Content-Type '%s')", path.c_str(), written, ct.c_str());
   out.localPath = path;
   out.extension = ext;
   return out;

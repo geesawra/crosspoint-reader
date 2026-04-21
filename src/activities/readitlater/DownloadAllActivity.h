@@ -1,8 +1,9 @@
 #pragma once
-#include <InstapaperArticle.h>
+#include <ReadItLaterArticle.h>
 
 #include <vector>
 
+#include "Provider.h"
 #include "activities/Activity.h"
 
 /**
@@ -10,14 +11,14 @@
  * cached EPUB for each. Drives a progress bar. Useful before going offline
  * (e.g. a commute).
  *
- * Entered with WiFi already connected (caller is InstapaperArticleListActivity
+ * Entered with WiFi already connected (caller is ArticleListActivity
  * which has already performed WiFi acquisition).
  */
-class InstapaperDownloadAllActivity final : public Activity {
+class DownloadAllActivity final : public Activity {
  public:
-  InstapaperDownloadAllActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                std::vector<InstapaperArticle> articles)
-      : Activity("InstapaperDownloadAll", renderer, mappedInput), articles(std::move(articles)) {}
+  DownloadAllActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, Provider* provider,
+                      std::vector<ReadItLaterArticle> articles)
+      : Activity("DownloadAll", renderer, mappedInput), provider(provider), articles(std::move(articles)) {}
 
   void onEnter() override;
   void onExit() override;
@@ -33,7 +34,8 @@ class InstapaperDownloadAllActivity final : public Activity {
     CANCELLED,
   };
 
-  std::vector<InstapaperArticle> articles;
+  Provider* provider = nullptr;
+  std::vector<ReadItLaterArticle> articles;
   State state = RUNNING;
   volatile bool cancelRequested = false;
   int completed = 0;

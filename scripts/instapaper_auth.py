@@ -12,13 +12,13 @@ Usage:
         --consumer-secret CS \\
         --username USER \\
         --password PASS \\
-        --output instapaper_tokens.txt
+        --output instapaper.txt
 
 You need an Instapaper OAuth consumer key/secret. Apply for one at:
     https://www.instapaper.com/developers/applications/create
 
 Copy the resulting file to your SD card at:
-    /.crosspoint/instapaper_tokens.txt
+    /.crosspoint/instapaper.txt
 """
 import argparse
 import base64
@@ -98,7 +98,7 @@ def main() -> int:
     parser.add_argument("--consumer-secret", required=True)
     parser.add_argument("--username", required=True)
     parser.add_argument("--password", help="Prompted if omitted")
-    parser.add_argument("--output", default="instapaper_tokens.txt")
+    parser.add_argument("--output", default="instapaper.txt")
     args = parser.parse_args()
 
     password = args.password or getpass.getpass("Instapaper password: ")
@@ -118,7 +118,7 @@ def main() -> int:
         f.write(f"oauth_token_secret={token_secret}\n")
 
     print(f"Wrote {args.output}.")
-    print("Copy it to your SD card at /.crosspoint/instapaper_tokens.txt")
+    print("Copy it to your SD card at /.crosspoint/instapaper.txt")
     return 0
 
 

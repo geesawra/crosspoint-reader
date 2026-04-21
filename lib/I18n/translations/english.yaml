@@ -320,3 +320,8 @@ STR_INSTAPAPER_UNSTAR: "Unstar"
 STR_INSTAPAPER_ARCHIVE_ACTION: "Archive"
 STR_INSTAPAPER_UNARCHIVE: "Unarchive"
 STR_INSTAPAPER_DELETE: "Delete"
+
+STR_READ_IT_LATER: "Read-it-Later"
+STR_RIL_NO_TOKENS: "No providers configured"
+STR_RIL_TOKENS_HINT: "Add a .txt file to /.crosspoint/"
+STR_RIL_SELECT_PROVIDER: "Select service"

@@ -1,10 +1,9 @@
-#include "InstapaperDownloadAllActivity.h"
+#include "DownloadAllActivity.h"
 
+#include <EpubBuilder.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <I18n.h>
-#include <InstapaperClient.h>
-#include <InstapaperEpubBuilder.h>
 #include <Logging.h>
 #include <WiFi.h>
 
@@ -15,14 +14,19 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 
-void InstapaperDownloadAllActivity::onEnter() {
+void DownloadAllActivity::onEnter() {
   Activity::onEnter();
   completed = 0;
   skipped = 0;
   failed = 0;
   cancelRequested = false;
 
-  // WiFi is mandatory here — launching straight into getText() without it
+  if (!provider) {
+    finish();
+    return;
+  }
+
+  // WiFi is mandatory here — launching straight into fetchText() without it
   // triggers a null-mutex assert deep in lwIP because the TCPIP core lock is
   // only initialized on the first WiFi.begin().
   if (WiFi.status() != WL_CONNECTED) {
@@ -38,7 +42,7 @@ void InstapaperDownloadAllActivity::onEnter() {
   performDownloads();
 }
 
-void InstapaperDownloadAllActivity::onWifiSelectionComplete(bool success) {
+void DownloadAllActivity::onWifiSelectionComplete(bool success) {
   if (!success) {
     finish();
     return;
@@ -48,9 +52,9 @@ void InstapaperDownloadAllActivity::onWifiSelectionComplete(bool success) {
   performDownloads();
 }
 
-void InstapaperDownloadAllActivity::onExit() { Activity::onExit(); }
+void DownloadAllActivity::onExit() { Activity::onExit(); }
 
-void InstapaperDownloadAllActivity::performDownloads() {
+void DownloadAllActivity::performDownloads() {
   for (size_t i = 0; i < articles.size(); i++) {
     if (cancelRequested) {
       RenderLock lock(*this);
@@ -59,10 +63,10 @@ void InstapaperDownloadAllActivity::performDownloads() {
       return;
     }
 
-    const InstapaperArticle& a = articles[i];
+    const ReadItLaterArticle& a = articles[i];
 
     // Skip if already cached.
-    const std::string epubPath = InstapaperEpubBuilder::pathFor(a.id);
+    const std::string epubPath = provider->epubPathFor(a.id);
     if (Storage.exists(epubPath.c_str())) {
       skipped++;
       {
@@ -74,12 +78,14 @@ void InstapaperDownloadAllActivity::performDownloads() {
     }
 
     std::string html;
-    const auto r = InstapaperClient::getText(a.id, html);
-    if (r != InstapaperClient::OK) {
-      LOG_ERR("INSTA", "Download-all: %s failed (%s)", a.title, InstapaperClient::errorString(r));
+    const auto r = provider->fetchText(a.id, html);
+    if (r != Provider::Result::OK) {
+      LOG_ERR("RIL", "Download-all: %s failed (%s)", a.title, provider->errorString(r));
       failed++;
     } else {
-      const std::string out = InstapaperEpubBuilder::build(a.id, a.title, a.author, html.c_str());
+      const std::string out =
+          EpubBuilder::build(provider->cacheDirName(), provider->coverPngData(), provider->coverPngLen(), a.id,
+                             a.title, a.author, html.c_str());
       if (out.empty()) {
         failed++;
       }
@@ -99,7 +105,7 @@ void InstapaperDownloadAllActivity::performDownloads() {
   requestUpdate(true);
 }
 
-void InstapaperDownloadAllActivity::loop() {
+void DownloadAllActivity::loop() {
   if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
     if (state == RUNNING) {
       cancelRequested = true;
@@ -109,7 +115,7 @@ void InstapaperDownloadAllActivity::loop() {
   }
 }
 
-void InstapaperDownloadAllActivity::render(RenderLock&&) {
+void DownloadAllActivity::render(RenderLock&&) {
   renderer.clearScreen();
   const auto& metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();

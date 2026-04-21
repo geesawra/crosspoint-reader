@@ -11,7 +11,7 @@
  * Safe to call with an insecure TLS context (setInsecure()); image CDNs
  * rarely present certificates worth verifying.
  */
-namespace InstapaperImageFetcher {
+namespace ImageFetcher {
 
 struct Result {
   std::string localPath;  // absolute SD path of the downloaded file, empty on failure
@@ -23,4 +23,4 @@ struct Result {
 // strings on any failure.
 Result download(const std::string& url, const std::string& localPathBase, size_t maxBytes = 150 * 1024);
 
-}  // namespace InstapaperImageFetcher
+}  // namespace ImageFetcher

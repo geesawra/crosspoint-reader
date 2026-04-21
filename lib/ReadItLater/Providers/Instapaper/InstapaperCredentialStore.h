@@ -12,14 +12,14 @@
  * User generates the file with scripts/instapaper_auth.py on a computer
  * and drops it onto the SD card. No on-device login flow.
  */
-class InstapaperTokenStore {
+class InstapaperCredentialStore {
  public:
-  static InstapaperTokenStore& getInstance() { return instance; }
+  static InstapaperCredentialStore& getInstance() { return instance; }
 
-  InstapaperTokenStore(const InstapaperTokenStore&) = delete;
-  InstapaperTokenStore& operator=(const InstapaperTokenStore&) = delete;
+  InstapaperCredentialStore(const InstapaperCredentialStore&) = delete;
+  InstapaperCredentialStore& operator=(const InstapaperCredentialStore&) = delete;
 
-  // Load from /.crosspoint/instapaper_tokens.txt. Returns true if all four
+  // Load from /.crosspoint/instapaper.txt. Returns true if all four
   // fields are present and non-empty.
   bool loadFromFile();
 
@@ -32,8 +32,8 @@ class InstapaperTokenStore {
   const std::string& getOauthTokenSecret() const { return oauthTokenSecret; }
 
  private:
-  InstapaperTokenStore() = default;
-  static InstapaperTokenStore instance;
+  InstapaperCredentialStore() = default;
+  static InstapaperCredentialStore instance;
 
   std::string consumerKey;
   std::string consumerSecret;
@@ -41,4 +41,4 @@ class InstapaperTokenStore {
   std::string oauthTokenSecret;
 };
 
-#define INSTAPAPER_TOKENS InstapaperTokenStore::getInstance()
+#define INSTAPAPER_CREDENTIALS InstapaperCredentialStore::getInstance()

@@ -1,16 +1,18 @@
-#include "InstapaperArticleListActivity.h"
+#include "ArticleListActivity.h"
 
 #include <GfxRenderer.h>
 #include <I18n.h>
-#include <InstapaperEpubBuilder.h>
-#include <InstapaperStateCache.h>
 #include <Logging.h>
+#include <Provider.h>
+#include <StateCache.h>
 #include <WiFi.h>
 #include <time.h>
 
-#include "InstapaperActionsActivity.h"
-#include "InstapaperDownloadAllActivity.h"
-#include "InstapaperFetchActivity.h"
+#include <cstdio>
+
+#include "ActionsActivity.h"
+#include "DownloadAllActivity.h"
+#include "FetchActivity.h"
 #include "MappedInputManager.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
@@ -18,26 +20,14 @@
 
 namespace {
 constexpr int LIST_LIMIT = 50;
-
-const char* folderLabelKey(InstapaperFolder f) {
-  switch (f) {
-    case InstapaperFolder::UNREAD:
-      return tr(STR_INSTAPAPER_UNREAD);
-    case InstapaperFolder::STARRED:
-      return tr(STR_INSTAPAPER_STARRED);
-    case InstapaperFolder::ARCHIVE:
-      return tr(STR_INSTAPAPER_ARCHIVE);
-  }
-  return "";
-}
 }  // namespace
 
-void InstapaperArticleListActivity::onEnter() {
+void ArticleListActivity::onEnter() {
   Activity::onEnter();
 
   // Populate from SD cache first so the list appears instantly, even if the
   // follow-up live refresh is slow or fails entirely (offline re-entry).
-  const bool hadCache = InstapaperStateCache::load(folder, articles, &lastSyncedAt);
+  const bool hadCache = StateCache::load(provider->cacheDirName(), folder.id, articles, &lastSyncedAt);
   if (hadCache && !articles.empty()) {
     state = SHOWING_LIST;
     selectedIndex = 0;
@@ -60,9 +50,9 @@ void InstapaperArticleListActivity::onEnter() {
                          [this](const ActivityResult& r) { onWifiSelectionComplete(!r.isCancelled); });
 }
 
-void InstapaperArticleListActivity::onExit() { Activity::onExit(); }
+void ArticleListActivity::onExit() { Activity::onExit(); }
 
-void InstapaperArticleListActivity::onWifiSelectionComplete(bool success) {
+void ArticleListActivity::onWifiSelectionComplete(bool success) {
   if (!success) {
     finish();
     return;
@@ -72,12 +62,12 @@ void InstapaperArticleListActivity::onWifiSelectionComplete(bool success) {
   performFetch();
 }
 
-void InstapaperArticleListActivity::performFetch() {
+void ArticleListActivity::performFetch() {
   // Defense in depth: callers other than onEnter have historically reached
   // here without verifying WiFi, which faults lwIP (Invalid mbox) when the
   // radio was never initialized on this boot.
   if (WiFi.status() != WL_CONNECTED) {
-    LOG_DBG("INSTA", "performFetch skipped: WiFi not connected");
+    LOG_DBG("RIL", "performFetch skipped: WiFi not connected");
     RenderLock lock(*this);
     if (state == SHOWING_LIST && !articles.empty()) {
       offline = true;
@@ -98,11 +88,11 @@ void InstapaperArticleListActivity::performFetch() {
   }
   requestUpdateAndWait();
 
-  std::vector<InstapaperArticle> fresh;
-  const auto r = InstapaperClient::listBookmarks(folder, LIST_LIMIT, fresh);
+  std::vector<ReadItLaterArticle> fresh;
+  const auto r = provider->listArticles(folder, LIST_LIMIT, fresh);
 
-  if (r == InstapaperClient::OK) {
-    InstapaperStateCache::save(folder, fresh);
+  if (r == Provider::Result::OK) {
+    StateCache::save(provider->cacheDirName(), folder.id, fresh);
     {
       RenderLock lock(*this);
       articles = std::move(fresh);
@@ -126,22 +116,22 @@ void InstapaperArticleListActivity::performFetch() {
     if (hadCachedList) {
       // Stay on cached data, just mark as offline.
       offline = true;
-      errorMessage = InstapaperClient::errorString(r);
+      errorMessage = provider->errorString(r);
     } else {
       state = FETCH_FAILED;
-      errorMessage = InstapaperClient::errorString(r);
+      errorMessage = provider->errorString(r);
     }
   }
   requestUpdate(true);
 }
 
-void InstapaperArticleListActivity::openSelected() {
+void ArticleListActivity::openSelected() {
   if (state != SHOWING_LIST || articles.empty()) return;
-  const InstapaperArticle& a = articles[selectedIndex];
-  activityManager.pushActivity(std::make_unique<InstapaperFetchActivity>(renderer, mappedInput, a));
+  const ReadItLaterArticle& a = articles[selectedIndex];
+  activityManager.pushActivity(std::make_unique<FetchActivity>(renderer, mappedInput, provider, a));
 }
 
-void InstapaperArticleListActivity::loop() {
+void ArticleListActivity::loop() {
   if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
     finish();
     return;
@@ -169,8 +159,8 @@ void InstapaperArticleListActivity::loop() {
   if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
     if (articles.empty()) return;
     const int savedIndex = selectedIndex;
-    const InstapaperArticle a = articles[selectedIndex];
-    startActivityForResult(std::make_unique<InstapaperActionsActivity>(renderer, mappedInput, a, folder),
+    const ReadItLaterArticle a = articles[selectedIndex];
+    startActivityForResult(std::make_unique<ActionsActivity>(renderer, mappedInput, provider, a, folder),
                            [this, savedIndex](const ActivityResult& r) {
                              const bool changed = !r.isCancelled;
                              if (changed) {
@@ -188,13 +178,13 @@ void InstapaperArticleListActivity::loop() {
   // Right: bulk download of the current folder.
   if (mappedInput.wasPressed(MappedInputManager::Button::Right)) {
     if (articles.empty()) return;
-    startActivityForResult(std::make_unique<InstapaperDownloadAllActivity>(renderer, mappedInput, articles),
+    startActivityForResult(std::make_unique<DownloadAllActivity>(renderer, mappedInput, provider, articles),
                            [this](const ActivityResult&) { requestUpdate(); });
     return;
   }
 }
 
-void InstapaperArticleListActivity::render(RenderLock&&) {
+void ArticleListActivity::render(RenderLock&&) {
   renderer.clearScreen();
 
   const auto& metrics = UITheme::getInstance().getMetrics();
@@ -216,8 +206,10 @@ void InstapaperArticleListActivity::render(RenderLock&&) {
     }
     subtitle = subtitleBuf;
   }
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, folderLabelKey(folder),
-                 subtitle);
+
+  const char* headerLabel =
+      (folder.label && folder.label[0] != '\0') ? folder.label : (provider ? provider->name() : "");
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, headerLabel, subtitle);
 
   if (state == FETCHING || state == WIFI_SELECTION) {
     renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2, tr(STR_INSTAPAPER_FETCHING), true, EpdFontFamily::BOLD);

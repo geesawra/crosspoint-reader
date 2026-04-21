@@ -27,8 +27,8 @@ int HomeActivity::getMenuItemCount() const {
   if (hasOpdsUrl) {
     count++;
   }
-#ifdef INSTAPAPER_ENABLED
-  count++;  // Instapaper
+#ifdef READ_IT_LATER_ENABLED
+  count++;  // Read-it-Later
 #endif
   return count;
 }
@@ -194,10 +194,10 @@ void HomeActivity::loop() {
     const int fileBrowserIdx = idx++;
     const int recentsIdx = idx++;
     const int opdsLibraryIdx = hasOpdsUrl ? idx++ : -1;
-#ifdef INSTAPAPER_ENABLED
-    const int instapaperIdx = idx++;
+#ifdef READ_IT_LATER_ENABLED
+    const int readItLaterIdx = idx++;
 #else
-    const int instapaperIdx = -1;
+    const int readItLaterIdx = -1;
 #endif
     const int fileTransferIdx = idx++;
     const int settingsIdx = idx;
@@ -210,9 +210,9 @@ void HomeActivity::loop() {
       onRecentsOpen();
     } else if (menuSelectedIndex == opdsLibraryIdx) {
       onOpdsBrowserOpen();
-#ifdef INSTAPAPER_ENABLED
-    } else if (menuSelectedIndex == instapaperIdx) {
-      onInstapaperOpen();
+#ifdef READ_IT_LATER_ENABLED
+    } else if (menuSelectedIndex == readItLaterIdx) {
+      onReadItLaterOpen();
 #endif
     } else if (menuSelectedIndex == fileTransferIdx) {
       onFileTransferOpen();
@@ -247,12 +247,12 @@ void HomeActivity::render(RenderLock&&) {
     menuIcons.insert(menuIcons.begin() + 2, Library);
   }
 
-#ifdef INSTAPAPER_ENABLED
+#ifdef READ_IT_LATER_ENABLED
   {
-    // Insert Instapaper before File Transfer (index depends on OPDS presence).
+    // Insert Read-it-Later before File Transfer (index depends on OPDS presence).
     const size_t pos = hasOpdsUrl ? 3 : 2;
-    menuItems.insert(menuItems.begin() + pos, tr(STR_INSTAPAPER));
-    menuIcons.insert(menuIcons.begin() + pos, Instapaper);
+    menuItems.insert(menuItems.begin() + pos, tr(STR_READ_IT_LATER));
+    menuIcons.insert(menuIcons.begin() + pos, ReadItLater);
   }
 #endif
 
@@ -291,6 +291,6 @@ void HomeActivity::onFileTransferOpen() { activityManager.goToFileTransfer(); }
 
 void HomeActivity::onOpdsBrowserOpen() { activityManager.goToBrowser(); }
 
-#ifdef INSTAPAPER_ENABLED
-void HomeActivity::onInstapaperOpen() { activityManager.goToInstapaper(); }
+#ifdef READ_IT_LATER_ENABLED
+void HomeActivity::onReadItLaterOpen() { activityManager.goToReadItLater(); }
 #endif
