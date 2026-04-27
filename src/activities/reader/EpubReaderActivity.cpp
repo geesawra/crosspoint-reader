@@ -53,6 +53,10 @@ void EpubReaderActivity::onEnter() {
     return;
   }
 
+  // Reset refresh counter so every book entry starts with a predictable cadence.
+  // Without this the counter carries stale state across book opens.
+  pagesUntilFullRefresh = 0;
+
   // Configure screen orientation based on settings
   // NOTE: This affects layout math and must be applied before any render calls.
   ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
