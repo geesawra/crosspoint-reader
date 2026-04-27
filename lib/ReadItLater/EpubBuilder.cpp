@@ -86,38 +86,65 @@ void appendEscapedText(std::string& out, const char* s, size_t len) {
   }
 }
 
-std::vector<std::string> extractImageUrls(const char* html, size_t maxUrls) {
+std::vector<std::string> extractImageUrlsFromFile(FsFile& file, size_t maxUrls) {
   std::vector<std::string> urls;
-  if (!html) return urls;
-  const size_t n = std::strlen(html);
-  size_t i = 0;
-  while (i + 4 < n && urls.size() < maxUrls) {
-    if (!((html[i] == '<') && ((html[i + 1] | 0x20) == 'i') && ((html[i + 2] | 0x20) == 'm') &&
-          ((html[i + 3] | 0x20) == 'g'))) {
-      i++;
-      continue;
-    }
-    size_t end = i + 4;
-    while (end < n && html[end] != '>') end++;
-    if (end >= n) break;
-    for (size_t p = i + 4; p + 4 < end; p++) {
-      if ((html[p] | 0x20) == 's' && (html[p + 1] | 0x20) == 'r' && (html[p + 2] | 0x20) == 'c' && html[p + 3] == '=') {
-        size_t vs = p + 4;
-        char quote = 0;
-        if (vs < end && (html[vs] == '"' || html[vs] == '\'')) {
-          quote = html[vs];
-          vs++;
-        }
-        size_t ve = vs;
-        while (ve < end && html[ve] != (quote ? quote : ' ') && html[ve] != '>') ve++;
-        if (ve > vs) {
-          urls.emplace_back(html + vs, ve - vs);
-        }
-        break;
+  constexpr size_t CHUNK_SIZE = 2048;
+  constexpr size_t OVERLAP = 1024;  // Enough for any realistic <img ...> tag
+
+  std::string partial;
+  partial.reserve(OVERLAP);
+
+  uint8_t buf[CHUNK_SIZE];
+  while (file.available() && urls.size() < maxUrls) {
+    const int got = file.read(buf, CHUNK_SIZE);
+    if (got <= 0) break;
+
+    std::string combined;
+    combined.reserve(partial.size() + static_cast<size_t>(got));
+    combined.append(partial);
+    combined.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(got));
+
+    size_t i = 0;
+    const size_t n = combined.size();
+    while (i + 4 < n && urls.size() < maxUrls) {
+      if (!((combined[i] == '<') && ((combined[i + 1] | 0x20) == 'i') && ((combined[i + 2] | 0x20) == 'm') &&
+            ((combined[i + 3] | 0x20) == 'g'))) {
+        i++;
+        continue;
       }
+      size_t end = i + 4;
+      while (end < n && combined[end] != '>') end++;
+      if (end >= n) break;  // Incomplete tag — will be completed in next iteration
+      for (size_t p = i + 4; p + 4 < end; p++) {
+        if ((combined[p] | 0x20) == 's' && (combined[p + 1] | 0x20) == 'r' &&
+            (combined[p + 2] | 0x20) == 'c' && combined[p + 3] == '=') {
+          size_t vs = p + 4;
+          char quote = 0;
+          if (vs < end && (combined[vs] == '"' || combined[vs] == '\'')) {
+            quote = combined[vs];
+            vs++;
+          }
+          size_t ve = vs;
+          while (ve < end && combined[ve] != (quote ? quote : ' ') && combined[ve] != '>') ve++;
+          if (ve > vs) {
+            urls.emplace_back(combined.c_str() + vs, ve - vs);
+          }
+          break;
+        }
+      }
+      i = end + 1;
     }
-    i = end + 1;
+
+    // Save trailing bytes as partial for next iteration
+    size_t keep = n - i;
+    if (keep > OVERLAP) keep = OVERLAP;
+    if (keep > 0) {
+      partial.assign(combined.c_str() + n - keep, keep);
+    } else {
+      partial.clear();
+    }
   }
+
   return urls;
 }
 
@@ -708,25 +735,17 @@ std::string EpubBuilder::build(const char* cacheDir,
   const std::string authorEsc = escapeXml(author && *author ? author : "");
 
   // --- Image URL extraction ---
-  // Read only the first 32 KB of the HTML file for img src scanning.
-  // This keeps a reasonable cap on the pre-pass memory while still catching
-  // images near the top of the article (where they almost always appear).
-  constexpr size_t IMG_SCAN_LIMIT = 32768;
-  std::string htmlHead;
+  // Stream-scan the full HTML file for <img src="..."> tags. Peak heap is
+  // O(CHUNK_SIZE + OVERLAP) regardless of article length.
+  std::vector<std::string> imageUrls;
   {
     FsFile hf;
     if (Storage.openFileForRead("RIL", htmlPath, hf)) {
-      htmlHead.resize(IMG_SCAN_LIMIT);
-      const int got = hf.read(&htmlHead[0], IMG_SCAN_LIMIT);
-      htmlHead.resize(got > 0 ? static_cast<size_t>(got) : 0);
+      constexpr size_t MAX_IMAGES = 6;
+      imageUrls = extractImageUrlsFromFile(hf, MAX_IMAGES);
       hf.close();
     }
   }
-
-  constexpr size_t MAX_IMAGES = 3;
-  const std::vector<std::string> imageUrls = extractImageUrls(htmlHead.c_str(), MAX_IMAGES);
-  htmlHead.clear();
-  htmlHead.shrink_to_fit();
   LOG_DBG("RIL", "Article has %zu image URL(s) to fetch", imageUrls.size());
   for (size_t idx = 0; idx < imageUrls.size(); idx++) {
     LOG_DBG("RIL", "  Image URL [%zu]: %s", idx, imageUrls[idx].c_str());

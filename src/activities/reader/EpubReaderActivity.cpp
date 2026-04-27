@@ -741,15 +741,31 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   LOG_DBG("ERS", "Heap: before=%lu after=%lu delta=%ld", heapBefore, heapAfter,
           (int32_t)heapAfter - (int32_t)heapBefore);
 
-  // Force special handling for pages with images when anti-aliasing is on
+  // Force special handling for pages with images when anti-aliasing is on.
+  // Only do the double-FAST blanking if all images are already cached.
+  // If an image is uncached, decoding may OOM after BW buffers are allocated,
+  // leaving a blank image area that never gets filled. In that case fall
+  // back to the normal refresh cycle so text remains readable.
   bool imagePageWithAA = page->hasImages() && SETTINGS.textAntiAliasing;
+  bool allImagesCached = true;
+  if (imagePageWithAA) {
+    for (const auto& el : page->elements) {
+      if (el->getTag() == TAG_PageImage) {
+        auto& pi = static_cast<PageImage&>(*el);
+        if (!pi.getImageBlock().isCached()) {
+          allImagesCached = false;
+          LOG_DBG("ERS", "Uncached image on page: %s", pi.getImageBlock().getImagePath().c_str());
+        }
+      }
+    }
+  }
 
   page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
   renderStatusBar();
   fcm->logStats("bw_render");
   const auto tBwRender = millis();
 
-  if (imagePageWithAA) {
+  if (imagePageWithAA && allImagesCached) {
     // Double FAST_REFRESH with selective image blanking (pablohc's technique):
     // HALF_REFRESH sets particles too firmly for the grayscale LUT to adjust.
     // Instead, blank only the image area and do two fast refreshes.
@@ -771,8 +787,8 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     }
     // Double FAST_REFRESH handles ghosting for image pages; don't count toward full refresh cadence
   } else {
-    LOG_DBG("ERS", "Refresh: cycle (counter=%d hasImages=%d AA=%d)", pagesUntilFullRefresh,
-            page->hasImages() ? 1 : 0, SETTINGS.textAntiAliasing ? 1 : 0);
+    LOG_DBG("ERS", "Refresh: cycle (counter=%d hasImages=%d AA=%d allCached=%d)", pagesUntilFullRefresh,
+            page->hasImages() ? 1 : 0, SETTINGS.textAntiAliasing ? 1 : 0, allImagesCached ? 1 : 0);
     ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
   }
   const auto tDisplay = millis();
