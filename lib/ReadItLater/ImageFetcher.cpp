@@ -74,6 +74,7 @@ ImageFetcher::Result ImageFetcher::download(const std::string& url,
 
   FsFile file;
   if (!Storage.openFileForWrite("IMG", path.c_str(), file)) {
+    LOG_ERR("IMG", "Cannot open SD file for write: %s", path.c_str());
     http.end();
     return out;
   }

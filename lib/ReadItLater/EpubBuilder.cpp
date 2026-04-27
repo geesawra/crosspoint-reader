@@ -364,6 +364,8 @@ bool EpubBuilder::sanitizeHtmlBodyStreaming(FsFile& inFile,
             if (!writeOut("<img src=\"", 10)) return false;
             if (!writeOut(it->second.data(), it->second.size())) return false;
             if (!writeOut("\"/>", 3)) return false;
+          } else {
+            LOG_DBG("RIL", "Sanitizer dropped <img> (src not in imageMap): %.80s", src.c_str());
           }
         }
       }
@@ -555,6 +557,8 @@ std::string EpubBuilder::sanitizeHtmlBody(const char* rawHtml,
             out.append("<img src=\"");
             out.append(it->second);
             out.append("\"/>");
+          } else {
+            LOG_DBG("RIL", "Sanitizer dropped <img> (src not in imageMap): %.80s", src.c_str());
           }
         }
       }
@@ -724,6 +728,9 @@ std::string EpubBuilder::build(const char* cacheDir,
   htmlHead.clear();
   htmlHead.shrink_to_fit();
   LOG_DBG("RIL", "Article has %zu image URL(s) to fetch", imageUrls.size());
+  for (size_t idx = 0; idx < imageUrls.size(); idx++) {
+    LOG_DBG("RIL", "  Image URL [%zu]: %s", idx, imageUrls[idx].c_str());
+  }
 
   std::unordered_map<std::string, std::string> imageMap;
   struct DownloadedImage {

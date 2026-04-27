@@ -301,6 +301,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
         {
           // Resolve the image path relative to the HTML file
           std::string resolvedPath = FsHelpers::normalisePath(self->contentBase + src);
+          LOG_DBG("EHP", "Resolved image path: %s (base=%s)", resolvedPath.c_str(), self->contentBase.c_str());
 
           if (ImageDecoderFactory::isFormatSupported(resolvedPath)) {
             // Create a unique filename for the cached image
@@ -468,6 +469,8 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
             } else {
               LOG_ERR("EHP", "Failed to extract image");
             }
+          } else {
+            LOG_DBG("EHP", "Image format not supported: %s", resolvedPath.c_str());
           }  // isFormatSupported
         }
       }
