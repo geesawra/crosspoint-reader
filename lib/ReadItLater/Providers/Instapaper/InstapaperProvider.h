@@ -18,14 +18,14 @@ class InstapaperProvider : public Provider {
   InstapaperProvider() = default;
 
   const char* name() const override { return "Instapaper"; }
-  const char* cacheDirName() const override { return "instapaper"; }
+  const char* cacheDirName() const override { return "read-it-later"; }
 
   bool loadCredentials() override { return INSTAPAPER_CREDENTIALS.loadFromFile(); }
   bool isConfigured() const override { return INSTAPAPER_CREDENTIALS.hasTokens(); }
 
   Result listFolders(std::vector<FolderInfo>& out) override;
   Result listArticles(const FolderInfo& folder, int limit, std::vector<ReadItLaterArticle>& out) override;
-  Result fetchText(uint64_t articleId, std::string& outHtml) override;
+  Result fetchText(uint64_t articleId, const std::string& outPath) override;
   std::vector<Action> availableActions(const FolderInfo& folder, const ReadItLaterArticle& article) const override;
   Result performAction(uint64_t articleId, Action action) override;
   Result updateProgress(uint64_t articleId, float progress) override;

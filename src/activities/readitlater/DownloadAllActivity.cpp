@@ -77,21 +77,33 @@ void DownloadAllActivity::performDownloads() {
       continue;
     }
 
-    std::string html;
-    const auto r = provider->fetchText(a.id, html);
+    char htmlTmpBuf[128];
+    std::snprintf(htmlTmpBuf, sizeof(htmlTmpBuf), "/.crosspoint/%s/tmp_html_%llu",
+                  provider->cacheDirName(), static_cast<unsigned long long>(a.id));
+    const std::string htmlTmpPath(htmlTmpBuf);
+
+    // Ensure the cache directory exists (build() also does this, but fetchText
+    // writes a temp file there first and needs it to already exist).
+    {
+      char cacheDir[64];
+      std::snprintf(cacheDir, sizeof(cacheDir), "/.crosspoint/%s", provider->cacheDirName());
+      Storage.mkdir(cacheDir);
+    }
+
+    const auto r = provider->fetchText(a.id, htmlTmpPath);
     if (r != Provider::Result::OK) {
       LOG_ERR("RIL", "Download-all: %s failed (%s)", a.title, provider->errorString(r));
+      Storage.remove(htmlTmpPath.c_str());
       failed++;
     } else {
       const std::string out =
           EpubBuilder::build(provider->cacheDirName(), provider->coverPngData(), provider->coverPngLen(), a.id,
-                             a.title, a.author, html.c_str());
+                             a.title, a.author, htmlTmpPath.c_str());
+      Storage.remove(htmlTmpPath.c_str());
       if (out.empty()) {
         failed++;
       }
     }
-    html.clear();
-    html.shrink_to_fit();
 
     {
       RenderLock lock(*this);

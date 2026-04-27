@@ -191,6 +191,87 @@ bool StoredZipWriter::addFileFromPath(const char* zipPath, const char* localPath
   return true;
 }
 
+bool StoredZipWriter::addFileFromCallback(const char* zipPath, size_t totalSize, WriteCallback cb) {
+  if (!opened) {
+    LOG_ERR("ZIPW", "addFileFromCallback before open");
+    return false;
+  }
+  if (!crcTableReady) {
+    buildCrcTable();
+  }
+
+  // Pass 1: compute CRC32 by running the callback dry into a stack buffer.
+  // We call cb twice (pass1 + pass2) so the caller must produce identical
+  // bytes on each invocation (i.e. be a pure generator, not a one-shot stream).
+  uint32_t crc = 0xFFFFFFFFu;
+  size_t scanned = 0;
+  uint8_t chunk[256];
+  while (scanned < totalSize) {
+    const int got = cb(chunk, sizeof(chunk));
+    if (got < 0) {
+      LOG_ERR("ZIPW", "Callback error during CRC pass");
+      return false;
+    }
+    if (got == 0) break;
+    for (int j = 0; j < got; j++) {
+      crc = crcTable[(crc ^ chunk[j]) & 0xFF] ^ (crc >> 8);
+    }
+    scanned += got;
+  }
+  crc ^= 0xFFFFFFFFu;
+
+  if (scanned != totalSize) {
+    LOG_ERR("ZIPW", "Callback produced %zu bytes, expected %zu (CRC pass)", scanned, totalSize);
+    return false;
+  }
+
+  Entry e;
+  e.path = zipPath;
+  e.size = static_cast<uint32_t>(totalSize);
+  e.crc32 = crc;
+  e.localOffset = static_cast<uint32_t>(file.position());
+
+  const uint16_t nameLen = static_cast<uint16_t>(e.path.size());
+
+  // Local file header.
+  if (!writeLE32(file, LOCAL_FILE_SIG)) return false;
+  if (!writeLE16(file, VERSION_NEEDED)) return false;
+  if (!writeLE16(file, 0)) return false;
+  if (!writeLE16(file, METHOD_STORED)) return false;
+  if (!writeLE16(file, 0)) return false;
+  if (!writeLE16(file, 0)) return false;
+  if (!writeLE32(file, e.crc32)) return false;
+  if (!writeLE32(file, e.size)) return false;
+  if (!writeLE32(file, e.size)) return false;
+  if (!writeLE16(file, nameLen)) return false;
+  if (!writeLE16(file, 0)) return false;
+  if (file.write(e.path.data(), nameLen) != nameLen) return false;
+
+  // Pass 2: write bytes.
+  size_t copied = 0;
+  while (copied < totalSize) {
+    const int got = cb(chunk, sizeof(chunk));
+    if (got < 0) {
+      LOG_ERR("ZIPW", "Callback error during write pass");
+      return false;
+    }
+    if (got == 0) break;
+    if (file.write(chunk, got) != static_cast<size_t>(got)) {
+      LOG_ERR("ZIPW", "Short write during callback copy");
+      return false;
+    }
+    copied += got;
+  }
+
+  if (copied != totalSize) {
+    LOG_ERR("ZIPW", "Callback produced %zu bytes, expected %zu (write pass)", copied, totalSize);
+    return false;
+  }
+
+  entries.push_back(std::move(e));
+  return true;
+}
+
 bool StoredZipWriter::finish() {
   if (!opened) {
     return false;

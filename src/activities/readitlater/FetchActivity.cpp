@@ -70,8 +70,18 @@ void FetchActivity::performWork() {
   }
   requestUpdateAndWait();
 
-  std::string html;
-  const auto fetchResult = provider->fetchText(article.id, html);
+  // Ensure cache directory exists before trying to create temp files in it.
+  char cacheDir[64];
+  std::snprintf(cacheDir, sizeof(cacheDir), "/.crosspoint/%s", provider->cacheDirName());
+  Storage.mkdir(cacheDir);
+
+  // Stream HTML directly to SD — no in-memory accumulation.
+  char htmlTmpBuf[128];
+  std::snprintf(htmlTmpBuf, sizeof(htmlTmpBuf), "%s/tmp_html_%llu",
+                cacheDir, static_cast<unsigned long long>(article.id));
+  const std::string htmlTmpPath(htmlTmpBuf);
+
+  const auto fetchResult = provider->fetchText(article.id, htmlTmpPath);
   if (fetchResult != Provider::Result::OK) {
     RenderLock lock(*this);
     state = FAILED;
@@ -90,7 +100,11 @@ void FetchActivity::performWork() {
 
   const std::string path = EpubBuilder::build(
       provider->cacheDirName(), provider->coverPngData(), provider->coverPngLen(), article.id, article.title,
-      article.author, html.c_str(), &onBuildProgress, this);
+      article.author, htmlTmpPath.c_str(), &onBuildProgress, this);
+
+  // HTML temp file is no longer needed regardless of outcome.
+  Storage.remove(htmlTmpPath.c_str());
+
   if (path.empty()) {
     RenderLock lock(*this);
     state = FAILED;
@@ -98,11 +112,6 @@ void FetchActivity::performWork() {
     requestUpdate(true);
     return;
   }
-
-  // Free the HTML buffer before entering the reader to maximize headroom
-  // for the EPUB indexing pass.
-  html.clear();
-  html.shrink_to_fit();
 
   // Drain any button-edge events accumulated while fetch+build blocked.
   mappedInput.update();

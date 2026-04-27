@@ -25,7 +25,7 @@ bool StateCache::save(const char* providerKey, const char* folderId,
                       const std::vector<ReadItLaterArticle>& articles) {
   Storage.mkdir(cacheDirFor(providerKey).c_str());
 
-  JsonDocument doc;
+  DynamicJsonDocument doc(16384);
   doc["synced_at"] = static_cast<int64_t>(::time(nullptr));
   JsonArray arr = doc["articles"].to<JsonArray>();
   for (const ReadItLaterArticle& a : articles) {
@@ -67,7 +67,7 @@ bool StateCache::load(const char* providerKey, const char* folderId,
   const String body = Storage.readFile(path.c_str());
   if (body.isEmpty()) return false;
 
-  JsonDocument doc;
+  DynamicJsonDocument doc(16384);
   if (deserializeJson(doc, body.c_str())) {
     LOG_ERR("RIL", "Cache load: JSON parse failed for %s", path.c_str());
     return false;

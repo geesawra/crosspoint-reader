@@ -33,8 +33,9 @@ class InstapaperClient {
   // List up to `limit` (1..500) bookmarks in `folder`. Output cleared on entry.
   static Result listBookmarks(InstapaperFolder folder, int limit, std::vector<InstapaperArticle>& out);
 
-  // Fetch the processed article body HTML. Stored in `outHtml` (UTF-8).
-  static Result getText(uint64_t bookmarkId, std::string& outHtml);
+  // Fetch the processed article body HTML, streaming directly to `outPath` on
+  // SD. The file is created (or truncated) on entry and removed on any error.
+  static Result getText(uint64_t bookmarkId, const std::string& outPath);
 
   // Push read progress (0.0..1.0) back to Instapaper so other clients resume
   // at the right spot.

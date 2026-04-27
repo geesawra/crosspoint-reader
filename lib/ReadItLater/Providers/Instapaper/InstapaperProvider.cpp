@@ -65,8 +65,8 @@ Provider::Result InstapaperProvider::listArticles(const FolderInfo& folder, int 
   return Result::OK;
 }
 
-Provider::Result InstapaperProvider::fetchText(uint64_t articleId, std::string& outHtml) {
-  return fromInstapaperResult(InstapaperClient::getText(articleId, outHtml));
+Provider::Result InstapaperProvider::fetchText(uint64_t articleId, const std::string& outPath) {
+  return fromInstapaperResult(InstapaperClient::getText(articleId, outPath));
 }
 
 std::vector<Provider::Action> InstapaperProvider::availableActions(const FolderInfo& folder,
@@ -120,13 +120,13 @@ Provider::Result InstapaperProvider::updateProgress(uint64_t articleId, float pr
 
 std::string InstapaperProvider::epubPathFor(uint64_t articleId) const {
   char buf[128];
-  std::snprintf(buf, sizeof(buf), "/.crosspoint/instapaper/article_v2_%llu.epub",
+  std::snprintf(buf, sizeof(buf), "/.crosspoint/read-it-later/article_v2_%llu.epub",
                 static_cast<unsigned long long>(articleId));
   return std::string(buf);
 }
 
 uint64_t InstapaperProvider::extractArticleId(const std::string& epubPath) const {
-  constexpr char PREFIX[] = "/.crosspoint/instapaper/article_v2_";
+  constexpr char PREFIX[] = "/.crosspoint/read-it-later/article_v2_";
   constexpr char SUFFIX[] = ".epub";
   const size_t prefixLen = sizeof(PREFIX) - 1;
   const size_t suffixLen = sizeof(SUFFIX) - 1;

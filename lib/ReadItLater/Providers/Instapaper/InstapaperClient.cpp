@@ -2,6 +2,7 @@
 
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <HalStorage.h>
 #include <Logging.h>
 #include <NetworkClientSecure.h>
 #include <WiFi.h>
@@ -30,17 +31,28 @@ constexpr char URL_DELETE[] = "https://www.instapaper.com/api/1/bookmarks/delete
 // more than ~5 minutes off. The ESP32-C3 has no RTC so time() is 0 until NTP
 // syncs. Every signed call flows through signedPost(), so gating sync here
 // catches every entry point (listBookmarks, getText, star/archive/…).
+//
+// Important: do NOT call esp_sntp_stop(). It calls sys_untimeout() which
+// asserts the lwIP TCPIP core lock is held by the current task — it never is.
+// Instead, if SNTP is already running (from a prior attempt or auto-started by
+// the WiFi stack), just wait for it to complete.
 void ensureTimeSynced() {
   if (::time(nullptr) > 1600000000) return;  // post-2020 = synced
-  if (esp_sntp_enabled()) {
-    esp_sntp_stop();
+
+  if (!esp_sntp_enabled()) {
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
   }
-  esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
-  esp_sntp_setservername(0, "pool.ntp.org");
-  esp_sntp_init();
-  for (int i = 0; i < 50; i++) {  // ~5 s max
-    if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) break;
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+
+  // Wait for sync in 3 rounds (SNTP does background polls; each round gives
+  // the poller a chance to succeed).  Break early if time becomes valid.
+  for (int round = 0; round < 3; round++) {
+    for (int i = 0; i < 30; i++) {
+      if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) break;
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+    if (::time(nullptr) > 1600000000) break;
   }
   if (::time(nullptr) < 1600000000) {
     LOG_ERR("INSTA", "NTP sync timed out; OAuth signatures may be rejected");
@@ -126,9 +138,11 @@ int signedPost(const char* url, const std::vector<OAuth1Signer::Param>& bodyPara
   return code;
 }
 
-// Same as signedPost but streams the response body to a std::string (no JSON
-// parsing here — used by get_text which returns raw HTML, potentially large).
-int signedPostStreaming(const char* url, const std::vector<OAuth1Signer::Param>& bodyParams, std::string& outBody) {
+// Same as signedPost but streams the response body directly to an SD file
+// instead of accumulating it in a std::string. This keeps peak heap usage
+// bounded to the chunk buffer regardless of article size.
+// Returns the HTTP status code, or -1 on pre-request failure.
+int signedPostStreamingToFile(const char* url, const std::vector<OAuth1Signer::Param>& bodyParams, FsFile& outFile) {
   if (!INSTAPAPER_CREDENTIALS.hasTokens()) {
     return -1;
   }
@@ -155,19 +169,25 @@ int signedPostStreaming(const char* url, const std::vector<OAuth1Signer::Param>&
   const int code = http.POST(const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(body.data())), body.size());
   if (code >= 200 && code < 300) {
     const int contentLen = http.getSize();
-    if (contentLen > 0) outBody.reserve(static_cast<size_t>(contentLen));
     WiFiClient* stream = http.getStreamPtr();
     uint8_t buf[512];
-    while (http.connected() && (contentLen < 0 || outBody.size() < static_cast<size_t>(contentLen))) {
+    size_t written = 0;
+    while (http.connected() && (contentLen < 0 || written < static_cast<size_t>(contentLen))) {
       const int avail = stream ? stream->available() : 0;
       if (avail > 0) {
         const int n = stream->read(buf, sizeof(buf) < static_cast<size_t>(avail) ? sizeof(buf) : avail);
         if (n <= 0) break;
-        outBody.append(reinterpret_cast<const char*>(buf), n);
+        if (outFile.write(buf, n) != static_cast<size_t>(n)) {
+          LOG_ERR("INSTA", "Short write to HTML temp file after %zu bytes", written);
+          http.end();
+          return -1;
+        }
+        written += n;
       } else {
         delay(1);
       }
     }
+    LOG_DBG("INSTA", "Streamed %zu bytes to HTML temp file", written);
   }
   http.end();
   return code;
@@ -244,7 +264,7 @@ InstapaperClient::Result InstapaperClient::listBookmarks(InstapaperFolder folder
   const Result r = mapHttpCode(code, body);
   if (r != OK) return r;
 
-  JsonDocument doc;
+  DynamicJsonDocument doc(16384);
   const auto err = deserializeJson(doc, body);
   if (err) {
     LOG_ERR("INSTA", "JSON parse failed: %s", err.c_str());
@@ -287,9 +307,8 @@ InstapaperClient::Result InstapaperClient::listBookmarks(InstapaperFolder folder
   return OK;
 }
 
-InstapaperClient::Result InstapaperClient::getText(uint64_t bookmarkId, std::string& outHtml) {
+InstapaperClient::Result InstapaperClient::getText(uint64_t bookmarkId, const std::string& outPath) {
   if (!INSTAPAPER_CREDENTIALS.hasTokens()) return NO_TOKENS;
-  outHtml.clear();
 
   char idStr[24];
   std::snprintf(idStr, sizeof(idStr), "%llu", static_cast<unsigned long long>(bookmarkId));
@@ -297,8 +316,26 @@ InstapaperClient::Result InstapaperClient::getText(uint64_t bookmarkId, std::str
   std::vector<OAuth1Signer::Param> params;
   params.push_back({"bookmark_id", idStr});
 
-  const int code = signedPostStreaming(URL_GET_TEXT, params, outHtml);
-  return mapHttpCode(code, outHtml);
+  FsFile file;
+  if (!Storage.openFileForWrite("INSTA", outPath.c_str(), file)) {
+    LOG_ERR("INSTA", "Cannot open HTML temp file: %s", outPath.c_str());
+    return NETWORK_FAILED;
+  }
+
+  const int code = signedPostStreamingToFile(URL_GET_TEXT, params, file);
+  file.close();
+
+  if (code < 0) {
+    Storage.remove(outPath.c_str());
+    return NETWORK_FAILED;
+  }
+
+  // Map HTTP errors; for non-2xx the file will be empty/partial — remove it.
+  const Result r = mapHttpCode(code);
+  if (r != OK) {
+    Storage.remove(outPath.c_str());
+  }
+  return r;
 }
 
 namespace {

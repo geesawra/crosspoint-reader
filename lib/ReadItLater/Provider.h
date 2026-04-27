@@ -67,8 +67,8 @@ class Provider {
   virtual Result listArticles(const FolderInfo& folder, int limit,
                               std::vector<ReadItLaterArticle>& out) = 0;
 
-  /** Fetch the processed article body HTML into `outHtml`. */
-  virtual Result fetchText(uint64_t articleId, std::string& outHtml) = 0;
+  /** Fetch the processed article body HTML, streaming to `outPath` on SD. */
+  virtual Result fetchText(uint64_t articleId, const std::string& outPath) = 0;
 
   // ---------- Actions ----------
 

@@ -1,4 +1,6 @@
 #pragma once
+#include <HalStorage.h>
+
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -22,16 +24,18 @@ class EpubBuilder {
   // path per the project's memory rules.
   using ProgressCallback = void (*)(void* ctx, int percent, const char* label);
 
-  // Build the EPUB file on SD. Returns the absolute path of the created file
-  // on success, or an empty string on failure. If `cb` is non-null it is
-  // invoked from the same thread as the caller, synchronously, at each
-  // phase transition — safe to update UI state inside.
+  // Build the EPUB file on SD. `htmlPath` is the SD path of a temp file
+  // containing the raw article HTML (written by InstapaperClient::getText).
+  // The HTML file is NOT removed by this function — caller is responsible.
+  // Returns the absolute path of the created EPUB on success, or an empty
+  // string on failure. If `cb` is non-null it is invoked synchronously at
+  // each phase transition — safe to update UI state inside.
   static std::string build(const char* cacheDir,
                            const char* coverPngData, size_t coverPngLen,
                            uint64_t articleId,
                            const char* title,
                            const char* author,
-                           const char* rawHtml,
+                           const char* htmlPath,
                            ProgressCallback cb = nullptr,
                            void* ctx = nullptr);
 
@@ -39,11 +43,17 @@ class EpubBuilder {
   static std::string pathFor(const char* cacheDir, uint64_t articleId);
 
  private:
-  // Convert an HTML body fragment into a well-formed XHTML body fragment
-  // that expat can parse. If `imageMap` is provided, any `<img src="URL">`
-  // whose URL is in the map is rewritten; others are stripped.
+  // Sanitize rawHtml (in-memory) into a well-formed XHTML fragment.
+  // Used only for the image-URL extraction pre-pass (small subset of HTML).
   static std::string sanitizeHtmlBody(const char* rawHtml,
                                       const std::unordered_map<std::string, std::string>* imageMap = nullptr);
+
+  // Streaming sanitizer: reads raw HTML from `inFile` in chunks, writes
+  // sanitized XHTML body to `outFile`. `imageMap` rewrites img src= URLs.
+  // Both files must already be open. Returns false on I/O error.
+  static bool sanitizeHtmlBodyStreaming(FsFile& inFile,
+                                        FsFile& outFile,
+                                        const std::unordered_map<std::string, std::string>* imageMap = nullptr);
 
   // Escape text for XML attribute / content use.
   static std::string escapeXml(const char* s);

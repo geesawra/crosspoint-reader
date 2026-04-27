@@ -11,6 +11,7 @@
 #include <cstdio>
 
 #include "ActionsActivity.h"
+#include "ArticleListMenuActivity.h"
 #include "DownloadAllActivity.h"
 #include "FetchActivity.h"
 #include "MappedInputManager.h"
@@ -62,12 +63,15 @@ void ArticleListActivity::onWifiSelectionComplete(bool success) {
   performFetch();
 }
 
-void ArticleListActivity::performFetch() {
-  // Defense in depth: callers other than onEnter have historically reached
-  // here without verifying WiFi, which faults lwIP (Invalid mbox) when the
-  // radio was never initialized on this boot.
+void ArticleListActivity::performFetch(bool showProgress) {
   if (WiFi.status() != WL_CONNECTED) {
     LOG_DBG("RIL", "performFetch skipped: WiFi not connected");
+    if (showProgress) {
+      // User explicitly requested a refresh — offer WiFi selection.
+      startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
+                             [this](const ActivityResult& r) { onWifiSelectionComplete(!r.isCancelled); });
+      return;
+    }
     RenderLock lock(*this);
     if (state == SHOWING_LIST && !articles.empty()) {
       offline = true;
@@ -80,9 +84,10 @@ void ArticleListActivity::performFetch() {
   }
 
   // If we already have cached data on screen, keep showing it while the
-  // refresh runs rather than blanking to a "fetching" spinner.
+  // refresh runs rather than blanking to a "fetching" spinner — unless an
+  // explicit refresh was requested by the user.
   const bool hadCachedList = (state == SHOWING_LIST && !articles.empty());
-  if (!hadCachedList) {
+  if (!hadCachedList || showProgress) {
     RenderLock lock(*this);
     state = FETCHING;
   }
@@ -117,6 +122,7 @@ void ArticleListActivity::performFetch() {
       // Stay on cached data, just mark as offline.
       offline = true;
       errorMessage = provider->errorString(r);
+      state = SHOWING_LIST;
     } else {
       state = FETCH_FAILED;
       errorMessage = provider->errorString(r);
@@ -136,6 +142,13 @@ void ArticleListActivity::loop() {
     finish();
     return;
   }
+
+  if (pendingRefresh) {
+    pendingRefresh = false;
+    performFetch(true);
+    return;
+  }
+
   if (state != SHOWING_LIST) return;
 
   // Nav uses Up/Down only — NOT ButtonNavigator's Up/Left/Down/Right, because
@@ -164,10 +177,8 @@ void ArticleListActivity::loop() {
                            [this, savedIndex](const ActivityResult& r) {
                              const bool changed = !r.isCancelled;
                              if (changed) {
-                               // Article may have moved folders — refetch, keep index within bounds.
-                               performFetch();
+                               pendingRefresh = true;
                              } else {
-                               // Cancelled: restore the cursor exactly and just redraw.
                                selectedIndex = savedIndex;
                                requestUpdate();
                              }
@@ -175,11 +186,32 @@ void ArticleListActivity::loop() {
     return;
   }
 
-  // Right: bulk download of the current folder.
+  // Right: article-list-level actions menu (download all / refresh).
   if (mappedInput.wasPressed(MappedInputManager::Button::Right)) {
-    if (articles.empty()) return;
-    startActivityForResult(std::make_unique<DownloadAllActivity>(renderer, mappedInput, provider, articles),
-                           [this](const ActivityResult&) { requestUpdate(); });
+    startActivityForResult(std::make_unique<ArticleListMenuActivity>(renderer, mappedInput),
+                           [this](const ActivityResult& r) {
+                             if (r.isCancelled) {
+                               requestUpdate();
+                               return;
+                             }
+                             const auto action =
+                                 static_cast<ArticleListMenuActivity::Action>(std::get<PercentResult>(r.data).percent);
+                             switch (action) {
+                               case ArticleListMenuActivity::Action::DOWNLOAD_ALL:
+                                 if (articles.empty()) {
+                                   requestUpdate();
+                                   break;
+                                 }
+                                 startActivityForResult(
+                                     std::make_unique<DownloadAllActivity>(renderer, mappedInput, provider, articles),
+                                     [this](const ActivityResult&) { requestUpdate(); });
+                                 break;
+                               case ArticleListMenuActivity::Action::REFRESH:
+                                 pendingRefresh = true;
+                                 requestUpdate();
+                                 break;
+                             }
+                           });
     return;
   }
 }
@@ -196,13 +228,13 @@ void ArticleListActivity::render(RenderLock&&) {
   if (offline && lastSyncedAt > 0) {
     const time_t age = ::time(nullptr) - lastSyncedAt;
     if (age < 120) {
-      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · updated just now");
+      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline");
     } else if (age < 3600) {
-      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · %dm ago", static_cast<int>(age / 60));
+      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · %dm", static_cast<int>(age / 60));
     } else if (age < 86400) {
-      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · %dh ago", static_cast<int>(age / 3600));
+      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · %dh", static_cast<int>(age / 3600));
     } else {
-      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · %dd ago", static_cast<int>(age / 86400));
+      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · %dd", static_cast<int>(age / 86400));
     }
     subtitle = subtitleBuf;
   }
@@ -212,7 +244,7 @@ void ArticleListActivity::render(RenderLock&&) {
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, headerLabel, subtitle);
 
   if (state == FETCHING || state == WIFI_SELECTION) {
-    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2, tr(STR_INSTAPAPER_FETCHING), true, EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2, tr(STR_INSTAPAPER_REFRESHING), true, EpdFontFamily::BOLD);
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     renderer.displayBuffer();
@@ -247,7 +279,7 @@ void ArticleListActivity::render(RenderLock&&) {
       [this](int index) { return std::string(articles[index].domain); }, nullptr);
 
   const auto labels =
-      mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_INSTAPAPER_ACTIONS), tr(STR_INSTAPAPER_GET_ALL));
+      mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_INSTAPAPER_ACTIONS), tr(STR_OPTIONS));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer();
 }
