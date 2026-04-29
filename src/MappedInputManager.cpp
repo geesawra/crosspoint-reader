@@ -45,9 +45,13 @@ bool MappedInputManager::mapButton(const Button button, bool (HalGPIO::*fn)(uint
       return (gpio.*fn)(HalGPIO::BTN_POWER);
     case Button::PageBack:
       // Reader page navigation uses side buttons and can be swapped via settings.
+      if (sideLayout == CrossPointSettings::BOTH_FORWARD) return false;
       return (gpio.*fn)(side.pageBack);
     case Button::PageForward:
       // Reader page navigation uses side buttons and can be swapped via settings.
+      if (sideLayout == CrossPointSettings::BOTH_FORWARD) {
+        return (gpio.*fn)(HalGPIO::BTN_UP) || (gpio.*fn)(HalGPIO::BTN_DOWN);
+      }
       return (gpio.*fn)(side.pageForward);
   }
 
