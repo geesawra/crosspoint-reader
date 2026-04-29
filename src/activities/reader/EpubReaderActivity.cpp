@@ -793,13 +793,16 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   }
   const auto tDisplay = millis();
 
-  // Save bw buffer to reset buffer state after grayscale data sync
-  renderer.storeBwBuffer();
+  // Save bw buffer to reset buffer state after grayscale data sync.
+  // If the save fails (heap pressure), the AA pass below must be skipped —
+  // running displayGrayBuffer() without a recoverable BW baseline corrupts
+  // HAL display state for the rest of the session.
+  const bool bwStored = renderer.storeBwBuffer();
   const auto tBwStore = millis();
 
   // grayscale rendering
   // TODO: Only do this if font supports it
-  if (SETTINGS.textAntiAliasing) {
+  if (SETTINGS.textAntiAliasing && bwStored) {
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
     page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
@@ -830,7 +833,11 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
             tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tBwStore - tDisplay, tGrayLsb - tBwStore,
             tGrayMsb - tGrayLsb, tGrayDisplay - tGrayMsb, tBwRestore - tGrayDisplay, tEnd - t0);
   } else {
-    // restore the bw data
+    if (SETTINGS.textAntiAliasing && !bwStored) {
+      LOG_ERR("ERS", "Skipping AA pass: BW buffer save failed (heap pressure); page rendered as plain BW");
+    }
+    // restore is still safe to call (it no-ops or recovers HAL state) and
+    // keeps the timing log shape consistent with the AA branch.
     renderer.restoreBwBuffer();
     const auto tBwRestore = millis();
 
