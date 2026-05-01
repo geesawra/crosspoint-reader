@@ -488,6 +488,7 @@ void EpubReaderActivity::applyOrientation(const uint8_t orientation) {
     // Reset section to force re-layout in the new orientation.
     section.reset();
   }
+  requestUpdate();
 }
 
 void EpubReaderActivity::toggleAutoPageTurn(const uint8_t selectedPageTurnOption) {

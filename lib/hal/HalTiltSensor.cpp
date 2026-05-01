@@ -193,6 +193,11 @@ void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const 
   if (needsAccel) {
     float ax, ay, az;
     if (readAccel(ax, ay, az)) {
+      // On this X3 PCB revision the accel axes are inverted relative to the
+      // device frame. Negate to align sensor X/Y with physical top/left.
+      ax = -ax;
+      ay = -ay;
+
       const float absX = fabsf(ax);
       const float absY = fabsf(ay);
       const float absZ = fabsf(az);
