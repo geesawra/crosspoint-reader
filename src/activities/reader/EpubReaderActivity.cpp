@@ -470,9 +470,12 @@ void EpubReaderActivity::applyOrientation(const uint8_t orientation) {
   }
 
   // Preserve current reading position so we can restore after reflow.
+  // Only capture once per orientation-change chain to avoid compounding
+  // rounding errors when the user rotates multiple times before the new
+  // layout is rendered.
   {
     RenderLock lock(*this);
-    if (section) {
+    if (section && cachedChapterTotalPageCount == 0) {
       cachedSpineIndex = currentSpineIndex;
       cachedChapterTotalPageCount = section->pageCount;
       nextPageNumber = section->currentPage;
@@ -632,7 +635,7 @@ void EpubReaderActivity::render(RenderLock&& lock) {
         // Orientation or settings changed: remap by percentage to preserve reading position.
         // nextPageNumber and cachedChapterTotalPageCount are from the old layout.
         const float progress = static_cast<float>(nextPageNumber) / static_cast<float>(cachedChapterTotalPageCount);
-        section->currentPage = static_cast<int>(progress * section->pageCount);
+        section->currentPage = static_cast<int>(progress * section->pageCount + 0.5f);
         cachedChapterTotalPageCount = 0;
       } else {
         section->currentPage = nextPageNumber;

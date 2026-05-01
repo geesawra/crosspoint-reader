@@ -106,7 +106,9 @@ void TxtReaderActivity::applyOrientation(uint8_t orientation) {
   {
     RenderLock lock(*this);
     // Preserve reading position as a percentage so it maps correctly after reflow.
-    if (totalPages > 0) {
+    // Only capture once per orientation-change chain to avoid compounding rounding
+    // errors when the user rotates multiple times before the new layout is rendered.
+    if (totalPages > 0 && cachedTotalPages == 0) {
       cachedPageProgress = static_cast<float>(currentPage) / static_cast<float>(totalPages);
       cachedTotalPages = totalPages;
     }
@@ -168,7 +170,7 @@ void TxtReaderActivity::initializeReader() {
 
   // If orientation changed, remap currentPage by percentage to preserve reading position.
   if (cachedTotalPages > 0 && totalPages > 0 && totalPages != cachedTotalPages) {
-    currentPage = static_cast<int>(cachedPageProgress * totalPages);
+    currentPage = static_cast<int>(cachedPageProgress * totalPages + 0.5f);
     if (currentPage >= totalPages) currentPage = totalPages - 1;
     if (currentPage < 0) currentPage = 0;
     cachedTotalPages = 0;
