@@ -247,22 +247,19 @@ void HomeActivity::render(RenderLock&&) {
     menuIcons.insert(menuIcons.begin() + 2, Library);
   }
 
-<<<<<<< HEAD
-#ifdef READ_IT_LATER_ENABLED
-  {
-    // Insert Read-it-Later before File Transfer (index depends on OPDS presence).
-    const size_t pos = hasOpdsUrl ? 3 : 2;
-    menuItems.insert(menuItems.begin() + pos, tr(STR_READ_IT_LATER));
-    menuIcons.insert(menuIcons.begin() + pos, ReadItLater);
-  }
-#endif
-=======
   if (metrics.homeContinueReadingInMenu) {
     // Insert Continue Reading at the top if enabled in theme
     menuItems.insert(menuItems.begin(), tr(STR_CONTINUE_READING));
     menuIcons.insert(menuIcons.begin(), Book);
   }
->>>>>>> upstream/master
+#ifdef READ_IT_LATER_ENABLED
+  {
+    // Insert Read-it-Later before File Transfer (index depends on OPDS presence).
+    const size_t pos = hasOpdsServers ? 4 : 3;
+    menuItems.insert(menuItems.begin() + pos, tr(STR_READ_IT_LATER));
+    menuIcons.insert(menuIcons.begin() + pos, ReadItLater);
+  }
+#endif
 
   GUI.drawButtonMenu(
       renderer,
