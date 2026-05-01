@@ -94,10 +94,11 @@ The table below summarises what this fork adds or changes compared to upstream.
 
 | Feature | Description |
 |---------|-------------|
+| **Auto-rotate (X3 only)** | Automatic screen orientation detection via the QMI8658 accelerometer. Rotates the reader in real time when the device is turned, with a 500 ms debounce. Position is preserved across rotations via percentage-based remapping. |
 | **Instapaper / Read-it-Later** | Full Instapaper integration — browse, read, star, archive, and bulk-download your saved articles as EPUBs. Built on a generic multi-provider framework for future services. |
 | **CSS lazy-loading** | CSS rules are loaded on-demand from an indexed SD cache instead of all-at-once, reducing peak RAM usage during EPUB rendering. |
 | **"Both Forward" side button layout** | New side-button arrangement where both the front and back buttons advance the page forward. |
-| **Auto-rotate (X3 only)** | Automatic screen orientation detection via the QMI8658 accelerometer. Rotates the reader when the device is turned, with a 1-second debounce to avoid accidental flips. |
+| **Bookerly font** | Bookerly is retained as a reader font. Upstream replaced it with Noto Serif for licensing reasons; this fork restores it and removes OpenDyslexic instead. |
 | **Custom wallpaper script** | `convert_wallpaper.py` to prepare personal sleep-screen images. |
 | **Crash dump decoder** | `decode_crash.py` to translate raw ESP32-C3 crash logs into readable stack traces. |
 
@@ -107,15 +108,11 @@ The table below summarises what this fork adds or changes compared to upstream.
 * Resets `pagesUntilFullRefresh` counter when entering a book.
 * Streams images into the EPUB ZIP incrementally to avoid OOM on Instapaper articles with many images.
 * Raises the per-image download size cap from 150 KiB to 512 KiB.
+* Caps per-side horizontal CSS inset at 2 em to prevent excessive paragraph indentation.
 
-#### Features in upstream (not in this fork)
+#### Upstream parity
 
-The original upstream includes features that this fork has **not yet incorporated**:
-
-* KOReader Sync TLS / OOM fixes
-* Royalty.dev funding integration
-
-These will be back-ported as time permits.
+This fork is fully up to date with upstream — all upstream features (tilt page turn, Roundedraff theme, multiple OPDS servers, context-aware screenshot filenames, i18n offset-table optimisation, KOReader Sync TLS / OOM fixes, etc.) are included.
 
 ## Installing
 
