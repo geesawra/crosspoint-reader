@@ -264,7 +264,7 @@ InstapaperClient::Result InstapaperClient::listBookmarks(InstapaperFolder folder
   const Result r = mapHttpCode(code, body);
   if (r != OK) return r;
 
-  DynamicJsonDocument doc(16384);
+  JsonDocument doc;
   const auto err = deserializeJson(doc, body);
   if (err) {
     LOG_ERR("INSTA", "JSON parse failed: %s", err.c_str());
