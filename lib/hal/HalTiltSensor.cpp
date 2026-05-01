@@ -80,6 +80,7 @@ bool HalTiltSensor::readAccel(float& ax, float& ay, float& az) const {
 void HalTiltSensor::begin() {
   if (!gpio.deviceIsX3()) {
     _available = false;
+    LOG_INF("GYR", "Skipping QMI8658 init: device detected as X4");
     return;
   }
 
