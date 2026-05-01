@@ -16,6 +16,7 @@
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "MappedInputManager.h"
+#include "ReaderUtils.h"
 #include "RecentBooksStore.h"
 #include "XtcReaderChapterSelectionActivity.h"
 #include "components/UITheme.h"
@@ -131,6 +132,20 @@ void XtcReaderActivity::loop() {
     }
     requestUpdate();
   }
+}
+
+void XtcReaderActivity::onOrientationChanged(uint8_t orientation) {
+  if (SETTINGS.orientation == orientation) {
+    return;
+  }
+
+  {
+    RenderLock lock(*this);
+    SETTINGS.orientation = orientation;
+    SETTINGS.saveToFile();
+    ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
+  }
+  requestUpdate();
 }
 
 void XtcReaderActivity::render(RenderLock&&) {

@@ -103,6 +103,9 @@ class ActivityManager {
   bool skipLoopDelay() const;
   ScreenshotInfo getScreenshotInfo() const;
 
+  // Notify the current activity that the physical orientation has changed.
+  void notifyOrientationChanged(uint8_t orientation);
+
   // If immediate is true, the update will be triggered immediately.
   // Otherwise, it will be deferred until the end of the current loop iteration.
   void requestUpdate(bool immediate = false);

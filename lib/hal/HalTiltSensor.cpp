@@ -51,6 +51,32 @@ bool HalTiltSensor::readGyro(float& gx, float& gy, float& gz) const {
   return true;
 }
 
+bool HalTiltSensor::readAccel(float& ax, float& ay, float& az) const {
+  Wire.beginTransmission(_i2cAddr);
+  Wire.write(REG_AX_L);  // Start reading at Accel X Low
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  Wire.requestFrom(_i2cAddr, (uint8_t)6);
+  if (Wire.available() < 6) {
+    return false;
+  }
+
+  auto readInt16 = [&]() -> int16_t {
+    const uint8_t lo = Wire.read();
+    const uint8_t hi = Wire.read();
+    return static_cast<int16_t>((hi << 8) | lo);
+  };
+
+  // If Full Scale is ±4g, the scale factor is 32768 / 4 = 8192 LSB/g
+  constexpr float SCALE = 1.0f / 8192.0f;
+  ax = readInt16() * SCALE;
+  ay = readInt16() * SCALE;
+  az = readInt16() * SCALE;
+  return true;
+}
+
 void HalTiltSensor::begin() {
   if (!gpio.deviceIsX3()) {
     _available = false;
@@ -71,7 +97,8 @@ void HalTiltSensor::begin() {
 
   LOG_INF("GYR", "QMI8658 IMU found at 0x%02X", _i2cAddr);
 
-  if (!writeReg(REG_CTRL7, CTRL7_DISABLE_ALL) || !writeReg(REG_CTRL3, CTRL3_FS_512DPS | CTRL3_ODR_28HZ) ||
+  if (!writeReg(REG_CTRL7, CTRL7_DISABLE_ALL) || !writeReg(REG_CTRL2, CTRL2_FS_4G | CTRL2_ODR_28HZ) ||
+      !writeReg(REG_CTRL3, CTRL3_FS_512DPS | CTRL3_ODR_28HZ) ||
       !writeReg(REG_CTRL1, CTRL1_BASE | CTRL1_SENSOR_DISABLE)) {
     LOG_ERR("GYR", "QMI8658 register configuration failed");
     _available = false;
@@ -94,7 +121,7 @@ bool HalTiltSensor::wake() {
     return false;
   }
 
-  if (writeReg(REG_CTRL1, CTRL1_BASE) && writeReg(REG_CTRL7, CTRL7_GYRO_ENABLE)) {
+  if (writeReg(REG_CTRL1, CTRL1_BASE) && writeReg(REG_CTRL7, CTRL7_GYRO_ENABLE | CTRL7_ACC_ENABLE)) {
     _lastPollMs = millis();
     _lastTiltMs = millis();
     _wakeMs = millis();
@@ -127,22 +154,25 @@ bool HalTiltSensor::deepSleep() {
   }
 }
 
-void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const bool inReader) {
+void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const bool autoRotate,
+                            const bool inReader) {
   if (!_available) {
     return;
   }
 
+  const bool needsImu = (mode != CrossPointTiltPageTurn::TILT_OFF) || autoRotate;
+
   // State machine: wake up or sleep based on the enabled flag
-  if ((mode != CrossPointTiltPageTurn::TILT_OFF) && !_isAwake) {
+  if (needsImu && !_isAwake) {
     _isAwake = wake();
     return;
-  } else if ((mode == CrossPointTiltPageTurn::TILT_OFF) && _isAwake) {
+  } else if (!needsImu && _isAwake) {
     _isAwake = !deepSleep();
     return;
   }
 
   // If disabled, skip the rest of the polling logic and avoid unnecessary I2C traffic in non-reader activities
-  if ((mode == CrossPointTiltPageTurn::TILT_OFF) || !inReader) {
+  if (!needsImu || !inReader) {
     return;
   }
 
@@ -157,52 +187,90 @@ void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const 
   }
   _lastPollMs = now;
 
-  float gx, gy, gz;
-  if (!readGyro(gx, gy, gz)) {
-    return;
-  }
+  // --- Auto-rotate via accelerometer ---
+  if (autoRotate) {
+    float ax, ay, az;
+    if (readAccel(ax, ay, az)) {
+      const float absX = fabsf(ax);
+      const float absY = fabsf(ay);
+      const float absZ = fabsf(az);
 
-  // Map the gyro axis to left/right tilt based on reader orientation.
-  // On the X3 PCB: X axis = left/right in portrait, Y axis = left/right in landscape.
-  float tiltAxis;
-  switch (orientation) {
-    case CrossPointOrientation::PORTRAIT:
-      tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? -gx : gx;
-      break;
-    case CrossPointOrientation::INVERTED:
-      tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? gx : -gx;
-      break;
-    case CrossPointOrientation::LANDSCAPE_CW:
-      tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? gy : -gy;
-      break;
-    case CrossPointOrientation::LANDSCAPE_CCW:
-      tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? -gy : gy;
-      break;
-    default:
-      tiltAxis = gx;
-      break;
-  }
+      uint8_t newOrientation = orientation;
+      if (absZ > ACCEL_FLAT_THRESHOLD && absZ > absX && absZ > absY) {
+        // Device is roughly flat; keep current orientation
+        newOrientation = orientation;
+      } else if (absY > absX) {
+        // Portrait family: Y axis dominant
+        newOrientation = (ay > 0) ? CrossPointOrientation::PORTRAIT : CrossPointOrientation::INVERTED;
+      } else {
+        // Landscape family: X axis dominant
+        newOrientation = (ax > 0) ? CrossPointOrientation::LANDSCAPE_CW : CrossPointOrientation::LANDSCAPE_CCW;
+      }
 
-  if (_inTilt) {
-    // Wait for device to return to neutral before allowing next trigger
-    if (fabsf(tiltAxis) < NEUTRAL_RATE_DPS) {
-      _inTilt = false;
+      if (newOrientation != _candidateOrientation) {
+        _candidateOrientation = newOrientation;
+        _candidateStartMs = now;
+      } else if ((now - _candidateStartMs) >= ORIENTATION_DEBOUNCE_MS) {
+        if (_detectedOrientation != _candidateOrientation) {
+          _detectedOrientation = _candidateOrientation;
+          // Suppress any pending tilt events to avoid accidental page turns while rotating
+          clearPendingEvents();
+          _inTilt = false;
+          LOG_INF("GYR", "Auto-rotate detected orientation=%u", _detectedOrientation);
+        }
+      }
     }
-  } else {
-    // Check for new tilt gesture (with cooldown)
-    if ((now - _lastTiltMs) >= COOLDOWN_MS) {
-      if (tiltAxis > RATE_THRESHOLD_DPS) {
-        _tiltForwardEvent = true;
-        _hadActivity = true;
-        _inTilt = true;
-        _lastTiltMs = now;
-        LOG_INF("GYR", "Forward Trigger=(%.1f) dps", tiltAxis);
-      } else if (tiltAxis < -RATE_THRESHOLD_DPS) {
-        _tiltBackEvent = true;
-        _hadActivity = true;
-        _inTilt = true;
-        _lastTiltMs = now;
-        LOG_INF("GYR", "Backward Trigger=(%.1f) dps", tiltAxis);
+  }
+
+  // --- Tilt page turn via gyroscope ---
+  if (mode != CrossPointTiltPageTurn::TILT_OFF) {
+    float gx, gy, gz;
+    if (!readGyro(gx, gy, gz)) {
+      return;
+    }
+
+    // Map the gyro axis to left/right tilt based on reader orientation.
+    // On the X3 PCB: X axis = left/right in portrait, Y axis = left/right in landscape.
+    float tiltAxis;
+    switch (orientation) {
+      case CrossPointOrientation::PORTRAIT:
+        tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? -gx : gx;
+        break;
+      case CrossPointOrientation::INVERTED:
+        tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? gx : -gx;
+        break;
+      case CrossPointOrientation::LANDSCAPE_CW:
+        tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? gy : -gy;
+        break;
+      case CrossPointOrientation::LANDSCAPE_CCW:
+        tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? -gy : gy;
+        break;
+      default:
+        tiltAxis = gx;
+        break;
+    }
+
+    if (_inTilt) {
+      // Wait for device to return to neutral before allowing next trigger
+      if (fabsf(tiltAxis) < NEUTRAL_RATE_DPS) {
+        _inTilt = false;
+      }
+    } else {
+      // Check for new tilt gesture (with cooldown)
+      if ((now - _lastTiltMs) >= COOLDOWN_MS) {
+        if (tiltAxis > RATE_THRESHOLD_DPS) {
+          _tiltForwardEvent = true;
+          _hadActivity = true;
+          _inTilt = true;
+          _lastTiltMs = now;
+          LOG_INF("GYR", "Forward Trigger=(%.1f) dps", tiltAxis);
+        } else if (tiltAxis < -RATE_THRESHOLD_DPS) {
+          _tiltBackEvent = true;
+          _hadActivity = true;
+          _inTilt = true;
+          _lastTiltMs = now;
+          LOG_INF("GYR", "Backward Trigger=(%.1f) dps", tiltAxis);
+        }
       }
     }
   }

@@ -322,7 +322,17 @@ void loop() {
   static unsigned long lastMemPrint = 0;
 
   gpio.update();
-  halTiltSensor.update(SETTINGS.tiltPageTurn, SETTINGS.orientation, activityManager.isReaderActivity());
+  halTiltSensor.update(SETTINGS.tiltPageTurn, SETTINGS.orientation, SETTINGS.autoRotate,
+                        activityManager.isReaderActivity());
+
+  // Auto-rotate: if the physically detected orientation differs from settings, notify the current activity
+  if (SETTINGS.autoRotate && activityManager.isReaderActivity()) {
+    const uint8_t detectedOrientation = halTiltSensor.getDetectedOrientation();
+    if (detectedOrientation != SETTINGS.orientation) {
+      LOG_INF("MAIN", "Auto-rotate: orientation changed from %u to %u", SETTINGS.orientation, detectedOrientation);
+      activityManager.notifyOrientationChanged(detectedOrientation);
+    }
+  }
 
   renderer.setFadingFix(SETTINGS.fadingFix);
 

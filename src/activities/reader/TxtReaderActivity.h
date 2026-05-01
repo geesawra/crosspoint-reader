@@ -50,4 +50,8 @@ class TxtReaderActivity final : public Activity {
   void render(RenderLock&&) override;
   bool isReaderActivity() const override { return true; }
   ScreenshotInfo getScreenshotInfo() const override;
+  void onOrientationChanged(uint8_t orientation) override;
+
+ private:
+  void applyOrientation(uint8_t orientation);
 };

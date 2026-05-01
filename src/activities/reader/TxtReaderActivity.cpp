@@ -89,6 +89,30 @@ void TxtReaderActivity::loop() {
   }
 }
 
+void TxtReaderActivity::applyOrientation(uint8_t orientation) {
+  if (SETTINGS.orientation == orientation) {
+    return;
+  }
+
+  {
+    RenderLock lock(*this);
+    SETTINGS.orientation = orientation;
+    SETTINGS.saveToFile();
+    ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
+
+    initialized = false;
+    pageOffsets.clear();
+    currentPageLines.clear();
+    totalPages = 1;
+    // currentPage is preserved; it will be clamped after rebuild
+  }
+  requestUpdate();
+}
+
+void TxtReaderActivity::onOrientationChanged(uint8_t orientation) {
+  applyOrientation(orientation);
+}
+
 void TxtReaderActivity::initializeReader() {
   if (initialized) {
     return;

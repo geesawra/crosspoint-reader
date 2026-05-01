@@ -66,4 +66,5 @@ class EpubReaderActivity final : public Activity {
   void render(RenderLock&& lock) override;
   bool isReaderActivity() const override { return true; }
   ScreenshotInfo getScreenshotInfo() const override;
+  void onOrientationChanged(uint8_t orientation) override { applyOrientation(orientation); }
 };

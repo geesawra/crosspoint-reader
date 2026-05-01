@@ -203,6 +203,8 @@ class CrossPointSettings {
   uint8_t imageRendering = IMAGES_DISPLAY;
   // Tilt-based page turning (X3 only — requires QMI8658 IMU)
   uint8_t tiltPageTurn = TILT_OFF;
+  // Auto-rotate screen based on device orientation via accelerometer (X3 only)
+  uint8_t autoRotate = 0;
 
   ~CrossPointSettings() = default;
 

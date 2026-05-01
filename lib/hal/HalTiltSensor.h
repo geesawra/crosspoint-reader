@@ -43,8 +43,10 @@ class HalTiltSensor {
 
   // --- QMI8658 registers ---
   static constexpr uint8_t REG_CTRL1 = 0x02;
+  static constexpr uint8_t REG_CTRL2 = 0x03;
   static constexpr uint8_t REG_CTRL3 = 0x04;
   static constexpr uint8_t REG_CTRL7 = 0x08;
+  static constexpr uint8_t REG_AX_L = 0x35;
   static constexpr uint8_t REG_GX_L = 0x3B;
 
   // --- Register Bit Flags ---
@@ -55,17 +57,30 @@ class HalTiltSensor {
   static constexpr uint8_t CTRL1_SENSOR_DISABLE = (1 << 0);                 // 0x01: Power down sensor engine
   static constexpr uint8_t CTRL1_BASE = CTRL1_AUTO_INC | CTRL1_BIG_ENDIAN;  // 0x60
 
+  // REG_CTRL2 (0x03) - Accel Config
+  static constexpr uint8_t CTRL2_FS_4G = (0b001 << 4);  // Bits 6:4 = 001
+  static constexpr uint8_t CTRL2_ODR_28HZ = 0b1000;     // Bits 3:0 = 1000
+
   // REG_CTRL3 (0x04) - Gyro Config
   static constexpr uint8_t CTRL3_FS_512DPS = (0b101 << 4);  // Bits 6:4 = 101
   static constexpr uint8_t CTRL3_ODR_28HZ = 0b1000;         // Bits 3:0 = 1000 (28.025 Hz)
 
   // REG_CTRL7 (0x08) - Enable
   static constexpr uint8_t CTRL7_DISABLE_ALL = 0x00;
+  static constexpr uint8_t CTRL7_ACC_ENABLE = (1 << 0);   // Bit 0 = 1
   static constexpr uint8_t CTRL7_GYRO_ENABLE = (1 << 1);  // Bit 1 = 1
 
   bool writeReg(uint8_t reg, uint8_t val) const;
   bool readReg(uint8_t reg, uint8_t* val) const;
   bool readGyro(float& gx, float& gy, float& gz) const;
+  bool readAccel(float& ax, float& ay, float& az) const;
+
+  // Auto-rotate state
+  uint8_t _detectedOrientation = CrossPointOrientation::PORTRAIT;
+  uint8_t _candidateOrientation = CrossPointOrientation::PORTRAIT;
+  unsigned long _candidateStartMs = 0;
+  static constexpr unsigned long ORIENTATION_DEBOUNCE_MS = 1000;
+  static constexpr float ACCEL_FLAT_THRESHOLD = 0.75f;
 
  public:
   // Call after gpio.begin() and powerManager.begin() (I2C already initialised for X3)
@@ -80,8 +95,11 @@ class HalTiltSensor {
   // True if the QMI8658 IMU is present on this device
   bool isAvailable() const { return _available; }
 
-  // Poll the accelerometer and update tilt gesture state.
-  void update(const uint8_t mode, const uint8_t orientation, const bool inReader);
+  // Poll the IMU and update tilt gesture / auto-rotate state.
+  void update(const uint8_t mode, const uint8_t orientation, const bool autoRotate, const bool inReader);
+
+  // Returns the physically detected orientation from the accelerometer (auto-rotate).
+  uint8_t getDetectedOrientation() const { return _detectedOrientation; }
 
   // Returns true once per tilt-forward gesture (next page direction).
   // Consumed on read — subsequent calls return false until next gesture.

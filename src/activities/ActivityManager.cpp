@@ -252,6 +252,12 @@ ScreenshotInfo ActivityManager::getScreenshotInfo() const {
   return {};
 }
 
+void ActivityManager::notifyOrientationChanged(uint8_t orientation) {
+  if (currentActivity) {
+    currentActivity->onOrientationChanged(orientation);
+  }
+}
+
 void ActivityManager::requestUpdate(bool immediate) {
   if (immediate) {
     if (renderTaskHandle) {
