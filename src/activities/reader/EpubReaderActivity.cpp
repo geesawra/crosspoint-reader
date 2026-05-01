@@ -19,6 +19,9 @@
 #include "EpubReaderPercentSelectionActivity.h"
 #include "KOReaderCredentialStore.h"
 #include "KOReaderSyncActivity.h"
+#ifdef READ_IT_LATER_ENABLED
+#include "ProgressSync.h"
+#endif
 #include "MappedInputManager.h"
 #include "QrDisplayActivity.h"
 #include "ReaderUtils.h"
@@ -51,6 +54,10 @@ void EpubReaderActivity::onEnter() {
   if (!epub) {
     return;
   }
+
+  // Reset refresh counter so every book entry starts with a predictable cadence.
+  // Without this the counter carries stale state across book opens.
+  pagesUntilFullRefresh = 0;
 
   // Configure screen orientation based on settings
   // NOTE: This affects layout math and must be applied before any render calls.
@@ -100,6 +107,19 @@ void EpubReaderActivity::onEnter() {
 
 void EpubReaderActivity::onExit() {
   Activity::onExit();
+
+#ifdef READ_IT_LATER_ENABLED
+  // Push final read-progress back to the Read-it-Later provider when closing
+  // a synthesized article EPUB. Best-effort: silently skipped if WiFi is down
+  // or the file is not owned by any provider. Must run BEFORE `epub.reset()`.
+  if (epub && section) {
+    const int pageCount = section->pageCount;
+    const float chapterProg =
+        (pageCount > 0) ? (static_cast<float>(section->currentPage + 1) / static_cast<float>(pageCount)) : 0.0f;
+    const float bookProgress = epub->calculateProgress(currentSpineIndex, chapterProg);
+    ProgressSync::pushForPath(epub->getPath(), bookProgress);
+  }
+#endif
 
   // Reset orientation back to portrait for the rest of the UI
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
@@ -752,15 +772,31 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   LOG_DBG("ERS", "Heap: before=%lu after=%lu delta=%ld", heapBefore, heapAfter,
           (int32_t)heapAfter - (int32_t)heapBefore);
 
-  // Force special handling for pages with images when anti-aliasing is on
+  // Force special handling for pages with images when anti-aliasing is on.
+  // Only do the double-FAST blanking if all images are already cached.
+  // If an image is uncached, decoding may OOM after BW buffers are allocated,
+  // leaving a blank image area that never gets filled. In that case fall
+  // back to the normal refresh cycle so text remains readable.
   bool imagePageWithAA = page->hasImages() && SETTINGS.textAntiAliasing;
+  bool allImagesCached = true;
+  if (imagePageWithAA) {
+    for (const auto& el : page->elements) {
+      if (el->getTag() == TAG_PageImage) {
+        auto& pi = static_cast<PageImage&>(*el);
+        if (!pi.getImageBlock().isCached()) {
+          allImagesCached = false;
+          LOG_DBG("ERS", "Uncached image on page: %s", pi.getImageBlock().getImagePath().c_str());
+        }
+      }
+    }
+  }
 
   page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
   renderStatusBar();
   fcm->logStats("bw_render");
   const auto tBwRender = millis();
 
-  if (imagePageWithAA) {
+  if (imagePageWithAA && allImagesCached) {
     // Double FAST_REFRESH with selective image blanking (pablohc's technique):
     // HALF_REFRESH sets particles too firmly for the grayscale LUT to adjust.
     // Instead, blank only the image area and do two fast refreshes.
@@ -768,6 +804,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     // Step 2: Re-render with images and display again (images appear clean)
     int16_t imgX, imgY, imgW, imgH;
     if (page->getImageBoundingBox(imgX, imgY, imgW, imgH)) {
+      LOG_DBG("ERS", "Refresh: image-page double-FAST");
       renderer.fillRect(imgX + orientedMarginLeft, imgY + orientedMarginTop, imgW, imgH, false);
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 
@@ -776,21 +813,27 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
     } else {
+      LOG_DBG("ERS", "Refresh: AA-with-images-no-bbox HALF");
       renderer.displayBuffer(HalDisplay::HALF_REFRESH);
     }
     // Double FAST_REFRESH handles ghosting for image pages; don't count toward full refresh cadence
   } else {
+    LOG_DBG("ERS", "Refresh: cycle (counter=%d hasImages=%d AA=%d allCached=%d)", pagesUntilFullRefresh,
+            page->hasImages() ? 1 : 0, SETTINGS.textAntiAliasing ? 1 : 0, allImagesCached ? 1 : 0);
     ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
   }
   const auto tDisplay = millis();
 
-  // Save bw buffer to reset buffer state after grayscale data sync
-  renderer.storeBwBuffer();
+  // Save bw buffer to reset buffer state after grayscale data sync.
+  // If the save fails (heap pressure), the AA pass below must be skipped —
+  // running displayGrayBuffer() without a recoverable BW baseline corrupts
+  // HAL display state for the rest of the session.
+  const bool bwStored = renderer.storeBwBuffer();
   const auto tBwStore = millis();
 
   // grayscale rendering
   // TODO: Only do this if font supports it
-  if (SETTINGS.textAntiAliasing) {
+  if (SETTINGS.textAntiAliasing && bwStored) {
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
     page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
@@ -821,7 +864,11 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
             tPrewarm - t0, tBwRender - tPrewarm, tDisplay - tBwRender, tBwStore - tDisplay, tGrayLsb - tBwStore,
             tGrayMsb - tGrayLsb, tGrayDisplay - tGrayMsb, tBwRestore - tGrayDisplay, tEnd - t0);
   } else {
-    // restore the bw data
+    if (SETTINGS.textAntiAliasing && !bwStored) {
+      LOG_ERR("ERS", "Skipping AA pass: BW buffer save failed (heap pressure); page rendered as plain BW");
+    }
+    // restore is still safe to call (it no-ops or recovers HAL state) and
+    // keeps the timing log shape consistent with the AA branch.
     renderer.restoreBwBuffer();
     const auto tBwRestore = millis();
 

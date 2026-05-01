@@ -89,7 +89,7 @@ class CrossPointSettings {
   // Side button layout options
   // Default: Previous, Next
   // Swapped: Next, Previous
-  enum SIDE_BUTTON_LAYOUT { PREV_NEXT = 0, NEXT_PREV = 1, SIDE_BUTTON_LAYOUT_COUNT };
+  enum SIDE_BUTTON_LAYOUT { PREV_NEXT = 0, NEXT_PREV = 1, BOTH_FORWARD = 2, SIDE_BUTTON_LAYOUT_COUNT };
 
   // Font family options
   enum FONT_FAMILY { BOOKERLY = 0, NOTOSANS = 1, OPENDYSLEXIC = 2, FONT_FAMILY_COUNT };

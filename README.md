@@ -37,6 +37,7 @@ This project is **not affiliated with Xteink**; it's built as a community projec
 - [x] Wifi book upload
 - [x] Wifi OTA updates
 - [x] KOReader Sync integration for cross-device reading progress
+- [x] Read-it-Later integration (multi-provider; read saved articles as EPUBs — Instapaper supported out of the box)
 - [x] Configurable font, layout, and display options
   - [ ] User provided fonts
   - [ ] Full UTF support
@@ -48,6 +49,35 @@ See [the user guide](./USER_GUIDE.md) for instructions on operating CrossPoint, 
 [KOReader Sync quick setup](./USER_GUIDE.md#365-koreader-sync-quick-setup).
 
 For more details about the scope of the project, see the [SCOPE.md](SCOPE.md) document.
+
+### Read-it-Later setup
+
+CrossPoint includes a generic **Read-it-Later** framework that can sync saved
+articles from multiple services. Currently **Instapaper** is supported out of
+the box; additional providers can be added in the future.
+
+#### Instapaper
+
+CrossPoint reads your Instapaper bookmarks using the
+[Full API](https://www.instapaper.com/api/full), so you first need an OAuth consumer
+token — apply at [instapaper.com/developers/applications/create](https://www.instapaper.com/developers/applications/create).
+
+Once you have a consumer key and secret, run the helper script on your
+computer to exchange your account credentials for a persistent access token
+pair:
+
+```sh
+python3 scripts/instapaper_auth.py \
+    --consumer-key   YOUR_CONSUMER_KEY \
+    --consumer-secret YOUR_CONSUMER_SECRET \
+    --username        you@example.com
+# password is prompted interactively
+```
+
+Copy the resulting `instapaper.txt` to your SD card at
+`/.crosspoint/instapaper.txt`. From the home screen, select
+**Read-it-Later** → **Instapaper** to browse your Unread, Starred and Archive
+folders. Opened articles are cached on the SD card and can be re-read offline.
 
 ## Installing
 

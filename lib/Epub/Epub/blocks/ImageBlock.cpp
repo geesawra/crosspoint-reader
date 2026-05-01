@@ -91,6 +91,8 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
 
 }  // namespace
 
+bool ImageBlock::isCached() const { return Storage.exists(getCachePath(imagePath).c_str()); }
+
 void ImageBlock::render(GfxRenderer& renderer, const int x, const int y) {
   LOG_DBG("IMG", "Rendering image at %d,%d: %s (%dx%d)", x, y, imagePath.c_str(), width, height);
 
@@ -99,8 +101,12 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y) {
 
   // Bounds check render position using logical screen dimensions
   if (x < 0 || y < 0 || x + width > screenWidth || y + height > screenHeight) {
-    LOG_ERR("IMG", "Invalid render position: (%d,%d) size (%dx%d) screen (%dx%d)", x, y, width, height, screenWidth,
-            screenHeight);
+    LOG_ERR("IMG", "Invalid render position: image (%d,%d) size %dx%d, screen %dx%d, checks: x<0=%d y<0=%d "
+                  "x+width>sw=%d (%d>%d) y+height>sh=%d (%d>%d)",
+            x, y, width, height, screenWidth, screenHeight,
+            x < 0, y < 0,
+            x + width > screenWidth, x + width, screenWidth,
+            y + height > screenHeight, y + height, screenHeight);
     return;
   }
 
@@ -137,6 +143,9 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y) {
   config.performanceMode = false;
   config.useExactDimensions = true;  // Use pre-calculated dimensions to avoid rounding mismatches
   config.cachePath = cachePath;      // Enable caching during decode
+
+  LOG_DBG("IMG", "Decode config: x=%d y=%d maxWidth=%d maxHeight=%d cache=%s", config.x, config.y, config.maxWidth,
+          config.maxHeight, config.cachePath.c_str());
 
   ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(imagePath);
   if (!decoder) {

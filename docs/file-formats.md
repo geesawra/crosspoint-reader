@@ -219,3 +219,27 @@ if (parsedSize != fileSize) {
     std::warning(std::format("Unparsed data detected: {} bytes remaining at offset 0x{:X}", fileSize - parsedSize, parsedSize));
 }
 ```
+
+
+## `instapaper_tokens.txt`
+
+Plain UTF-8 text, four `key=value` lines, order-independent. Blank and `#`-commented lines ignored.
+
+```
+consumer_key=<OAuth 1.0a consumer key from your Instapaper app registration>
+consumer_secret=<OAuth 1.0a consumer secret>
+oauth_token=<user access token>
+oauth_token_secret=<user access token secret>
+```
+
+Generate with `scripts/instapaper_auth.py`. See `README.md` for setup.
+
+## `/.crosspoint/instapaper/`
+
+Per-article synthesized EPUB cache. Each article fetched via the Instapaper
+API is wrapped in a minimal STORED-only ZIP archive and stored as
+`article_<bookmark_id>.epub`. The existing EPUB pipeline treats these files
+exactly like any other EPUB, so paginated sections, progress, and rendered
+thumbnails live in the standard `.crosspoint/epub_<hash>/` cache keyed by the
+synthesized filepath. To re-fetch an article (e.g. after Instapaper re-parses
+it), delete both `article_<id>.epub` and the matching `epub_<hash>/` directory.

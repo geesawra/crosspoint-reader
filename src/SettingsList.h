@@ -67,7 +67,8 @@ inline const std::vector<SettingInfo>& getSettingsList() {
                         "imageRendering", StrId::STR_CAT_READER),
       // --- Controls ---
       SettingInfo::Enum(StrId::STR_SIDE_BTN_LAYOUT, &CrossPointSettings::sideButtonLayout,
-                        {StrId::STR_PREV_NEXT, StrId::STR_NEXT_PREV}, "sideButtonLayout", StrId::STR_CAT_CONTROLS),
+                         {StrId::STR_PREV_NEXT, StrId::STR_NEXT_PREV, StrId::STR_BOTH_FORWARD}, "sideButtonLayout",
+                         StrId::STR_CAT_CONTROLS),
       SettingInfo::Toggle(StrId::STR_LONG_PRESS_SKIP, &CrossPointSettings::longPressChapterSkip, "longPressChapterSkip",
                           StrId::STR_CAT_CONTROLS),
       SettingInfo::Enum(StrId::STR_SHORT_PWR_BTN, &CrossPointSettings::shortPwrBtn,

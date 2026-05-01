@@ -27,6 +27,9 @@ int HomeActivity::getMenuItemCount() const {
   if (hasOpdsUrl) {
     count++;
   }
+#ifdef READ_IT_LATER_ENABLED
+  count++;  // Read-it-Later
+#endif
   return count;
 }
 
@@ -191,6 +194,11 @@ void HomeActivity::loop() {
     const int fileBrowserIdx = idx++;
     const int recentsIdx = idx++;
     const int opdsLibraryIdx = hasOpdsUrl ? idx++ : -1;
+#ifdef READ_IT_LATER_ENABLED
+    const int readItLaterIdx = idx++;
+#else
+    const int readItLaterIdx = -1;
+#endif
     const int fileTransferIdx = idx++;
     const int settingsIdx = idx;
 
@@ -202,6 +210,10 @@ void HomeActivity::loop() {
       onRecentsOpen();
     } else if (menuSelectedIndex == opdsLibraryIdx) {
       onOpdsBrowserOpen();
+#ifdef READ_IT_LATER_ENABLED
+    } else if (menuSelectedIndex == readItLaterIdx) {
+      onReadItLaterOpen();
+#endif
     } else if (menuSelectedIndex == fileTransferIdx) {
       onFileTransferOpen();
     } else if (menuSelectedIndex == settingsIdx) {
@@ -234,6 +246,15 @@ void HomeActivity::render(RenderLock&&) {
     menuItems.insert(menuItems.begin() + 2, tr(STR_OPDS_BROWSER));
     menuIcons.insert(menuIcons.begin() + 2, Library);
   }
+
+#ifdef READ_IT_LATER_ENABLED
+  {
+    // Insert Read-it-Later before File Transfer (index depends on OPDS presence).
+    const size_t pos = hasOpdsUrl ? 3 : 2;
+    menuItems.insert(menuItems.begin() + pos, tr(STR_READ_IT_LATER));
+    menuIcons.insert(menuIcons.begin() + pos, ReadItLater);
+  }
+#endif
 
   GUI.drawButtonMenu(
       renderer,
@@ -269,3 +290,7 @@ void HomeActivity::onSettingsOpen() { activityManager.goToSettings(); }
 void HomeActivity::onFileTransferOpen() { activityManager.goToFileTransfer(); }
 
 void HomeActivity::onOpdsBrowserOpen() { activityManager.goToBrowser(); }
+
+#ifdef READ_IT_LATER_ENABLED
+void HomeActivity::onReadItLaterOpen() { activityManager.goToReadItLater(); }
+#endif

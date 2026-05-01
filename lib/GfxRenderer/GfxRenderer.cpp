@@ -1233,6 +1233,13 @@ void GfxRenderer::restoreBwBuffer() {
   }
 
   if (missingChunks) {
+    // BW buffer was lost (likely storeBwBuffer() failed under heap pressure and
+    // the caller didn't check). The HAL still expects a cleanup pass to rebase
+    // RAM from a known buffer; skipping it leaves _x3RedRamSynced=false, which
+    // forces every subsequent displayBuffer() into a full sync until reboot.
+    // Use the current framebuffer as the baseline — it's the best we have.
+    LOG_ERR("GFX", "BW buffer chunks missing on restore; recovering HAL state from framebuffer");
+    display.cleanupGrayscaleBuffers(frameBuffer);
     freeBwBufferChunks();
     return;
   }

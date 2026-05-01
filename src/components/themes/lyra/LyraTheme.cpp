@@ -20,7 +20,9 @@
 #include "components/icons/folder24.h"
 #include "components/icons/hotspot.h"
 #include "components/icons/image24.h"
+#include "components/icons/instapaper.h"
 #include "components/icons/library.h"
+#include "components/icons/readitlater.h"
 #include "components/icons/recent.h"
 #include "components/icons/settings2.h"
 #include "components/icons/text24.h"
@@ -78,6 +80,10 @@ const uint8_t* iconForName(UIIcon icon, int size) {
         return Book24Icon;
       case UIIcon::File:
         return File24Icon;
+      case UIIcon::Instapaper:
+        return InstapaperIcon24;
+      case UIIcon::ReadItLater:
+        return ReadItLaterIcon24;
       default:
         return nullptr;
     }
@@ -99,6 +105,10 @@ const uint8_t* iconForName(UIIcon icon, int size) {
         return WifiIcon;
       case UIIcon::Hotspot:
         return HotspotIcon;
+      case UIIcon::Instapaper:
+        return InstapaperIcon;
+      case UIIcon::ReadItLater:
+        return ReadItLaterIcon;
       default:
         return nullptr;
     }
