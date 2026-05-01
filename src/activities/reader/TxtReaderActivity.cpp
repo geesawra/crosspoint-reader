@@ -29,6 +29,15 @@ void TxtReaderActivity::onEnter() {
     return;
   }
 
+  // Sync to physical orientation when auto-rotate is active.
+  if (SETTINGS.autoRotate && halTiltSensor.isAvailable()) {
+    const uint8_t detected = halTiltSensor.getDetectedOrientation();
+    if (detected != SETTINGS.orientation) {
+      SETTINGS.orientation = detected;
+      SETTINGS.saveToFile();
+    }
+  }
+
   ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
 
   txt->setupCacheDir();

@@ -79,7 +79,7 @@ class HalTiltSensor {
   uint8_t _detectedOrientation = CrossPointOrientation::PORTRAIT;
   uint8_t _candidateOrientation = CrossPointOrientation::PORTRAIT;
   unsigned long _candidateStartMs = 0;
-  static constexpr unsigned long ORIENTATION_DEBOUNCE_MS = 1000;
+  static constexpr unsigned long ORIENTATION_DEBOUNCE_MS = 500;
   static constexpr float ACCEL_FLAT_THRESHOLD = 0.75f;
 
  public:

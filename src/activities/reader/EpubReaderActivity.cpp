@@ -59,6 +59,16 @@ void EpubReaderActivity::onEnter() {
   // Without this the counter carries stale state across book opens.
   pagesUntilFullRefresh = 0;
 
+  // Sync to physical orientation when auto-rotate is active, so the book opens
+  // in the correct orientation even if the device was rotated on the home screen.
+  if (SETTINGS.autoRotate && halTiltSensor.isAvailable()) {
+    const uint8_t detected = halTiltSensor.getDetectedOrientation();
+    if (detected != SETTINGS.orientation) {
+      SETTINGS.orientation = detected;
+      SETTINGS.saveToFile();
+    }
+  }
+
   // Configure screen orientation based on settings
   // NOTE: This affects layout math and must be applied before any render calls.
   ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);

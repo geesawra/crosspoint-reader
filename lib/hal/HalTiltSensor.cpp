@@ -161,7 +161,9 @@ void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const 
     return;
   }
 
-  const bool needsImu = (mode != CrossPointTiltPageTurn::TILT_OFF) || autoRotate;
+  const bool needsAccel = autoRotate;
+  const bool needsGyro = (mode != CrossPointTiltPageTurn::TILT_OFF) && inReader;
+  const bool needsImu = needsAccel || needsGyro;
 
   // State machine: wake up or sleep based on the enabled flag
   if (needsImu && !_isAwake) {
@@ -172,8 +174,7 @@ void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const 
     return;
   }
 
-  // If disabled, skip the rest of the polling logic and avoid unnecessary I2C traffic in non-reader activities
-  if (!needsImu || !inReader) {
+  if (!needsImu) {
     return;
   }
 
@@ -188,24 +189,26 @@ void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const 
   }
   _lastPollMs = now;
 
-  // --- Auto-rotate via accelerometer ---
-  if (autoRotate) {
+  // --- Auto-rotate via accelerometer (works everywhere, not just in reader) ---
+  if (needsAccel) {
     float ax, ay, az;
     if (readAccel(ax, ay, az)) {
       const float absX = fabsf(ax);
       const float absY = fabsf(ay);
       const float absZ = fabsf(az);
 
+      LOG_DBG("GYR", "Accel: x=%.2f y=%.2f z=%.2f", ax, ay, az);
+
       uint8_t newOrientation = orientation;
       if (absZ > ACCEL_FLAT_THRESHOLD && absZ > absX && absZ > absY) {
         // Device is roughly flat; keep current orientation
         newOrientation = orientation;
-      } else if (absY > absX) {
-        // Portrait family: Y axis dominant
-        newOrientation = (ay > 0) ? CrossPointOrientation::PORTRAIT : CrossPointOrientation::INVERTED;
+      } else if (absX > absY) {
+        // X dominant -> portrait family (sensor X aligns with device top-to-bottom)
+        newOrientation = (ax > 0) ? CrossPointOrientation::PORTRAIT : CrossPointOrientation::INVERTED;
       } else {
-        // Landscape family: X axis dominant
-        newOrientation = (ax > 0) ? CrossPointOrientation::LANDSCAPE_CW : CrossPointOrientation::LANDSCAPE_CCW;
+        // Y dominant -> landscape family (sensor Y aligns with device left-to-right)
+        newOrientation = (ay > 0) ? CrossPointOrientation::LANDSCAPE_CCW : CrossPointOrientation::LANDSCAPE_CW;
       }
 
       if (newOrientation != _candidateOrientation) {
@@ -223,8 +226,8 @@ void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const 
     }
   }
 
-  // --- Tilt page turn via gyroscope ---
-  if (mode != CrossPointTiltPageTurn::TILT_OFF) {
+  // --- Tilt page turn via gyroscope (reader only) ---
+  if (needsGyro) {
     float gx, gy, gz;
     if (!readGyro(gx, gy, gz)) {
       return;
