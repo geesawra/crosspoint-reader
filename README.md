@@ -79,6 +79,48 @@ Copy the resulting `instapaper.txt` to your SD card at
 **Read-it-Later** → **Instapaper** to browse your Unread, Starred and Archive
 folders. Opened articles are cached on the SD card and can be re-read offline.
 
+### Additional tools
+
+* `scripts/convert_wallpaper.py` — Convert and resize images to custom sleep-screen wallpapers.
+* `scripts/instapaper_auth.py` — Exchange your Instapaper username/password for persistent OAuth tokens.
+* `tools/decode_crash.py` — Decode ESP32-C3 crash dumps into human-readable stack traces.
+
+## Fork Differences
+
+This repository is a **fork** of the original [CrossPoint Reader](https://github.com/crosspoint-reader/crosspoint-reader) project.
+The table below summarises what this fork adds or changes compared to upstream.
+
+#### Added features (not in upstream)
+
+| Feature | Description |
+|---------|-------------|
+| **Instapaper / Read-it-Later** | Full Instapaper integration — browse, read, star, archive, and bulk-download your saved articles as EPUBs. Built on a generic multi-provider framework for future services. |
+| **CSS lazy-loading** | CSS rules are loaded on-demand from an indexed SD cache instead of all-at-once, reducing peak RAM usage during EPUB rendering. |
+| **"Both Forward" side button layout** | New side-button arrangement where both the front and back buttons advance the page forward. |
+| **Custom wallpaper script** | `convert_wallpaper.py` to prepare personal sleep-screen images. |
+| **Crash dump decoder** | `decode_crash.py` to translate raw ESP32-C3 crash logs into readable stack traces. |
+
+#### Notable fixes (not in upstream)
+
+* Prevents sticky full-refresh after text-only page OOM in the reader.
+* Resets `pagesUntilFullRefresh` counter when entering a book.
+* Streams images into the EPUB ZIP incrementally to avoid OOM on Instapaper articles with many images.
+* Raises the per-image download size cap from 150 KiB to 512 KiB.
+
+#### Features in upstream (not in this fork)
+
+The original upstream includes features that this fork has **not yet incorporated**:
+
+* Multiple OPDS server support
+* X3 gyroscope-based tilt page turning (QMI8658 IMU)
+* KOReader Sync TLS / OOM fixes
+* Roundedraff theme
+* Context-aware screenshot filenames
+* Royalty.dev funding integration
+* i18n pointer-table optimisation (reduced binary size)
+
+These will be back-ported as time permits.
+
 ## Installing
 
 ### Web (latest firmware)
