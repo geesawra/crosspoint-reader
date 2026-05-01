@@ -627,7 +627,16 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       }
       pendingPageJump.reset();
     } else {
-      section->currentPage = nextPageNumber;
+      if (cachedChapterTotalPageCount > 0 && currentSpineIndex == cachedSpineIndex &&
+          section->pageCount != cachedChapterTotalPageCount) {
+        // Orientation or settings changed: remap by percentage to preserve reading position.
+        // nextPageNumber and cachedChapterTotalPageCount are from the old layout.
+        const float progress = static_cast<float>(nextPageNumber) / static_cast<float>(cachedChapterTotalPageCount);
+        section->currentPage = static_cast<int>(progress * section->pageCount);
+        cachedChapterTotalPageCount = 0;
+      } else {
+        section->currentPage = nextPageNumber;
+      }
       if (section->currentPage < 0) {
         section->currentPage = 0;
       } else if (section->currentPage >= section->pageCount && section->pageCount > 0) {

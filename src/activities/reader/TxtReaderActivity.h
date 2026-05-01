@@ -30,6 +30,10 @@ class TxtReaderActivity final : public Activity {
   int cachedOrientedMarginBottom = 0;
   int cachedOrientedMarginLeft = 0;
 
+  // Percentage-based remap on orientation change
+  float cachedPageProgress = 0.0f;
+  int cachedTotalPages = 0;
+
   void renderPage();
   void renderStatusBar() const;
 

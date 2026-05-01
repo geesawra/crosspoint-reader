@@ -105,6 +105,12 @@ void TxtReaderActivity::applyOrientation(uint8_t orientation) {
 
   {
     RenderLock lock(*this);
+    // Preserve reading position as a percentage so it maps correctly after reflow.
+    if (totalPages > 0) {
+      cachedPageProgress = static_cast<float>(currentPage) / static_cast<float>(totalPages);
+      cachedTotalPages = totalPages;
+    }
+
     SETTINGS.orientation = orientation;
     SETTINGS.saveToFile();
     ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
@@ -113,7 +119,6 @@ void TxtReaderActivity::applyOrientation(uint8_t orientation) {
     pageOffsets.clear();
     currentPageLines.clear();
     totalPages = 1;
-    // currentPage is preserved; it will be clamped after rebuild
   }
   requestUpdate();
 }
@@ -160,6 +165,15 @@ void TxtReaderActivity::initializeReader() {
 
   // Load saved progress
   loadProgress();
+
+  // If orientation changed, remap currentPage by percentage to preserve reading position.
+  if (cachedTotalPages > 0 && totalPages > 0 && totalPages != cachedTotalPages) {
+    currentPage = static_cast<int>(cachedPageProgress * totalPages);
+    if (currentPage >= totalPages) currentPage = totalPages - 1;
+    if (currentPage < 0) currentPage = 0;
+    cachedTotalPages = 0;
+    LOG_DBG("TRS", "Remapped page by progress: %d/%d", currentPage, totalPages);
+  }
 
   initialized = true;
 }
