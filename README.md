@@ -1,5 +1,10 @@
 # CrossPoint Reader
 
+> [!TIP]
+> This is my own personal fork of CrossPoint - I may have removed features that you rely upon, so please double-check.
+> There are several missing features, broken bones, and lots of LLM-assisted development.
+> It may or may not follow upstream, use at your risk.
+
 Firmware for the **Xteink X4** e-paper display reader (unaffiliated with Xteink).
 Built using **PlatformIO** and targeting the **ESP32-C3** microcontroller.
 
