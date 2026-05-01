@@ -97,6 +97,7 @@ The table below summarises what this fork adds or changes compared to upstream.
 | **Instapaper / Read-it-Later** | Full Instapaper integration — browse, read, star, archive, and bulk-download your saved articles as EPUBs. Built on a generic multi-provider framework for future services. |
 | **CSS lazy-loading** | CSS rules are loaded on-demand from an indexed SD cache instead of all-at-once, reducing peak RAM usage during EPUB rendering. |
 | **"Both Forward" side button layout** | New side-button arrangement where both the front and back buttons advance the page forward. |
+| **Auto-rotate (X3 only)** | Automatic screen orientation detection via the QMI8658 accelerometer. Rotates the reader when the device is turned, with a 1-second debounce to avoid accidental flips. |
 | **Custom wallpaper script** | `convert_wallpaper.py` to prepare personal sleep-screen images. |
 | **Crash dump decoder** | `decode_crash.py` to translate raw ESP32-C3 crash logs into readable stack traces. |
 
@@ -111,13 +112,8 @@ The table below summarises what this fork adds or changes compared to upstream.
 
 The original upstream includes features that this fork has **not yet incorporated**:
 
-* Multiple OPDS server support
-* X3 gyroscope-based tilt page turning (QMI8658 IMU)
 * KOReader Sync TLS / OOM fixes
-* Roundedraff theme
-* Context-aware screenshot filenames
 * Royalty.dev funding integration
-* i18n pointer-table optimisation (reduced binary size)
 
 These will be back-ported as time permits.
 
