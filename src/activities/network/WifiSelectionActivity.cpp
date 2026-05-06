@@ -4,6 +4,8 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <WiFi.h>
+#include <esp_sntp.h>
+#include <time.h>
 
 #include <map>
 
@@ -35,14 +37,6 @@ void WifiSelectionActivity::onEnter() {
   savePromptSelection = 0;
   forgetPromptSelection = 0;
   autoConnecting = false;
-
-  // Cache MAC address for display
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
-  char macStr[64];
-  snprintf(macStr, sizeof(macStr), "%s %02x-%02x-%02x-%02x-%02x-%02x", tr(STR_MAC_ADDRESS), mac[0], mac[1], mac[2],
-           mac[3], mac[4], mac[5]);
-  cachedMacAddress = std::string(macStr);
 
   // Trigger first update to show scanning message
   requestUpdate();
@@ -97,6 +91,10 @@ void WifiSelectionActivity::startWifiScan() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
+
+  // MAC is stable once STA mode is initialised; cache it now so the
+  // sub-header shows the correct address regardless of previous mode.
+  refreshMacAddress();
 
   // Start async scan
   WiFi.scanNetworks(true);  // true = async scan
@@ -220,6 +218,9 @@ void WifiSelectionActivity::attemptConnection() {
   WiFi.disconnect(true, true);  // Abort any in-progress SDK auto-connect and clear NVS-saved SSID
   delay(100);
 
+  // Ensure MAC is read after STA is initialised (mirrors startWifiScan).
+  refreshMacAddress();
+
   // Set hostname so routers show "CrossPoint-Reader-AABBCCDDEEFF" instead of "esp32-XXXXXXXXXXXX"
   String mac = WiFi.macAddress();
   mac.replace(":", "");
@@ -247,6 +248,16 @@ void WifiSelectionActivity::checkConnectionStatus() {
     snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
     connectedIP = ipStr;
     autoConnecting = false;
+
+    // Start SNTP in the background so that by the time the user reaches
+    // network-dependent features (Instapaper, etc.) the clock is already
+    // synced. OAuth 1.0a signatures require a valid Unix timestamp.
+    if (!esp_sntp_enabled()) {
+      esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+      esp_sntp_setservername(0, "pool.ntp.org");
+      esp_sntp_init();
+      LOG_DBG("WIFI", "SNTP started proactively after WiFi connect");
+    }
 
     // Save this as the last connected network - SD card operations need lock as
     // we use SPI for both
@@ -687,6 +698,15 @@ void WifiSelectionActivity::renderForgetPrompt() const {
   // Use centralized button hints
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_LEFT), tr(STR_DIR_RIGHT));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+}
+
+void WifiSelectionActivity::refreshMacAddress() {
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char macStr[64];
+  snprintf(macStr, sizeof(macStr), "%s %02x-%02x-%02x-%02x-%02x-%02x", tr(STR_MAC_ADDRESS), mac[0], mac[1], mac[2],
+           mac[3], mac[4], mac[5]);
+  cachedMacAddress = std::string(macStr);
 }
 
 void WifiSelectionActivity::onComplete(const bool connected) {

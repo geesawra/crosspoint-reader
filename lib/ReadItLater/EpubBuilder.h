@@ -37,7 +37,9 @@ class EpubBuilder {
                            const char* author,
                            const char* htmlPath,
                            ProgressCallback cb = nullptr,
-                           void* ctx = nullptr);
+                           void* ctx = nullptr,
+                           bool includeImages = true,
+                           const char* outPath = nullptr);
 
   // Compute the expected on-SD path for an article. Does not touch the SD.
   static std::string pathFor(const char* cacheDir, uint64_t articleId);

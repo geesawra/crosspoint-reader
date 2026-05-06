@@ -9,6 +9,7 @@
 
 #include <cstdio>
 
+#include "CrossPointSettings.h"
 #include "MappedInputManager.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
@@ -66,7 +67,7 @@ void DownloadAllActivity::performDownloads() {
     const ReadItLaterArticle& a = articles[i];
 
     // Skip if already cached.
-    const std::string epubPath = provider->epubPathFor(a.id);
+    const std::string epubPath = provider->epubPathFor(a.id, a.title);
     if (Storage.exists(epubPath.c_str())) {
       skipped++;
       {
@@ -98,7 +99,8 @@ void DownloadAllActivity::performDownloads() {
     } else {
       const std::string out =
           EpubBuilder::build(provider->cacheDirName(), provider->coverPngData(), provider->coverPngLen(), a.id,
-                             a.title, a.author, htmlTmpPath.c_str());
+                             a.title, a.author, htmlTmpPath.c_str(), nullptr, nullptr,
+                             SETTINGS.readItLaterImages, epubPath.c_str());
       Storage.remove(htmlTmpPath.c_str());
       if (out.empty()) {
         failed++;

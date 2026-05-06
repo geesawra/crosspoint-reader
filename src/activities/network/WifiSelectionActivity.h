@@ -95,6 +95,7 @@ class WifiSelectionActivity final : public Activity {
   void checkConnectionStatus();
   std::string getSignalStrengthIndicator(int32_t rssi) const;
 
+  void refreshMacAddress();
   void onComplete(bool connected);
 
  public:

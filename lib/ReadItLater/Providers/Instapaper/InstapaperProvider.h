@@ -30,7 +30,7 @@ class InstapaperProvider : public Provider {
   Result performAction(uint64_t articleId, Action action) override;
   Result updateProgress(uint64_t articleId, float progress) override;
 
-  std::string epubPathFor(uint64_t articleId) const override;
+  std::string epubPathFor(uint64_t articleId, const char* title = nullptr) const override;
   uint64_t extractArticleId(const std::string& epubPath) const override;
   const char* coverPngData() const override { return reinterpret_cast<const char*>(INSTAPAPER_COVER_PNG); }
   size_t coverPngLen() const override { return INSTAPAPER_COVER_PNG_LEN; }

@@ -98,7 +98,7 @@ class Provider {
   // ---------- EPUB path mapping ----------
 
   /** Absolute SD path where the EPUB for this article should live. */
-  virtual std::string epubPathFor(uint64_t articleId) const = 0;
+  virtual std::string epubPathFor(uint64_t articleId, const char* title = nullptr) const = 0;
 
   /** Extract article ID from an EPUB path, or 0 if not owned by this provider. */
   virtual uint64_t extractArticleId(const std::string& epubPath) const = 0;

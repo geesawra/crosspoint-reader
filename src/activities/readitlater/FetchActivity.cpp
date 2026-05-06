@@ -9,6 +9,7 @@
 
 #include <cstdio>
 
+#include "CrossPointSettings.h"
 #include "MappedInputManager.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
@@ -25,7 +26,7 @@ void FetchActivity::onEnter() {
   // If the article is already cached on SD, skip the API call and jump
   // straight to the reader. Flush button state first so the Confirm that
   // got us here doesn't ride through to the reader's first loop.
-  const std::string cached = provider->epubPathFor(article.id);
+  const std::string cached = provider->epubPathFor(article.id, article.title);
   if (Storage.exists(cached.c_str())) {
     LOG_DBG("RIL", "Using cached EPUB: %s", cached.c_str());
     mappedInput.update();
@@ -98,9 +99,11 @@ void FetchActivity::performWork() {
   }
   requestUpdateAndWait();
 
+  const std::string outPath = provider->epubPathFor(article.id, article.title);
   const std::string path = EpubBuilder::build(
       provider->cacheDirName(), provider->coverPngData(), provider->coverPngLen(), article.id, article.title,
-      article.author, htmlTmpPath.c_str(), &onBuildProgress, this);
+      article.author, htmlTmpPath.c_str(), &onBuildProgress, this,
+      SETTINGS.readItLaterImages, outPath.c_str());
 
   // HTML temp file is no longer needed regardless of outcome.
   Storage.remove(htmlTmpPath.c_str());

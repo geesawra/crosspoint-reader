@@ -45,9 +45,11 @@ void ensureTimeSynced() {
     esp_sntp_init();
   }
 
-  // Wait for sync in 3 rounds (SNTP does background polls; each round gives
+  // Wait for sync in 5 rounds (SNTP does background polls; each round gives
   // the poller a chance to succeed).  Break early if time becomes valid.
-  for (int round = 0; round < 3; round++) {
+  // First-time sync after cold boot can take 10-15s depending on DNS and
+  // network latency, so we are generous here.
+  for (int round = 0; round < 5; round++) {
     for (int i = 0; i < 30; i++) {
       if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) break;
       vTaskDelay(100 / portTICK_PERIOD_MS);
@@ -55,7 +57,7 @@ void ensureTimeSynced() {
     if (::time(nullptr) > 1600000000) break;
   }
   if (::time(nullptr) < 1600000000) {
-    LOG_ERR("INSTA", "NTP sync timed out; OAuth signatures may be rejected");
+    LOG_ERR("INSTA", "NTP sync timed out after 15s; OAuth signatures may be rejected");
   } else {
     LOG_DBG("INSTA", "NTP synced, epoch=%lld", static_cast<long long>(::time(nullptr)));
   }

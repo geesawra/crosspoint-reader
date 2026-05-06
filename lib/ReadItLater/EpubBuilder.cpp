@@ -708,7 +708,9 @@ std::string EpubBuilder::build(const char* cacheDir,
                                const char* title,
                                const char* author,
                                const char* htmlPath,
-                               ProgressCallback cb, void* ctx) {
+                               ProgressCallback cb, void* ctx,
+                               bool includeImages,
+                               const char* outPath) {
   auto report = [&](int pct, const char* label) {
     if (cb) cb(ctx, pct, label);
   };
@@ -718,7 +720,17 @@ std::string EpubBuilder::build(const char* cacheDir,
   char fullDir[64];
   std::snprintf(fullDir, sizeof(fullDir), "/.crosspoint/%s", cacheDir);
   Storage.mkdir(fullDir);
-  const std::string outPath = pathFor(fullDir, articleId);
+  const std::string outPathStr = (outPath && *outPath) ? outPath : pathFor(fullDir, articleId);
+
+  // Ensure the output directory exists when a custom path is supplied.
+  if (outPath && *outPath) {
+    std::string dir = outPathStr;
+    size_t lastSlash = dir.find_last_of('/');
+    if (lastSlash != std::string::npos) {
+      dir.resize(lastSlash);
+      Storage.mkdir(dir.c_str());
+    }
+  }
 
   // Temp paths — all cleaned up on every exit path below.
   char bodyTmpBuf[128];
@@ -738,17 +750,17 @@ std::string EpubBuilder::build(const char* cacheDir,
   // Stream-scan the full HTML file for <img src="..."> tags. Peak heap is
   // O(CHUNK_SIZE + OVERLAP) regardless of article length.
   std::vector<std::string> imageUrls;
-  {
+  if (includeImages) {
     FsFile hf;
     if (Storage.openFileForRead("RIL", htmlPath, hf)) {
       constexpr size_t MAX_IMAGES = 6;
       imageUrls = extractImageUrlsFromFile(hf, MAX_IMAGES);
       hf.close();
     }
-  }
-  LOG_DBG("RIL", "Article has %zu image URL(s) to fetch", imageUrls.size());
-  for (size_t idx = 0; idx < imageUrls.size(); idx++) {
-    LOG_DBG("RIL", "  Image URL [%zu]: %s", idx, imageUrls[idx].c_str());
+    LOG_DBG("RIL", "Article has %zu image URL(s) to fetch", imageUrls.size());
+    for (size_t idx = 0; idx < imageUrls.size(); idx++) {
+      LOG_DBG("RIL", "  Image URL [%zu]: %s", idx, imageUrls[idx].c_str());
+    }
   }
 
   std::unordered_map<std::string, std::string> imageMap;
@@ -765,30 +777,32 @@ std::string EpubBuilder::build(const char* cacheDir,
     LOG_ERR("RIL", "%s", msg);
     Storage.remove(bodyTmpPath.c_str());
     Storage.remove(xhtmlTmpPath.c_str());
-    Storage.remove(outPath.c_str());
+    Storage.remove(outPathStr.c_str());
     for (const auto& img : downloaded) Storage.remove(img.tempPath.c_str());
     return {};
   };
 
-  for (size_t idx = 0; idx < imageUrls.size(); idx++) {
-    char label[40];
-    std::snprintf(label, sizeof(label), "Image %zu of %zu", idx + 1, imageUrls.size());
-    const int pct = 5 + static_cast<int>((idx * 30) / imageUrls.size());
-    report(pct, label);
+  if (includeImages) {
+    for (size_t idx = 0; idx < imageUrls.size(); idx++) {
+      char label[40];
+      std::snprintf(label, sizeof(label), "Image %zu of %zu", idx + 1, imageUrls.size());
+      const int pct = 5 + static_cast<int>((idx * 30) / imageUrls.size());
+      report(pct, label);
 
-    char base[128];
-    std::snprintf(base, sizeof(base), "%s/tmp_img_%llu_%zu", fullDir,
-                  static_cast<unsigned long long>(articleId), idx);
-    const auto result = ImageFetcher::download(imageUrls[idx], base);
-    if (result.localPath.empty()) continue;
-    char zipName[32];
-    std::snprintf(zipName, sizeof(zipName), "img_%zu.%s", idx, result.extension.c_str());
-    DownloadedImage d;
-    d.tempPath = result.localPath;
-    d.zipName = zipName;
-    d.mediaType = (result.extension == "png") ? "image/png" : "image/jpeg";
-    imageMap[imageUrls[idx]] = zipName;
-    downloaded.push_back(std::move(d));
+      char base[128];
+      std::snprintf(base, sizeof(base), "%s/tmp_img_%llu_%zu", fullDir,
+                    static_cast<unsigned long long>(articleId), idx);
+      const auto result = ImageFetcher::download(imageUrls[idx], base);
+      if (result.localPath.empty()) continue;
+      char zipName[32];
+      std::snprintf(zipName, sizeof(zipName), "img_%zu.%s", idx, result.extension.c_str());
+      DownloadedImage d;
+      d.tempPath = result.localPath;
+      d.zipName = zipName;
+      d.mediaType = (result.extension == "png") ? "image/png" : "image/jpeg";
+      imageMap[imageUrls[idx]] = zipName;
+      downloaded.push_back(std::move(d));
+    }
   }
 
   // --- Streaming sanitize: htmlPath → bodyTmpPath ---
@@ -937,7 +951,7 @@ std::string EpubBuilder::build(const char* cacheDir,
   // --- Write EPUB ---
   report(65, "Writing EPUB");
   StoredZipWriter zip;
-  if (!zip.open(outPath.c_str())) {
+  if (!zip.open(outPathStr.c_str())) {
     return fail("Cannot open EPUB output file");
   }
 
@@ -969,6 +983,6 @@ std::string EpubBuilder::build(const char* cacheDir,
   if (!zip.finish()) return fail("ZIP finalize failed");
 
   report(100, "Done");
-  LOG_DBG("RIL", "Built EPUB: %s (+%zu images)", outPath.c_str(), downloaded.size());
-  return outPath;
+  LOG_DBG("RIL", "Built EPUB: %s (+%zu images)", outPathStr.c_str(), downloaded.size());
+  return outPathStr;
 }

@@ -194,12 +194,12 @@ void HomeActivity::loop() {
     const int fileBrowserIdx = idx++;
     const int recentsIdx = idx++;
     const int opdsLibraryIdx = hasOpdsServers ? idx++ : -1;
+    const int fileTransferIdx = idx++;
 #ifdef READ_IT_LATER_ENABLED
     const int readItLaterIdx = idx++;
 #else
     const int readItLaterIdx = -1;
 #endif
-    const int fileTransferIdx = idx++;
     const int settingsIdx = idx;
 
     if (selectorIndex < recentBooks.size()) {
@@ -255,7 +255,7 @@ void HomeActivity::render(RenderLock&&) {
 #ifdef READ_IT_LATER_ENABLED
   {
     // Insert Read-it-Later before File Transfer (index depends on OPDS presence).
-    const size_t pos = hasOpdsServers ? 4 : 3;
+    const size_t pos = (hasOpdsServers ? 4 : 3) + (metrics.homeContinueReadingInMenu ? 1 : 0);
     menuItems.insert(menuItems.begin() + pos, tr(STR_READ_IT_LATER));
     menuIcons.insert(menuIcons.begin() + pos, ReadItLater);
   }

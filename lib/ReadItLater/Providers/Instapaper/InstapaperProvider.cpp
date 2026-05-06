@@ -1,8 +1,35 @@
 #include "InstapaperProvider.h"
 
+#include <HalStorage.h>
 #include <Logging.h>
 
 #include <cstring>
+
+namespace {
+std::string sanitizeFilename(const char* raw) {
+  if (!raw || !*raw) return "untitled";
+  std::string out;
+  out.reserve(std::strlen(raw));
+  for (const char* p = raw; *p; ++p) {
+    unsigned char c = static_cast<unsigned char>(*p);
+    if (c < 32 || c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' ||
+        c == '|') {
+      out.push_back('_');
+    } else {
+      out.push_back(static_cast<char>(c));
+    }
+  }
+  // Trim trailing spaces and dots (invalid on FAT32)
+  while (!out.empty() && (out.back() == ' ' || out.back() == '.')) {
+    out.pop_back();
+  }
+  if (out.empty()) return "untitled";
+  // Leave room for "_{id}_v2.epub" plus a collision counter suffix
+  constexpr size_t MAX_BASENAME = 200;
+  if (out.size() > MAX_BASENAME) out.resize(MAX_BASENAME);
+  return out;
+}
+}  // namespace
 
 InstapaperFolder InstapaperProvider::toInstapaperFolder(const char* folderId) {
   if (std::strcmp(folderId, "starred") == 0) return InstapaperFolder::STARRED;
@@ -118,24 +145,49 @@ Provider::Result InstapaperProvider::updateProgress(uint64_t articleId, float pr
   return fromInstapaperResult(InstapaperClient::updateReadProgress(articleId, progress));
 }
 
-std::string InstapaperProvider::epubPathFor(uint64_t articleId) const {
-  char buf[128];
-  std::snprintf(buf, sizeof(buf), "/.crosspoint/read-it-later/article_v2_%llu.epub",
-                static_cast<unsigned long long>(articleId));
-  return std::string(buf);
+std::string InstapaperProvider::epubPathFor(uint64_t articleId, const char* title) const {
+  if (!title || !*title) {
+    // Fallback to legacy hidden path when no title is available.
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "/.crosspoint/read-it-later/article_v2_%llu.epub",
+                  static_cast<unsigned long long>(articleId));
+    return std::string(buf);
+  }
+
+  const std::string baseDir = "/read-it-later/Instapaper/";
+  Storage.mkdir(baseDir.c_str());
+
+  const std::string sanitized = sanitizeFilename(title);
+  char idBuf[32];
+  std::snprintf(idBuf, sizeof(idBuf), "_%llu", static_cast<unsigned long long>(articleId));
+
+  std::string path = baseDir + sanitized + idBuf + "_v2.epub";
+  if (!Storage.exists(path.c_str())) return path;
+
+  // Handle collision by appending a counter before _v2.epub
+  for (int counter = 1; counter < 1000; ++counter) {
+    char counterBuf[16];
+    std::snprintf(counterBuf, sizeof(counterBuf), "_%d", counter);
+    std::string candidate = baseDir + sanitized + idBuf + counterBuf + "_v2.epub";
+    if (!Storage.exists(candidate.c_str())) return candidate;
+  }
+  return path;  // fallback
 }
 
 uint64_t InstapaperProvider::extractArticleId(const std::string& epubPath) const {
-  constexpr char PREFIX[] = "/.crosspoint/read-it-later/article_v2_";
-  constexpr char SUFFIX[] = ".epub";
-  const size_t prefixLen = sizeof(PREFIX) - 1;
-  const size_t suffixLen = sizeof(SUFFIX) - 1;
-  if (epubPath.size() <= prefixLen + suffixLen) return 0;
-  if (epubPath.compare(0, prefixLen, PREFIX) != 0) return 0;
+  constexpr char SUFFIX[] = "_v2.epub";
+  constexpr size_t suffixLen = sizeof(SUFFIX) - 1;
+  if (epubPath.size() <= suffixLen) return 0;
   if (epubPath.compare(epubPath.size() - suffixLen, suffixLen, SUFFIX) != 0) return 0;
 
+  // The numeric token immediately before _v2.epub is the article ID.
+  size_t idEnd = epubPath.size() - suffixLen;
+  size_t idStart = idEnd;
+  while (idStart > 0 && epubPath[idStart - 1] != '_') --idStart;
+  if (idStart == 0 || idStart == idEnd) return 0;
+
   uint64_t id = 0;
-  for (size_t i = prefixLen; i < epubPath.size() - suffixLen; i++) {
+  for (size_t i = idStart; i < idEnd; ++i) {
     char c = epubPath[i];
     if (c < '0' || c > '9') return 0;
     id = id * 10 + static_cast<uint64_t>(c - '0');

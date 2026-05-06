@@ -26,6 +26,9 @@ constexpr int LIST_LIMIT = 50;
 void ArticleListActivity::onEnter() {
   Activity::onEnter();
 
+  pendingRefresh = false;
+  errorMessage.clear();
+
   // Populate from SD cache first so the list appears instantly, even if the
   // follow-up live refresh is slow or fails entirely (offline re-entry).
   const bool hadCache = StateCache::load(provider->cacheDirName(), folder.id, articles, &lastSyncedAt);

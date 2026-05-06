@@ -201,6 +201,8 @@ class CrossPointSettings {
   uint8_t showHiddenFiles = 0;
   // Image rendering mode in EPUB reader
   uint8_t imageRendering = IMAGES_DISPLAY;
+  // Download images during Read-it-Later article fetching (1 = enabled, 0 = disabled)
+  uint8_t readItLaterImages = 1;
   // Tilt-based page turning (X3 only — requires QMI8658 IMU)
   uint8_t tiltPageTurn = TILT_OFF;
   // Auto-rotate screen based on device orientation via accelerometer (X3 only)
