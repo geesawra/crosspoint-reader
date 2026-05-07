@@ -28,7 +28,7 @@ bool deletePath(const char* path) {
 
   if (file.isDirectory()) {
     file.rewindDirectory();
-    char name[128];
+    char name[256];
 
     for (auto entry = file.openNextFile(); entry; entry = file.openNextFile()) {
       entry.getName(name, sizeof(name));
@@ -46,15 +46,19 @@ bool deletePath(const char* path) {
           return false;
         }
       } else {
-        if (FsHelpers::hasEpubExtension(std::string_view(name))) {
-          clearEpubCacheIfNeeded(childPath.c_str());
+        clearEpubCacheIfNeeded(childPath.c_str());
+        entry.close();
+        if (!Storage.remove(childPath.c_str())) {
+          file.close();
+          return false;
         }
+        continue;  // entry already closed
       }
       entry.close();
     }
 
     file.close();
-    bool ok = Storage.removeDir(path);
+    bool ok = Storage.rmdir(path);
     if (ok) {
       LOG_DBG("DEL", "Deleted directory: %s", path);
     } else {

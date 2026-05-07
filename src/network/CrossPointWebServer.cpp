@@ -1,7 +1,6 @@
 #include "CrossPointWebServer.h"
 
 #include <ArduinoJson.h>
-#include <Epub.h>
 #include <FsHelpers.h>
 #include <HalStorage.h>
 #include <Logging.h>

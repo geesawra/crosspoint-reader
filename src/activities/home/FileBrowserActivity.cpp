@@ -187,7 +187,7 @@ void FileBrowserActivity::loop() {
         }
       };
 
-      std::string heading = isDirectory ? tr(STR_DELETE_RECURSIVE) : tr(STR_DELETE) + std::string("? ");
+      std::string heading = std::string(isDirectory ? tr(STR_DELETE_RECURSIVE) : tr(STR_DELETE)) + "? ";
 
       startActivityForResult(std::make_unique<ConfirmationActivity>(renderer, mappedInput, heading, entry), handler);
       return;
