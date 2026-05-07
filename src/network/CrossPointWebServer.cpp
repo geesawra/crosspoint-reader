@@ -18,6 +18,7 @@
 #include "html/HomePageHtml.generated.h"
 #include "html/SettingsPageHtml.generated.h"
 #include "html/js/jszip_minJs.generated.h"
+#include "util/FileDeletionUtil.h"
 
 namespace {
 // Folders/files to hide from the web interface file browser
@@ -43,15 +44,6 @@ size_t wsLastProgressSent = 0;
 String wsLastCompleteName;
 size_t wsLastCompleteSize = 0;
 unsigned long wsLastCompleteAt = 0;
-
-// Helper function to clear epub cache after upload
-void clearEpubCacheIfNeeded(const String& filePath) {
-  // Only clear cache for .epub files
-  if (FsHelpers::hasEpubExtension(filePath)) {
-    Epub(filePath.c_str(), "/.crosspoint").clearCache();
-    LOG_DBG("WEB", "Cleared epub cache for: %s", filePath.c_str());
-  }
-}
 
 String normalizeWebPath(const String& inputPath) {
   if (inputPath.isEmpty() || inputPath == "/") {
@@ -713,7 +705,7 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
         String filePath = state.path;
         if (!filePath.endsWith("/")) filePath += "/";
         filePath += state.fileName;
-        clearEpubCacheIfNeeded(filePath);
+        FileDeletionUtil::clearEpubCacheIfNeeded(filePath.c_str());
       }
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
@@ -859,7 +851,7 @@ void CrossPointWebServer::handleRename() const {
     return;
   }
 
-  clearEpubCacheIfNeeded(itemPath);
+  FileDeletionUtil::clearEpubCacheIfNeeded(itemPath.c_str());
   const bool success = file.rename(newPath.c_str());
   file.close();
 
@@ -952,7 +944,7 @@ void CrossPointWebServer::handleMove() const {
     return;
   }
 
-  clearEpubCacheIfNeeded(itemPath);
+  FileDeletionUtil::clearEpubCacheIfNeeded(itemPath.c_str());
   const bool success = file.rename(newPath.c_str());
   file.close();
 
@@ -1052,27 +1044,8 @@ void CrossPointWebServer::handleDelete() const {
       continue;
     }
 
-    // Decide whether it's a directory or file by opening it
-    bool success = false;
-    FsFile f = Storage.open(itemPath.c_str());
-    if (f && f.isDirectory()) {
-      // For folders, ensure empty before removing
-      FsFile entry = f.openNextFile();
-      if (entry) {
-        entry.close();
-        f.close();
-        failedItems += itemPath + " (folder not empty); ";
-        allSuccess = false;
-        continue;
-      }
-      f.close();
-      success = Storage.rmdir(itemPath.c_str());
-    } else {
-      // It's a file (or couldn't open as dir) — remove file
-      if (f) f.close();
-      success = Storage.remove(itemPath.c_str());
-      clearEpubCacheIfNeeded(itemPath);
-    }
+    // Delete file or directory recursively
+    bool success = FileDeletionUtil::deletePath(itemPath.c_str());
 
     if (!success) {
       failedItems += itemPath + " (deletion failed); ";
@@ -1471,7 +1444,7 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
             wsLastCompleteSize = 0;
             wsLastCompleteAt = millis();
             LOG_DBG("WS", "Zero-byte upload complete: %s", filePath.c_str());
-            clearEpubCacheIfNeeded(filePath);
+            FileDeletionUtil::clearEpubCacheIfNeeded(filePath.c_str());
             wsServer->sendTXT(num, "DONE");
             wsLastProgressSent = 0;
             break;
@@ -1540,7 +1513,7 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
         String filePath = wsUploadPath;
         if (!filePath.endsWith("/")) filePath += "/";
         filePath += wsUploadFileName;
-        clearEpubCacheIfNeeded(filePath);
+        FileDeletionUtil::clearEpubCacheIfNeeded(filePath.c_str());
 
         wsServer->sendTXT(num, "DONE");
         wsLastProgressSent = 0;

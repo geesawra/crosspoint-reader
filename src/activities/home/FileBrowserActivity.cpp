@@ -1,6 +1,5 @@
 #include "FileBrowserActivity.h"
 
-#include <Epub.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -13,6 +12,7 @@
 #include "MappedInputManager.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "util/FileDeletionUtil.h"
 
 namespace {
 constexpr unsigned long GO_HOME_MS = 1000;
@@ -132,14 +132,6 @@ void FileBrowserActivity::onExit() {
   files.clear();
 }
 
-void FileBrowserActivity::clearFileMetadata(const std::string& fullPath) {
-  // Only clear cache for .epub files
-  if (FsHelpers::hasEpubExtension(fullPath)) {
-    Epub(fullPath, "/.crosspoint").clearCache();
-    LOG_DBG("FileBrowser", "Cleared metadata cache for: %s", fullPath.c_str());
-  }
-}
-
 void FileBrowserActivity::loop() {
   // Long press BACK (1s+) goes to root folder
   // but Long press BACK (1s+) from ReaderActivity sends us here with the MappedInput already set.
@@ -167,8 +159,8 @@ void FileBrowserActivity::loop() {
     const std::string& entry = files[selectorIndex];
     bool isDirectory = (entry.back() == '/');
 
-    if (mappedInput.getHeldTime() >= GO_HOME_MS && !isDirectory) {
-      // --- LONG PRESS ACTION: DELETE FILE ---
+    if (mappedInput.getHeldTime() >= GO_HOME_MS) {
+      // --- LONG PRESS ACTION: DELETE FILE OR DIRECTORY ---
       std::string cleanBasePath = basepath;
       if (cleanBasePath.back() != '/') cleanBasePath += "/";
       const std::string fullPath = cleanBasePath + entry;
@@ -176,8 +168,7 @@ void FileBrowserActivity::loop() {
       auto handler = [this, fullPath](const ActivityResult& res) {
         if (!res.isCancelled) {
           LOG_DBG("FileBrowser", "Attempting to delete: %s", fullPath.c_str());
-          clearFileMetadata(fullPath);
-          if (Storage.remove(fullPath.c_str())) {
+          if (FileDeletionUtil::deletePath(fullPath)) {
             LOG_DBG("FileBrowser", "Deleted successfully");
             loadFiles();
             if (files.empty()) {
@@ -189,14 +180,14 @@ void FileBrowserActivity::loop() {
 
             requestUpdate(true);
           } else {
-            LOG_ERR("FileBrowser", "Failed to delete file: %s", fullPath.c_str());
+            LOG_ERR("FileBrowser", "Failed to delete: %s", fullPath.c_str());
           }
         } else {
           LOG_DBG("FileBrowser", "Delete cancelled by user");
         }
       };
 
-      std::string heading = tr(STR_DELETE) + std::string("? ");
+      std::string heading = isDirectory ? tr(STR_DELETE_RECURSIVE) : tr(STR_DELETE) + std::string("? ");
 
       startActivityForResult(std::make_unique<ConfirmationActivity>(renderer, mappedInput, heading, entry), handler);
       return;

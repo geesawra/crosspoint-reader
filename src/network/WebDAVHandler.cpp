@@ -6,6 +6,8 @@
 #include <Logging.h>
 #include <esp_task_wdt.h>
 
+#include "util/FileDeletionUtil.h"
+
 namespace {
 const char* HIDDEN_ITEMS[] = {"System Volume Information", "XTCache"};
 constexpr size_t HIDDEN_ITEMS_COUNT = sizeof(HIDDEN_ITEMS) / sizeof(HIDDEN_ITEMS[0]);
@@ -385,7 +387,7 @@ void WebDAVHandler::handlePut(WebServer& s) {
     return;
   }
 
-  clearEpubCacheIfNeeded(path);
+  FileDeletionUtil::clearEpubCacheIfNeeded(path.c_str());
   s.send(_putExisted ? 204 : 201);
   LOG_DBG("DAV", "PUT complete: %s", path.c_str());
 }
@@ -411,35 +413,10 @@ void WebDAVHandler::handleDelete(WebServer& s) {
     return;
   }
 
-  FsFile file = Storage.open(path.c_str());
-  if (!file) {
-    s.send(500, "text/plain", "Failed to open");
-    return;
-  }
-
-  if (file.isDirectory()) {
-    // Check if directory is empty
-    FsFile entry = file.openNextFile();
-    if (entry) {
-      entry.close();
-      file.close();
-      s.send(409, "text/plain", "Directory not empty");
-      return;
-    }
-    file.close();
-    if (Storage.rmdir(path.c_str())) {
-      s.send(204);
-    } else {
-      s.send(500, "text/plain", "Failed to remove directory");
-    }
+  if (FileDeletionUtil::deletePath(path.c_str())) {
+    s.send(204);
   } else {
-    file.close();
-    clearEpubCacheIfNeeded(path);
-    if (Storage.remove(path.c_str())) {
-      s.send(204);
-    } else {
-      s.send(500, "text/plain", "Failed to delete file");
-    }
+    s.send(500, "text/plain", "Failed to delete");
   }
 }
 
@@ -543,7 +520,7 @@ void WebDAVHandler::handleMove(WebServer& s) {
     return;
   }
 
-  clearEpubCacheIfNeeded(srcPath);
+  FileDeletionUtil::clearEpubCacheIfNeeded(srcPath.c_str());
   bool success = file.rename(dstPath.c_str());
   file.close();
 
@@ -798,12 +775,7 @@ bool WebDAVHandler::getOverwrite(WebServer& s) const {
   return true;  // Default is T
 }
 
-void WebDAVHandler::clearEpubCacheIfNeeded(const String& path) const {
-  if (FsHelpers::hasEpubExtension(path)) {
-    Epub(path.c_str(), "/.crosspoint").clearCache();
-    LOG_DBG("DAV", "Cleared epub cache for: %s", path.c_str());
-  }
-}
+
 
 String WebDAVHandler::getMimeType(const String& path) const {
   if (FsHelpers::hasEpubExtension(path)) return "application/epub+zip";
