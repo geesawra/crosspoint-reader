@@ -15,6 +15,7 @@ class FileBrowserActivity final : public Activity {
   size_t selectorIndex = 0;
 
   bool lockLongPressBack = false;
+  bool deleteLongPressTriggered = false;
 
   // Files state
   std::string basepath = "/";

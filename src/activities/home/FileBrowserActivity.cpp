@@ -153,56 +153,72 @@ void FileBrowserActivity::loop() {
   const int pathReserved = renderer.getLineHeight(SMALL_FONT_ID) + UITheme::getInstance().getMetrics().verticalSpacing;
   const int pageItems = UITheme::getNumberOfItemsPerPage(renderer, true, false, true, false, pathReserved);
 
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    if (files.empty()) return;
+  // Reset long-press tracking at the start of a new press cycle
+  if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+    deleteLongPressTriggered = false;
+  }
+
+  // Trigger delete confirmation popup after holding Confirm for 1s
+  if (mappedInput.isPressed(MappedInputManager::Button::Confirm) && mappedInput.getHeldTime() >= GO_HOME_MS &&
+      !files.empty() && !deleteLongPressTriggered) {
+    deleteLongPressTriggered = true;
 
     const std::string& entry = files[selectorIndex];
     bool isDirectory = (entry.back() == '/');
 
-    if (mappedInput.getHeldTime() >= GO_HOME_MS) {
-      // --- LONG PRESS ACTION: DELETE FILE OR DIRECTORY ---
-      std::string cleanBasePath = basepath;
-      if (cleanBasePath.back() != '/') cleanBasePath += "/";
-      const std::string fullPath = cleanBasePath + entry;
+    std::string cleanBasePath = basepath;
+    if (cleanBasePath.back() != '/') cleanBasePath += "/";
+    const std::string fullPath = cleanBasePath + entry;
 
-      auto handler = [this, fullPath](const ActivityResult& res) {
-        if (!res.isCancelled) {
-          LOG_DBG("FileBrowser", "Attempting to delete: %s", fullPath.c_str());
-          if (FileDeletionUtil::deletePath(fullPath)) {
-            LOG_DBG("FileBrowser", "Deleted successfully");
-            loadFiles();
-            if (files.empty()) {
-              selectorIndex = 0;
-            } else if (selectorIndex >= files.size()) {
-              // Move selection to the new "last" item
-              selectorIndex = files.size() - 1;
-            }
-
-            requestUpdate(true);
-          } else {
-            LOG_ERR("FileBrowser", "Failed to delete: %s", fullPath.c_str());
+    auto handler = [this, fullPath](const ActivityResult& res) {
+      if (!res.isCancelled) {
+        LOG_DBG("FileBrowser", "Attempting to delete: %s", fullPath.c_str());
+        if (FileDeletionUtil::deletePath(fullPath)) {
+          LOG_DBG("FileBrowser", "Deleted successfully");
+          loadFiles();
+          if (files.empty()) {
+            selectorIndex = 0;
+          } else if (selectorIndex >= files.size()) {
+            // Move selection to the new "last" item
+            selectorIndex = files.size() - 1;
           }
+
+          requestUpdate(true);
         } else {
-          LOG_DBG("FileBrowser", "Delete cancelled by user");
+          LOG_ERR("FileBrowser", "Failed to delete: %s", fullPath.c_str());
         }
-      };
-
-      std::string heading = std::string(isDirectory ? tr(STR_DELETE_RECURSIVE) : tr(STR_DELETE)) + "? ";
-
-      startActivityForResult(std::make_unique<ConfirmationActivity>(renderer, mappedInput, heading, entry), handler);
-      return;
-    } else {
-      // --- SHORT PRESS ACTION: OPEN/NAVIGATE ---
-      if (basepath.back() != '/') basepath += "/";
-
-      if (isDirectory) {
-        basepath += entry.substr(0, entry.length() - 1);
-        loadFiles();
-        selectorIndex = 0;
-        requestUpdate();
       } else {
-        onSelectBook(basepath + entry);
+        LOG_DBG("FileBrowser", "Delete cancelled by user");
       }
+    };
+
+    std::string heading = std::string(isDirectory ? tr(STR_DELETE_RECURSIVE) : tr(STR_DELETE)) + "? ";
+
+    startActivityForResult(std::make_unique<ConfirmationActivity>(renderer, mappedInput, heading, entry), handler);
+    return;
+  }
+
+  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    if (files.empty()) return;
+
+    if (deleteLongPressTriggered) {
+      deleteLongPressTriggered = false;
+      return;
+    }
+
+    // --- SHORT PRESS ACTION: OPEN/NAVIGATE ---
+    const std::string& entry = files[selectorIndex];
+    bool isDirectory = (entry.back() == '/');
+
+    if (basepath.back() != '/') basepath += "/";
+
+    if (isDirectory) {
+      basepath += entry.substr(0, entry.length() - 1);
+      loadFiles();
+      selectorIndex = 0;
+      requestUpdate();
+    } else {
+      onSelectBook(basepath + entry);
     }
     return;
   }
