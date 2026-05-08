@@ -131,6 +131,14 @@ class CrossPointSettings {
   // Hide battery percentage
   enum HIDE_BATTERY_PERCENTAGE { HIDE_NEVER = 0, HIDE_READER = 1, HIDE_ALWAYS = 2, HIDE_BATTERY_PERCENTAGE_COUNT };
 
+  // Page turn button long press behavior
+  enum LONG_PRESS_BUTTON_BEHAVIOR {
+    OFF = 0,
+    CHAPTER_SKIP = 1,
+    ORIENTATION_CHANGE = 2,
+    LONG_PRESS_BUTTON_BEHAVIOR_COUNT
+  };
+
   // UI Theme
   enum UI_THEME { CLASSIC = 0, LYRA = 1, LYRA_3_COVERS = 2, ROUNDEDRAFF = 3 };
 
@@ -145,6 +153,8 @@ class CrossPointSettings {
   uint8_t sleepScreenCoverMode = FIT;
   // Sleep screen cover filter
   uint8_t sleepScreenCoverFilter = NO_FILTER;
+  // Sleep screen orientation
+  uint8_t sleepScreenOrientation = PORTRAIT;
   // Status bar settings (statusBar retained for migration only)
   uint8_t statusBar = FULL;
   uint8_t statusBarChapterPageCount = 1;
@@ -189,8 +199,8 @@ class CrossPointSettings {
   char opdsPassword[64] = "";
   // Hide battery percentage
   uint8_t hideBatteryPercentage = HIDE_NEVER;
-  // Long-press chapter skip on side buttons
-  uint8_t longPressChapterSkip = 1;
+  // Long-press page turn button behavior
+  uint8_t longPressButtonBehavior = OFF;
   // UI Theme
   uint8_t uiTheme = LYRA;
   // Sunlight fading compensation
@@ -207,6 +217,8 @@ class CrossPointSettings {
   uint8_t tiltPageTurn = TILT_OFF;
   // Auto-rotate screen based on device orientation via accelerometer (X3 only)
   uint8_t autoRotate = 0;
+  // Language setting (Language enum index, default 0 = EN)
+  uint8_t language = 0;
 
   ~CrossPointSettings() = default;
 
@@ -228,6 +240,7 @@ class CrossPointSettings {
 
  private:
   bool loadFromBinaryFile();
+  bool migrateLanguageBinaryFile();
 
  public:
   float getReaderLineCompression() const;

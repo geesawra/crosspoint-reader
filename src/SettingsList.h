@@ -22,6 +22,9 @@ inline const std::vector<SettingInfo>& getSettingsList() {
                           "sleepScreen", StrId::STR_CAT_DISPLAY),
         SettingInfo::Enum(StrId::STR_SLEEP_COVER_MODE, &CrossPointSettings::sleepScreenCoverMode,
                           {StrId::STR_FIT, StrId::STR_CROP}, "sleepScreenCoverMode", StrId::STR_CAT_DISPLAY),
+        SettingInfo::Enum(StrId::STR_SLEEP_ORIENTATION, &CrossPointSettings::sleepScreenOrientation,
+                          {StrId::STR_PORTRAIT, StrId::STR_LANDSCAPE_CW, StrId::STR_INVERTED, StrId::STR_LANDSCAPE_CCW},
+                          "sleepScreenOrientation", StrId::STR_CAT_DISPLAY),
         SettingInfo::Enum(StrId::STR_SLEEP_COVER_FILTER, &CrossPointSettings::sleepScreenCoverFilter,
                           {StrId::STR_NONE_OPT, StrId::STR_FILTER_CONTRAST, StrId::STR_INVERTED},
                           "sleepScreenCoverFilter", StrId::STR_CAT_DISPLAY),
@@ -70,13 +73,15 @@ inline const std::vector<SettingInfo>& getSettingsList() {
                           "imageRendering", StrId::STR_CAT_READER),
         // --- Controls ---
         SettingInfo::Enum(StrId::STR_SIDE_BTN_LAYOUT, &CrossPointSettings::sideButtonLayout,
-                          {StrId::STR_PREV_NEXT, StrId::STR_NEXT_PREV, StrId::STR_BOTH_FORWARD}, "sideButtonLayout", StrId::STR_CAT_CONTROLS),
-        SettingInfo::Toggle(StrId::STR_LONG_PRESS_SKIP, &CrossPointSettings::longPressChapterSkip,
-                            "longPressChapterSkip", StrId::STR_CAT_CONTROLS),
+                          {StrId::STR_PREV_NEXT, StrId::STR_NEXT_PREV, StrId::STR_BOTH_FORWARD}, "sideButtonLayout",
+                          StrId::STR_CAT_CONTROLS),
+        SettingInfo::Enum(StrId::STR_LONG_PRESS_BEHAVIOR, &CrossPointSettings::longPressButtonBehavior,
+                          {StrId::STR_LONG_PRESS_BEHAVIOR_OFF, StrId::STR_LONG_PRESS_BEHAVIOR_SKIP,
+                           StrId::STR_LONG_PRESS_BEHAVIOR_ORIENTATION},
+                          "longPressButtonBehavior", StrId::STR_CAT_CONTROLS),
         SettingInfo::Enum(StrId::STR_SHORT_PWR_BTN, &CrossPointSettings::shortPwrBtn,
                           {StrId::STR_IGNORE, StrId::STR_SLEEP, StrId::STR_PAGE_TURN, StrId::STR_FORCE_REFRESH},
                           "shortPwrBtn", StrId::STR_CAT_CONTROLS),
-
         // --- System ---
         SettingInfo::Enum(StrId::STR_TIME_TO_SLEEP, &CrossPointSettings::sleepTimeout,
                           {StrId::STR_MIN_1, StrId::STR_MIN_5, StrId::STR_MIN_10, StrId::STR_MIN_15, StrId::STR_MIN_30},
@@ -140,11 +145,12 @@ inline const std::vector<SettingInfo>& getSettingsList() {
       // Insert after the short power button setting (end of Controls section)
       for (auto it = v.begin(); it != v.end(); ++it) {
         if (it->nameId == StrId::STR_SHORT_PWR_BTN) {
-          auto tiltIt = v.insert(it + 1, SettingInfo::Enum(StrId::STR_TILT_PAGE_TURN, &CrossPointSettings::tiltPageTurn,
-                                                             {StrId::STR_STATE_OFF, StrId::STR_NORMAL, StrId::STR_INVERTED},
-                                                             "tiltPageTurn", StrId::STR_CAT_CONTROLS));
-          v.insert(tiltIt + 1, SettingInfo::Toggle(StrId::STR_AUTO_ROTATE, &CrossPointSettings::autoRotate, "autoRotate",
-                                                   StrId::STR_CAT_CONTROLS));
+          auto tiltIt =
+              v.insert(it + 1, SettingInfo::Enum(StrId::STR_TILT_PAGE_TURN, &CrossPointSettings::tiltPageTurn,
+                                                 {StrId::STR_STATE_OFF, StrId::STR_NORMAL, StrId::STR_INVERTED},
+                                                 "tiltPageTurn", StrId::STR_CAT_CONTROLS));
+          v.insert(tiltIt + 1, SettingInfo::Toggle(StrId::STR_AUTO_ROTATE, &CrossPointSettings::autoRotate,
+                                                   "autoRotate", StrId::STR_CAT_CONTROLS));
           break;
         }
       }
