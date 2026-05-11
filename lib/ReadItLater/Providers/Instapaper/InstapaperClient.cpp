@@ -455,8 +455,7 @@ InstapaperClient::Result InstapaperClient::listBookmarks(InstapaperFolder folder
                                                          std::vector<InstapaperArticle>& out) {
   out.clear();
   if (!INSTAPAPER_CREDENTIALS.hasTokens()) return NO_TOKENS;
-  if (limit < 1) limit = 25;
-  if (limit > 500) limit = 500;
+  if (limit < 1) limit = 100;   // Instapaper API default; streaming parser handles any size safely
 
   // Guardrail: refuse to fetch if heap is critically low. Even though JSON
   // parsing is now streaming, the output vector grows proportionally to
