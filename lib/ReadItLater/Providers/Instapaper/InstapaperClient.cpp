@@ -455,8 +455,17 @@ InstapaperClient::Result InstapaperClient::listBookmarks(InstapaperFolder folder
                                                          std::vector<InstapaperArticle>& out) {
   out.clear();
   if (!INSTAPAPER_CREDENTIALS.hasTokens()) return NO_TOKENS;
-  if (limit < 1) limit = 10;   // Reduced from 25 to save heap
+  if (limit < 1) limit = 25;
   if (limit > 500) limit = 500;
+
+  // Guardrail: refuse to fetch if heap is critically low. Even though JSON
+  // parsing is now streaming, the output vector grows proportionally to
+  // `limit` (each InstapaperArticle is ~150 bytes).  With WiFi stack taking
+  // ~80 KB, we need at least 100 KB free to avoid OOM.
+  if (ESP.getFreeHeap() < 100 * 1024) {
+    LOG_ERR("INSTA", "Heap too low (%d bytes) to fetch bookmarks", ESP.getFreeHeap());
+    return NETWORK_FAILED;
+  }
 
   char limitStr[8];
   std::snprintf(limitStr, sizeof(limitStr), "%d", limit);
@@ -475,6 +484,12 @@ InstapaperClient::Result InstapaperClient::listBookmarks(InstapaperFolder folder
 
 InstapaperClient::Result InstapaperClient::getText(uint64_t bookmarkId, const std::string& outPath) {
   if (!INSTAPAPER_CREDENTIALS.hasTokens()) return NO_TOKENS;
+
+  // Guardrail: refuse if heap is critically low.
+  if (ESP.getFreeHeap() < 64 * 1024) {
+    LOG_ERR("INSTA", "Heap too low (%d bytes) to fetch article", ESP.getFreeHeap());
+    return NETWORK_FAILED;
+  }
 
   char idStr[24];
   std::snprintf(idStr, sizeof(idStr), "%llu", static_cast<unsigned long long>(bookmarkId));
