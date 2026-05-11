@@ -1,10 +1,10 @@
 #include "InstapaperClient.h"
 
-#include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <HalStorage.h>
 #include <Logging.h>
 #include <NetworkClientSecure.h>
+#include <StreamingJsonParser.h>
 #include <WiFi.h>
 #include <esp_sntp.h>
 #include <time.h>
@@ -31,13 +31,8 @@ constexpr char URL_DELETE[] = "https://www.instapaper.com/api/1/bookmarks/delete
 // more than ~5 minutes off. The ESP32-C3 has no RTC so time() is 0 until NTP
 // syncs. Every signed call flows through signedPost(), so gating sync here
 // catches every entry point (listBookmarks, getText, star/archive/…).
-//
-// Important: do NOT call esp_sntp_stop(). It calls sys_untimeout() which
-// asserts the lwIP TCPIP core lock is held by the current task — it never is.
-// Instead, if SNTP is already running (from a prior attempt or auto-started by
-// the WiFi stack), just wait for it to complete.
 void ensureTimeSynced() {
-  if (::time(nullptr) > 1600000000) return;  // post-2020 = synced
+  if (::time(nullptr) > 1600000000) return;
 
   if (!esp_sntp_enabled()) {
     esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
@@ -45,10 +40,6 @@ void ensureTimeSynced() {
     esp_sntp_init();
   }
 
-  // Wait for sync in 5 rounds (SNTP does background polls; each round gives
-  // the poller a chance to succeed).  Break early if time becomes valid.
-  // First-time sync after cold boot can take 10-15s depending on DNS and
-  // network latency, so we are generous here.
   for (int round = 0; round < 5; round++) {
     for (int i = 0; i < 30; i++) {
       if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) break;
@@ -87,11 +78,177 @@ std::string buildFormBody(const std::vector<OAuth1Signer::Param>& params) {
   return s;
 }
 
-// Shared POST helper. Sends a signed form-encoded request and returns the
-// HTTP status code. On success, either captures the response body into
-// `outBody` (if non-null) or streams to `outStream` (if non-null). Caller
-// may pass both as null to drop the body.
-int signedPost(const char* url, const std::vector<OAuth1Signer::Param>& bodyParams, std::string* outBody) {
+// ---------------------------------------------------------------------------
+// Streaming bookmark list parser
+// ---------------------------------------------------------------------------
+// Parses a JSON array of bookmark objects using StreamingJsonParser's
+// callback API. No heap allocation proportional to response size — peak
+// memory is bounded by TOKEN_BUF_SIZE (512 bytes) plus the output vector.
+
+struct BookmarkParseCtx {
+  std::vector<InstapaperArticle>* out;
+
+  // Fields accumulated for the current bookmark object.
+  uint64_t   bookmark_id = 0;
+  char       title[128]  = {0};
+  char       url[512]    = {0};
+  uint32_t   word_count  = 0;
+  float      progress    = 0.0f;
+  bool       starred     = false;
+  time_t     saved_at    = 0;
+  bool       has_type    = false;
+  bool       type_is_bookmark = false;
+  bool       in_bookmark   = false;
+
+  // Field name buffer (shared with StreamingJsonParser token buffer).
+  char field_name[64] = {0};
+  size_t field_name_len = 0;
+};
+
+// Copy a parsed value into a fixed char[] field, NUL-terminated.
+static void copyField(char* dst, size_t dstLen, const char* val, size_t valLen) {
+  if (!dst || dstLen == 0 || !val || valLen == 0) return;
+  const size_t copyLen = valLen < dstLen - 1 ? valLen : dstLen - 1;
+  std::memcpy(dst, val, copyLen);
+  dst[copyLen] = '\0';
+}
+
+static void bookmarkOnKey(void* ctx, const char* key, size_t len) {
+  auto* b = static_cast<BookmarkParseCtx*>(ctx);
+  b->field_name_len = 0;
+  std::memcpy(b->field_name, key, len < sizeof(b->field_name) - 1 ? len : sizeof(b->field_name) - 1);
+  b->field_name[len < sizeof(b->field_name) - 1 ? len : sizeof(b->field_name) - 1] = '\0';
+  (void)b;
+}
+
+static void bookmarkOnString(void* ctx, const char* val, size_t valLen) {
+  auto* b = static_cast<BookmarkParseCtx*>(ctx);
+  if (!b->in_bookmark) return;
+
+  if (std::strcmp(b->field_name, "type") == 0) {
+    b->has_type = true;
+    b->type_is_bookmark = (valLen == 8 && std::strncmp(val, "bookmark", 8) == 0);
+  } else if (std::strcmp(b->field_name, "title") == 0) {
+    copyField(b->title, sizeof(b->title), val, valLen);
+  } else if (std::strcmp(b->field_name, "url") == 0) {
+    copyField(b->url, sizeof(b->url), val, valLen);
+  }
+}
+
+static void bookmarkOnNumber(void* ctx, const char* val, size_t valLen) {
+  auto* b = static_cast<BookmarkParseCtx*>(ctx);
+  if (!b->in_bookmark) return;
+
+  if (std::strcmp(b->field_name, "bookmark_id") == 0) {
+    b->bookmark_id = strtoull(val, nullptr, 10);
+  } else if (std::strcmp(b->field_name, "word_count") == 0) {
+    b->word_count = static_cast<uint32_t>(strtoul(val, nullptr, 10));
+  } else if (std::strcmp(b->field_name, "progress") == 0) {
+    b->progress = strtof(val, nullptr);
+  } else if (std::strcmp(b->field_name, "time") == 0) {
+    b->saved_at = static_cast<time_t>(strtoll(val, nullptr, 10));
+  }
+}
+
+static void bookmarkOnBool(void* ctx, bool value) {
+  auto* b = static_cast<BookmarkParseCtx*>(ctx);
+  if (!b->in_bookmark) return;
+
+  if (std::strcmp(b->field_name, "starred") == 0) {
+    b->starred = value;
+  }
+}
+
+static void bookmarkOnArrayStart(void* ctx) {
+  (void)ctx;
+}
+
+static void bookmarkOnObjectStart(void* ctx) {
+  auto* b = static_cast<BookmarkParseCtx*>(ctx);
+  b->in_bookmark = true;
+  b->has_type = false;
+  b->type_is_bookmark = false;
+  b->bookmark_id = 0;
+  b->title[0] = '\0';
+  b->url[0] = '\0';
+  b->word_count = 0;
+  b->progress = 0.0f;
+  b->starred = false;
+  b->saved_at = 0;
+}
+
+static void bookmarkOnObjectEnd(void* ctx) {
+  auto* b = static_cast<BookmarkParseCtx*>(ctx);
+  if (!b->in_bookmark || !b->has_type || !b->type_is_bookmark) {
+    b->in_bookmark = false;
+    return;
+  }
+
+  InstapaperArticle a;
+  a.id = b->bookmark_id;
+  std::memcpy(a.title, b->title, sizeof(a.title));
+  const char* scheme = std::strstr(b->url, "://");
+  const char* host = scheme ? scheme + 3 : b->url;
+  const char* pathSep = std::strchr(host, '/');
+  const size_t hostLen = pathSep ? static_cast<size_t>(pathSep - host) : std::strlen(host);
+  const size_t copyLen = hostLen < sizeof(a.domain) - 1 ? hostLen : sizeof(a.domain) - 1;
+  std::memcpy(a.domain, host, copyLen);
+  a.domain[copyLen] = '\0';
+  a.word_count = b->word_count;
+  a.progress_pct = static_cast<uint32_t>(b->progress * 100.0f);
+  a.starred = b->starred;
+  a.saved_at = b->saved_at;
+
+  if (b->out) b->out->push_back(a);
+
+  b->in_bookmark = false;
+}
+
+// Parse a JSON array of bookmarks by streaming from the WiFiClient stream.
+// Returns 0 on success, -1 on failure.
+static int parseBookmarksStreaming(WiFiClient* stream, std::vector<InstapaperArticle>& out) {
+  if (!stream) return -1;
+
+  BookmarkParseCtx ctx;
+  ctx.out = &out;
+
+  JsonCallbacks cbs = {};
+  cbs.ctx = &ctx;
+  cbs.onKey       = bookmarkOnKey;
+  cbs.onString    = bookmarkOnString;
+  cbs.onNumber    = bookmarkOnNumber;
+  cbs.onBool      = bookmarkOnBool;
+  cbs.onArrayStart = bookmarkOnArrayStart;
+  cbs.onArrayEnd   = nullptr;
+  cbs.onObjectStart = bookmarkOnObjectStart;
+  cbs.onObjectEnd   = bookmarkOnObjectEnd;
+
+  StreamingJsonParser parser(cbs);
+  uint8_t buf[512];
+
+  while (stream->available()) {
+    const int n = stream->read(buf, sizeof(buf));
+    if (n <= 0) break;
+    parser.feed(reinterpret_cast<const char*>(buf), static_cast<size_t>(n));
+    if (parser.hasError()) {
+      LOG_ERR("INSTA", "Streaming JSON parse error");
+      return -1;
+    }
+  }
+
+  LOG_DBG("INSTA", "Parsed %zu bookmarks from stream", out.size());
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
+
+// Send a signed POST request and stream the response. `parseFn` is called
+// with the stream and user `ctx` after HTTP headers are consumed.
+// Returns 0 on success. The caller is responsible for calling http.end().
+static int signedPostStreaming(const char* url, const std::vector<OAuth1Signer::Param>& bodyParams,
+                               int (*parseFn)(WiFiClient*, void*), void* parseCtx) {
   if (!INSTAPAPER_CREDENTIALS.hasTokens()) {
     return -1;
   }
@@ -123,27 +280,81 @@ int signedPost(const char* url, const std::vector<OAuth1Signer::Param>& bodyPara
 
   const int code = http.POST(const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(body.data())), body.size());
 
-  // Always capture body so we can surface API-level error messages even when
-  // the HTTP status is 200 (Instapaper returns {"type":"error", …} with a 200
-  // for invalid auth in some cases).
-  const String respBody = http.getString();
-  if (outBody) {
-    *outBody = respBody.c_str();
+  WiFiClient* stream = http.getStreamPtr();
+  if (code >= 200 && code < 300 && parseFn) {
+    if (parseFn(stream, parseCtx) != 0) {
+      http.end();
+      return -1;
+    }
   }
+
+  http.end();
+  return code;
+}
+
+// Stream JSON from HTTP response into a small fixed buffer for error checking.
+// Used by action endpoints that return tiny responses.
+static int signedPostSmallBuffer(const char* url, const std::vector<OAuth1Signer::Param>& bodyParams,
+                                  std::string* outBody) {
+  if (!INSTAPAPER_CREDENTIALS.hasTokens()) {
+    return -1;
+  }
+
+  ensureTimeSynced();
+
+  const std::string authHeader = OAuth1Signer::buildAuthHeader(
+      "POST", url, bodyParams, INSTAPAPER_CREDENTIALS.getConsumerKey().c_str(),
+      INSTAPAPER_CREDENTIALS.getConsumerSecret().c_str(), INSTAPAPER_CREDENTIALS.getOauthToken().c_str(),
+      INSTAPAPER_CREDENTIALS.getOauthTokenSecret().c_str());
+  if (authHeader.empty()) {
+    LOG_ERR("INSTA", "Failed to build Authorization header");
+    return -1;
+  }
+
+  const std::string body = buildFormBody(bodyParams);
+
+  NetworkClientSecure tls;
+  tls.setInsecure();
+  HTTPClient http;
+
+  if (!http.begin(tls, url)) {
+    LOG_ERR("INSTA", "HTTPClient.begin failed for %s", url);
+    return -1;
+  }
+  http.addHeader("Authorization", authHeader.c_str());
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  http.addHeader("Accept", "application/json");
+
+  const int code = http.POST(const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(body.data())), body.size());
+
+  // Action responses are tiny (< 1 KB). Stream into a small fixed buffer.
+  char respBuf[1024];
+  size_t respLen = 0;
+  WiFiClient* stream = http.getStreamPtr();
+  while (http.connected() && stream->available() && respLen < sizeof(respBuf) - 1) {
+    const int avail = stream->available();
+    const size_t toRead = sizeof(respBuf) - 1 - respLen < static_cast<size_t>(avail)
+                              ? sizeof(respBuf) - 1 - respLen
+                              : static_cast<size_t>(avail);
+    const int n = stream->read(reinterpret_cast<uint8_t*>(respBuf) + respLen, toRead);
+    if (n <= 0) break;
+    respLen += n;
+  }
+  respBuf[respLen] = '\0';
+
+  if (outBody) *outBody = respBuf;
+
   http.end();
 
   if (code < 200 || code >= 300) {
-    LOG_ERR("INSTA", "POST %s → HTTP %d, body: %.160s", url, code, respBody.c_str());
-  } else if (respBody.indexOf("\"type\":\"error\"") >= 0) {
-    LOG_ERR("INSTA", "POST %s → API error: %.160s", url, respBody.c_str());
+    LOG_ERR("INSTA", "POST %s -> HTTP %d, body: %.160s", url, code, respBuf);
+  } else if (outBody && outBody->find("\"type\":\"error\"") != std::string::npos) {
+    LOG_ERR("INSTA", "POST %s -> API error: %.160s", url, respBuf);
   }
   return code;
 }
 
-// Same as signedPost but streams the response body directly to an SD file
-// instead of accumulating it in a std::string. This keeps peak heap usage
-// bounded to the chunk buffer regardless of article size.
-// Returns the HTTP status code, or -1 on pre-request failure.
+// Stream HTML response directly to an SD file. Used for article body downloads.
 int signedPostStreamingToFile(const char* url, const std::vector<OAuth1Signer::Param>& bodyParams, FsFile& outFile) {
   if (!INSTAPAPER_CREDENTIALS.hasTokens()) {
     return -1;
@@ -195,12 +406,15 @@ int signedPostStreamingToFile(const char* url, const std::vector<OAuth1Signer::P
   return code;
 }
 
-InstapaperClient::Result mapHttpCode(int code, const std::string& jsonBody = std::string()) {
+// ---------------------------------------------------------------------------
+// Response mapping
+// ---------------------------------------------------------------------------
+
+static InstapaperClient::Result mapHttpCode(int code, const std::string& jsonBody) {
   if (code < 0) return InstapaperClient::NETWORK_FAILED;
   if (code == 401 || code == 403) return InstapaperClient::AUTH_FAILED;
   if (code == 429) return InstapaperClient::RATE_LIMITED;
   if (code >= 200 && code < 300) {
-    // Instapaper sometimes returns 200 OK with an embedded error object.
     if (!jsonBody.empty() && jsonBody.find("\"type\":\"error\"") != std::string::npos) {
       if (jsonBody.find("\"error_code\":1040") != std::string::npos) return InstapaperClient::RATE_LIMITED;
       if (jsonBody.find("\"error_code\":403") != std::string::npos ||
@@ -215,16 +429,6 @@ InstapaperClient::Result mapHttpCode(int code, const std::string& jsonBody = std
   return InstapaperClient::SERVER_ERROR;
 }
 
-// Safely copy a std::string into a fixed char[] field, NUL-terminated.
-void copyInto(char* dst, size_t dstLen, const char* src) {
-  if (!dst || dstLen == 0) return;
-  if (!src) {
-    dst[0] = '\0';
-    return;
-  }
-  std::strncpy(dst, src, dstLen - 1);
-  dst[dstLen - 1] = '\0';
-}
 }  // namespace
 
 const char* InstapaperClient::errorString(Result r) {
@@ -251,7 +455,7 @@ InstapaperClient::Result InstapaperClient::listBookmarks(InstapaperFolder folder
                                                          std::vector<InstapaperArticle>& out) {
   out.clear();
   if (!INSTAPAPER_CREDENTIALS.hasTokens()) return NO_TOKENS;
-  if (limit < 1) limit = 25;
+  if (limit < 1) limit = 10;   // Reduced from 25 to save heap
   if (limit > 500) limit = 500;
 
   char limitStr[8];
@@ -261,52 +465,12 @@ InstapaperClient::Result InstapaperClient::listBookmarks(InstapaperFolder folder
   params.push_back({"limit", limitStr});
   params.push_back({"folder_id", folderId(folder)});
 
-  std::string body;
-  const int code = signedPost(URL_LIST, params, &body);
-  const Result r = mapHttpCode(code, body);
-  if (r != OK) return r;
+  // Use streaming JSON parser — no heap allocation proportional to response.
+  const int code = signedPostStreaming(URL_LIST, params, [](WiFiClient* stream, void* ctx) -> int {
+    return parseBookmarksStreaming(stream, *static_cast<std::vector<InstapaperArticle>*>(ctx));
+  }, &out);
 
-  JsonDocument doc;
-  const auto err = deserializeJson(doc, body);
-  if (err) {
-    LOG_ERR("INSTA", "JSON parse failed: %s", err.c_str());
-    return PARSE_FAILED;
-  }
-
-  JsonArrayConst arr = doc.as<JsonArrayConst>();
-  if (arr.isNull()) {
-    LOG_ERR("INSTA", "List response is not an array");
-    return PARSE_FAILED;
-  }
-
-  out.reserve(arr.size());
-  for (JsonVariantConst item : arr) {
-    const char* type = item["type"] | "";
-    if (std::strcmp(type, "bookmark") != 0) continue;
-    InstapaperArticle a;
-    a.id = item["bookmark_id"].as<uint64_t>();
-    copyInto(a.title, sizeof(a.title), item["title"] | "");
-    // `domain` is extracted client-side from the URL; Instapaper returns a
-    // full URL in `url` rather than a bare host.
-    const char* url = item["url"] | "";
-    if (url && *url) {
-      const char* scheme = std::strstr(url, "://");
-      const char* host = scheme ? scheme + 3 : url;
-      const char* pathSep = std::strchr(host, '/');
-      const size_t hostLen = pathSep ? static_cast<size_t>(pathSep - host) : std::strlen(host);
-      const size_t copyLen = hostLen < sizeof(a.domain) - 1 ? hostLen : sizeof(a.domain) - 1;
-      std::memcpy(a.domain, host, copyLen);
-      a.domain[copyLen] = '\0';
-    }
-    const char* author = item["title"].as<const char*>();
-    (void)author;  // Instapaper `bookmark` object has no author field; leave blank.
-    a.word_count = item["word_count"] | 0;
-    a.progress_pct = static_cast<uint32_t>((item["progress"] | 0.0f) * 100.0f);
-    a.starred = (std::strcmp(item["starred"] | "0", "1") == 0);
-    a.saved_at = item["time"] | 0;
-    out.push_back(a);
-  }
-  return OK;
+  return mapHttpCode(code, {});
 }
 
 InstapaperClient::Result InstapaperClient::getText(uint64_t bookmarkId, const std::string& outPath) {
@@ -332,8 +496,7 @@ InstapaperClient::Result InstapaperClient::getText(uint64_t bookmarkId, const st
     return NETWORK_FAILED;
   }
 
-  // Map HTTP errors; for non-2xx the file will be empty/partial — remove it.
-  const Result r = mapHttpCode(code);
+  const Result r = mapHttpCode(code, {});
   if (r != OK) {
     Storage.remove(outPath.c_str());
   }
@@ -348,7 +511,7 @@ InstapaperClient::Result actionWithBookmarkId(const char* url, uint64_t bookmark
   std::vector<OAuth1Signer::Param> params;
   params.push_back({"bookmark_id", idStr});
   std::string body;
-  const int code = signedPost(url, params, &body);
+  const int code = signedPostSmallBuffer(url, params, &body);
   return mapHttpCode(code, body);
 }
 }  // namespace
@@ -371,7 +534,7 @@ InstapaperClient::Result InstapaperClient::updateReadProgress(uint64_t bookmarkI
   params.push_back({"progress_timestamp", timestampStr});
 
   std::string body;
-  const int code = signedPost(URL_UPDATE_PROGRESS, params, &body);
+  const int code = signedPostSmallBuffer(URL_UPDATE_PROGRESS, params, &body);
   return mapHttpCode(code, body);
 }
 
