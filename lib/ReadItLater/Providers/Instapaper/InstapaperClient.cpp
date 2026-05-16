@@ -9,6 +9,7 @@
 #include <esp_sntp.h>
 #include <time.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -477,6 +478,11 @@ InstapaperClient::Result InstapaperClient::listBookmarks(InstapaperFolder folder
         return parseBookmarksStreaming(stream, *static_cast<std::vector<InstapaperArticle>*>(ctx));
       },
       &out);
+
+  // Sort most-recent-first by saved_at. Instapaper's default order is usually
+  // chronological but not contractually guaranteed; enforce it here.
+  std::sort(out.begin(), out.end(),
+            [](const InstapaperArticle& a, const InstapaperArticle& b) { return a.saved_at > b.saved_at; });
 
   return mapHttpCode(code, {});
 }
