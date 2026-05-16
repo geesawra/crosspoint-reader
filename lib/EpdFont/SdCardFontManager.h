@@ -15,7 +15,7 @@ class SdCardFontManager {
   SdCardFontManager(const SdCardFontManager&) = delete;
   SdCardFontManager& operator=(const SdCardFontManager&) = delete;
 
-  // Load the font file matching fontSizeEnum (SMALL=0 .. EXTRA_LARGE=3) by
+  // Load the font file matching fontSizeEnum (EXTRA_SMALL=0 .. LARGE=3) by
   // ordinal position in the family's sorted size list. Only one .cpfont file
   // is loaded; other sizes remain on disk. This keeps resident interval +
   // kern/ligature tables to one size's worth of memory.

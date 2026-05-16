@@ -78,8 +78,8 @@ void FetchActivity::performWork() {
 
   // Stream HTML directly to SD — no in-memory accumulation.
   char htmlTmpBuf[128];
-  std::snprintf(htmlTmpBuf, sizeof(htmlTmpBuf), "%s/tmp_html_%llu",
-                cacheDir, static_cast<unsigned long long>(article.id));
+  std::snprintf(htmlTmpBuf, sizeof(htmlTmpBuf), "%s/tmp_html_%llu", cacheDir,
+                static_cast<unsigned long long>(article.id));
   const std::string htmlTmpPath(htmlTmpBuf);
 
   const auto fetchResult = provider->fetchText(article.id, htmlTmpPath);
@@ -102,8 +102,7 @@ void FetchActivity::performWork() {
   const std::string outPath = provider->epubPathFor(article.id, article.title);
   const std::string path = EpubBuilder::build(
       provider->cacheDirName(), provider->coverPngData(), provider->coverPngLen(), article.id, article.title,
-      article.author, htmlTmpPath.c_str(), &onBuildProgress, this,
-      SETTINGS.readItLaterImages, outPath.c_str());
+      article.author, htmlTmpPath.c_str(), &onBuildProgress, this, SETTINGS.readItLaterImages, outPath.c_str());
 
   // HTML temp file is no longer needed regardless of outcome.
   Storage.remove(htmlTmpPath.c_str());

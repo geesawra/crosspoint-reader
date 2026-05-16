@@ -5,8 +5,8 @@
 #include <Logging.h>
 #include <Provider.h>
 
-#include "ProviderFolderActivity.h"
 #include "MappedInputManager.h"
+#include "ProviderFolderActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 

@@ -89,16 +89,16 @@ struct BookmarkParseCtx {
   std::vector<InstapaperArticle>* out;
 
   // Fields accumulated for the current bookmark object.
-  uint64_t   bookmark_id = 0;
-  char       title[128]  = {0};
-  char       url[512]    = {0};
-  uint32_t   word_count  = 0;
-  float      progress    = 0.0f;
-  bool       starred     = false;
-  time_t     saved_at    = 0;
-  bool       has_type    = false;
-  bool       type_is_bookmark = false;
-  bool       in_bookmark   = false;
+  uint64_t bookmark_id = 0;
+  char title[128] = {0};
+  char url[512] = {0};
+  uint32_t word_count = 0;
+  float progress = 0.0f;
+  bool starred = false;
+  time_t saved_at = 0;
+  bool has_type = false;
+  bool type_is_bookmark = false;
+  bool in_bookmark = false;
 
   // Field name buffer (shared with StreamingJsonParser token buffer).
   char field_name[64] = {0};
@@ -159,9 +159,7 @@ static void bookmarkOnBool(void* ctx, bool value) {
   }
 }
 
-static void bookmarkOnArrayStart(void* ctx) {
-  (void)ctx;
-}
+static void bookmarkOnArrayStart(void* ctx) { (void)ctx; }
 
 static void bookmarkOnObjectStart(void* ctx) {
   auto* b = static_cast<BookmarkParseCtx*>(ctx);
@@ -214,14 +212,14 @@ static int parseBookmarksStreaming(WiFiClient* stream, std::vector<InstapaperArt
 
   JsonCallbacks cbs = {};
   cbs.ctx = &ctx;
-  cbs.onKey       = bookmarkOnKey;
-  cbs.onString    = bookmarkOnString;
-  cbs.onNumber    = bookmarkOnNumber;
-  cbs.onBool      = bookmarkOnBool;
+  cbs.onKey = bookmarkOnKey;
+  cbs.onString = bookmarkOnString;
+  cbs.onNumber = bookmarkOnNumber;
+  cbs.onBool = bookmarkOnBool;
   cbs.onArrayStart = bookmarkOnArrayStart;
-  cbs.onArrayEnd   = nullptr;
+  cbs.onArrayEnd = nullptr;
   cbs.onObjectStart = bookmarkOnObjectStart;
-  cbs.onObjectEnd   = bookmarkOnObjectEnd;
+  cbs.onObjectEnd = bookmarkOnObjectEnd;
 
   StreamingJsonParser parser(cbs);
   uint8_t buf[512];
@@ -295,7 +293,7 @@ static int signedPostStreaming(const char* url, const std::vector<OAuth1Signer::
 // Stream JSON from HTTP response into a small fixed buffer for error checking.
 // Used by action endpoints that return tiny responses.
 static int signedPostSmallBuffer(const char* url, const std::vector<OAuth1Signer::Param>& bodyParams,
-                                  std::string* outBody) {
+                                 std::string* outBody) {
   if (!INSTAPAPER_CREDENTIALS.hasTokens()) {
     return -1;
   }
@@ -333,9 +331,8 @@ static int signedPostSmallBuffer(const char* url, const std::vector<OAuth1Signer
   WiFiClient* stream = http.getStreamPtr();
   while (http.connected() && stream->available() && respLen < sizeof(respBuf) - 1) {
     const int avail = stream->available();
-    const size_t toRead = sizeof(respBuf) - 1 - respLen < static_cast<size_t>(avail)
-                              ? sizeof(respBuf) - 1 - respLen
-                              : static_cast<size_t>(avail);
+    const size_t toRead = sizeof(respBuf) - 1 - respLen < static_cast<size_t>(avail) ? sizeof(respBuf) - 1 - respLen
+                                                                                     : static_cast<size_t>(avail);
     const int n = stream->read(reinterpret_cast<uint8_t*>(respBuf) + respLen, toRead);
     if (n <= 0) break;
     respLen += n;
@@ -455,7 +452,7 @@ InstapaperClient::Result InstapaperClient::listBookmarks(InstapaperFolder folder
                                                          std::vector<InstapaperArticle>& out) {
   out.clear();
   if (!INSTAPAPER_CREDENTIALS.hasTokens()) return NO_TOKENS;
-  if (limit < 1) limit = 100;   // Instapaper API default; streaming parser handles any size safely
+  if (limit < 1) limit = 100;  // Instapaper API default; streaming parser handles any size safely
 
   // Guardrail: refuse to fetch if heap is critically low. Even though JSON
   // parsing is now streaming, the output vector grows proportionally to
@@ -474,9 +471,12 @@ InstapaperClient::Result InstapaperClient::listBookmarks(InstapaperFolder folder
   params.push_back({"folder_id", folderId(folder)});
 
   // Use streaming JSON parser — no heap allocation proportional to response.
-  const int code = signedPostStreaming(URL_LIST, params, [](WiFiClient* stream, void* ctx) -> int {
-    return parseBookmarksStreaming(stream, *static_cast<std::vector<InstapaperArticle>*>(ctx));
-  }, &out);
+  const int code = signedPostStreaming(
+      URL_LIST, params,
+      [](WiFiClient* stream, void* ctx) -> int {
+        return parseBookmarksStreaming(stream, *static_cast<std::vector<InstapaperArticle>*>(ctx));
+      },
+      &out);
 
   return mapHttpCode(code, {});
 }

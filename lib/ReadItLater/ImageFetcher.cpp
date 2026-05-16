@@ -25,8 +25,7 @@ const char* extensionFromContentType(const String& contentType) {
 }
 }  // namespace
 
-ImageFetcher::Result ImageFetcher::download(const std::string& url,
-                                            const std::string& localPathBase, size_t maxBytes) {
+ImageFetcher::Result ImageFetcher::download(const std::string& url, const std::string& localPathBase, size_t maxBytes) {
   Result out;
   if (url.empty()) return out;
   if (!startsWith(url, "http://") && !startsWith(url, "https://")) return out;

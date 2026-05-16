@@ -125,9 +125,7 @@ void TxtReaderActivity::applyOrientation(uint8_t orientation) {
   requestUpdate();
 }
 
-void TxtReaderActivity::onOrientationChanged(uint8_t orientation) {
-  applyOrientation(orientation);
-}
+void TxtReaderActivity::onOrientationChanged(uint8_t orientation) { applyOrientation(orientation); }
 
 void TxtReaderActivity::initializeReader() {
   if (initialized) {

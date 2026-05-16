@@ -11,8 +11,7 @@ ArticleListMenuActivity::ArticleListMenuActivity(GfxRenderer& renderer, MappedIn
     : Activity("ArticleListMenu", renderer, mappedInput), menuItems(buildMenuItems()) {}
 
 std::vector<ArticleListMenuActivity::MenuItem> ArticleListMenuActivity::buildMenuItems() {
-  return {{Action::DOWNLOAD_ALL, StrId::STR_INSTAPAPER_DOWNLOAD_ALL},
-          {Action::REFRESH, StrId::STR_INSTAPAPER_REFRESH}};
+  return {{Action::DOWNLOAD_ALL, StrId::STR_INSTAPAPER_DOWNLOAD_ALL}, {Action::REFRESH, StrId::STR_INSTAPAPER_REFRESH}};
 }
 
 const char* ArticleListMenuActivity::labelFor(Action a) {
@@ -66,8 +65,7 @@ void ArticleListMenuActivity::render(RenderLock&&) {
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
 
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight},
-                 tr(STR_INSTAPAPER_ACTIONS));
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_INSTAPAPER_ACTIONS));
 
   const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
   const int contentHeight = pageHeight - contentTop - metrics.buttonHintsHeight - metrics.verticalSpacing * 2;

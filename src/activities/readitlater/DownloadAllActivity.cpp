@@ -79,8 +79,8 @@ void DownloadAllActivity::performDownloads() {
     }
 
     char htmlTmpBuf[128];
-    std::snprintf(htmlTmpBuf, sizeof(htmlTmpBuf), "/.crosspoint/%s/tmp_html_%llu",
-                  provider->cacheDirName(), static_cast<unsigned long long>(a.id));
+    std::snprintf(htmlTmpBuf, sizeof(htmlTmpBuf), "/.crosspoint/%s/tmp_html_%llu", provider->cacheDirName(),
+                  static_cast<unsigned long long>(a.id));
     const std::string htmlTmpPath(htmlTmpBuf);
 
     // Ensure the cache directory exists (build() also does this, but fetchText
@@ -97,10 +97,9 @@ void DownloadAllActivity::performDownloads() {
       Storage.remove(htmlTmpPath.c_str());
       failed++;
     } else {
-      const std::string out =
-          EpubBuilder::build(provider->cacheDirName(), provider->coverPngData(), provider->coverPngLen(), a.id,
-                             a.title, a.author, htmlTmpPath.c_str(), nullptr, nullptr,
-                             SETTINGS.readItLaterImages, epubPath.c_str());
+      const std::string out = EpubBuilder::build(provider->cacheDirName(), provider->coverPngData(),
+                                                 provider->coverPngLen(), a.id, a.title, a.author, htmlTmpPath.c_str(),
+                                                 nullptr, nullptr, SETTINGS.readItLaterImages, epubPath.c_str());
       Storage.remove(htmlTmpPath.c_str());
       if (out.empty()) {
         failed++;

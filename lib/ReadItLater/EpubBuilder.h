@@ -30,16 +30,9 @@ class EpubBuilder {
   // Returns the absolute path of the created EPUB on success, or an empty
   // string on failure. If `cb` is non-null it is invoked synchronously at
   // each phase transition — safe to update UI state inside.
-  static std::string build(const char* cacheDir,
-                           const char* coverPngData, size_t coverPngLen,
-                           uint64_t articleId,
-                           const char* title,
-                           const char* author,
-                           const char* htmlPath,
-                           ProgressCallback cb = nullptr,
-                           void* ctx = nullptr,
-                           bool includeImages = true,
-                           const char* outPath = nullptr);
+  static std::string build(const char* cacheDir, const char* coverPngData, size_t coverPngLen, uint64_t articleId,
+                           const char* title, const char* author, const char* htmlPath, ProgressCallback cb = nullptr,
+                           void* ctx = nullptr, bool includeImages = true, const char* outPath = nullptr);
 
   // Compute the expected on-SD path for an article. Does not touch the SD.
   static std::string pathFor(const char* cacheDir, uint64_t articleId);
@@ -53,8 +46,7 @@ class EpubBuilder {
   // Streaming sanitizer: reads raw HTML from `inFile` in chunks, writes
   // sanitized XHTML body to `outFile`. `imageMap` rewrites img src= URLs.
   // Both files must already be open. Returns false on I/O error.
-  static bool sanitizeHtmlBodyStreaming(FsFile& inFile,
-                                        FsFile& outFile,
+  static bool sanitizeHtmlBodyStreaming(FsFile& inFile, FsFile& outFile,
                                         const std::unordered_map<std::string, std::string>* imageMap = nullptr);
 
   // Escape text for XML attribute / content use.

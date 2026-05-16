@@ -191,30 +191,28 @@ void ArticleListActivity::loop() {
 
   // Right: article-list-level actions menu (download all / refresh).
   if (mappedInput.wasPressed(MappedInputManager::Button::Right)) {
-    startActivityForResult(std::make_unique<ArticleListMenuActivity>(renderer, mappedInput),
-                           [this](const ActivityResult& r) {
-                             if (r.isCancelled) {
-                               requestUpdate();
-                               return;
-                             }
-                             const auto action =
-                                 static_cast<ArticleListMenuActivity::Action>(std::get<PercentResult>(r.data).percent);
-                             switch (action) {
-                               case ArticleListMenuActivity::Action::DOWNLOAD_ALL:
-                                 if (articles.empty()) {
-                                   requestUpdate();
-                                   break;
-                                 }
-                                 startActivityForResult(
-                                     std::make_unique<DownloadAllActivity>(renderer, mappedInput, provider, articles),
+    startActivityForResult(
+        std::make_unique<ArticleListMenuActivity>(renderer, mappedInput), [this](const ActivityResult& r) {
+          if (r.isCancelled) {
+            requestUpdate();
+            return;
+          }
+          const auto action = static_cast<ArticleListMenuActivity::Action>(std::get<PercentResult>(r.data).percent);
+          switch (action) {
+            case ArticleListMenuActivity::Action::DOWNLOAD_ALL:
+              if (articles.empty()) {
+                requestUpdate();
+                break;
+              }
+              startActivityForResult(std::make_unique<DownloadAllActivity>(renderer, mappedInput, provider, articles),
                                      [this](const ActivityResult&) { requestUpdate(); });
-                                 break;
-                               case ArticleListMenuActivity::Action::REFRESH:
-                                 pendingRefresh = true;
-                                 requestUpdate();
-                                 break;
-                             }
-                           });
+              break;
+            case ArticleListMenuActivity::Action::REFRESH:
+              pendingRefresh = true;
+              requestUpdate();
+              break;
+          }
+        });
     return;
   }
 }
@@ -281,8 +279,7 @@ void ArticleListActivity::render(RenderLock&&) {
       [this](int index) { return std::string(articles[index].title); },
       [this](int index) { return std::string(articles[index].domain); }, nullptr);
 
-  const auto labels =
-      mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_INSTAPAPER_ACTIONS), tr(STR_OPTIONS));
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_INSTAPAPER_ACTIONS), tr(STR_OPTIONS));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer();
 }

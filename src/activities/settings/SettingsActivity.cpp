@@ -6,6 +6,7 @@
 #include "ButtonRemapActivity.h"
 #include "ClearCacheActivity.h"
 #include "CrossPointSettings.h"
+#include "DictionarySelectActivity.h"
 #include "FontDownloadActivity.h"
 #include "FontSelectionActivity.h"
 #include "KOReaderSettingsActivity.h"
@@ -20,6 +21,7 @@
 #include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "util/Dictionary.h"
 
 const StrId SettingsActivity::categoryNames[categoryCount] = {StrId::STR_CAT_DISPLAY, StrId::STR_CAT_READER,
                                                               StrId::STR_CAT_CONTROLS, StrId::STR_CAT_SYSTEM};
@@ -60,6 +62,28 @@ void SettingsActivity::rebuildSettingsLists() {
   // Insert "Download Fonts" right after the font family setting so users discover it naturally
   readerSettings.insert(readerSettings.begin() + 1,
                         SettingInfo::Action(StrId::STR_DOWNLOAD_FONTS, SettingAction::DownloadFonts));
+  {
+    auto dictSetting = SettingInfo::Action(StrId::STR_DICTIONARY, SettingAction::Dictionary);
+    dictSetting.stringGetter = [] {
+      std::string path = Dictionary::readDictPath();
+      if (path.empty()) return std::string(tr(STR_DICT_NONE));
+      // Path format: /dictionary/<folder>/<stem> — display the folder name.
+      const size_t lastSlash = path.rfind('/');
+      if (lastSlash == std::string::npos || lastSlash == 0) return path;
+      const size_t prevSlash = path.rfind('/', lastSlash - 1);
+      return (prevSlash != std::string::npos) ? path.substr(prevSlash + 1, lastSlash - prevSlash - 1)
+                                              : path.substr(0, lastSlash);
+    };
+    readerSettings.push_back(std::move(dictSetting));
+  }
+  // These are in SettingsList.h for persistence but with STR_NONE_OPT category,
+  // so we add them here manually to appear after the Dictionary selector.
+  readerSettings.push_back(SettingInfo::Value(
+      StrId::STR_LOOKUP_HIST_CAP, &CrossPointSettings::lookupHistoryCap,
+      {CrossPointSettings::HIST_CAP_MIN, CrossPointSettings::HIST_CAP_MAX, CrossPointSettings::HIST_CAP_STEP},
+      "lookupHistoryCap", StrId::STR_CAT_READER));
+  readerSettings.push_back(SettingInfo::Toggle(StrId::STR_DICT_HOLD_TO_LOOKUP, &CrossPointSettings::holdToLookup,
+                                               "holdToLookup", StrId::STR_CAT_READER));
   readerSettings.push_back(SettingInfo::Action(StrId::STR_CUSTOMISE_STATUS_BAR, SettingAction::CustomiseStatusBar));
 
   // Update currentSettings pointer and count for the active category
@@ -200,7 +224,8 @@ void SettingsActivity::toggleCurrentSetting() {
     const uint8_t cur = setting.valueGetter();
     setting.valueSetter((cur + 1) % totalValues);
   } else if (setting.type == SettingType::VALUE && setting.valuePtr != nullptr) {
-    const int8_t currentValue = SETTINGS.*(setting.valuePtr);
+    // uint8_t: int8_t overflows above 127, breaking dictionary history cap rollover
+    const uint8_t currentValue = SETTINGS.*(setting.valuePtr);
     if (currentValue + setting.valueRange.step > setting.valueRange.max) {
       SETTINGS.*(setting.valuePtr) = setting.valueRange.min;
     } else {
@@ -243,6 +268,9 @@ void SettingsActivity::toggleCurrentSetting() {
         break;
       case SettingAction::Language:
         startActivityForResult(std::make_unique<LanguageSelectActivity>(renderer, mappedInput), resultHandler);
+        break;
+      case SettingAction::Dictionary:
+        startActivityForResult(std::make_unique<DictionarySelectActivity>(renderer, mappedInput), resultHandler);
         break;
       case SettingAction::None:
         // Do nothing
@@ -301,6 +329,8 @@ void SettingsActivity::render(RenderLock&&) {
           }
         } else if (setting.type == SettingType::VALUE && setting.valuePtr != nullptr) {
           valueText = std::to_string(SETTINGS.*(setting.valuePtr));
+        } else if (setting.type == SettingType::ACTION && setting.stringGetter) {
+          valueText = setting.stringGetter();
         }
         return valueText;
       },

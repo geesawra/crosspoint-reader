@@ -64,8 +64,7 @@ class Provider {
   // ---------- Articles ----------
 
   /** List articles in `folder`. `limit` is advisory (1..500). */
-  virtual Result listArticles(const FolderInfo& folder, int limit,
-                              std::vector<ReadItLaterArticle>& out) = 0;
+  virtual Result listArticles(const FolderInfo& folder, int limit, std::vector<ReadItLaterArticle>& out) = 0;
 
   /** Fetch the processed article body HTML, streaming to `outPath` on SD. */
   virtual Result fetchText(uint64_t articleId, const std::string& outPath) = 0;
@@ -84,8 +83,7 @@ class Provider {
    * Return the actions available for `article` when viewed inside `folder`.
    * The generic ActionsActivity renders these as a menu.
    */
-  virtual std::vector<Action> availableActions(const FolderInfo& folder,
-                                               const ReadItLaterArticle& article) const = 0;
+  virtual std::vector<Action> availableActions(const FolderInfo& folder, const ReadItLaterArticle& article) const = 0;
 
   /** Perform `action` on `articleId`. */
   virtual Result performAction(uint64_t articleId, Action action) = 0;

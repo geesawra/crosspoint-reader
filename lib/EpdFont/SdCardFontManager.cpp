@@ -35,7 +35,7 @@ bool SdCardFontManager::loadFamily(const SdCardFontFamilyInfo& family, GfxRender
   }
 
   // Select by ordinal position: sort available sizes, then map the font size
-  // enum (SMALL=0 .. EXTRA_LARGE=3) to the corresponding slot. When the
+  // enum (EXTRA_SMALL=0 .. LARGE=3) to the corresponding slot. When the
   // family has fewer sizes than 4, clamp to the last available size.
   auto sizes = family.availableSizes();
   if (sizes.empty()) {
