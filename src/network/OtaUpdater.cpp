@@ -8,7 +8,10 @@
 #include <esp_wifi.h>
 
 namespace {
-constexpr char latestReleaseUrl[] = "https://api.github.com/repos/crosspoint-reader/crosspoint-reader/releases/latest";
+constexpr char latestReleaseUrl[] = "https://api.github.com/repos/geesawra/crosspoint-reader/releases/latest";
+
+// Skip an optional leading 'v'/'V' so tags like "v1.3.0" parse cleanly via sscanf("%d.%d.%d").
+constexpr const char* stripVPrefix(const char* s) { return (s && (*s == 'v' || *s == 'V')) ? s + 1 : s; }
 
 esp_err_t http_client_set_header_cb(esp_http_client_handle_t http_client) {
   return esp_http_client_set_header(http_client, "User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
@@ -106,8 +109,8 @@ bool OtaUpdater::isUpdateNewer() const {
   const auto currentVersion = CROSSPOINT_VERSION;
 
   // semantic version check (only match on 3 segments)
-  sscanf(latestVersion.c_str(), "%d.%d.%d", &latestMajor, &latestMinor, &latestPatch);
-  sscanf(currentVersion, "%d.%d.%d", &currentMajor, &currentMinor, &currentPatch);
+  sscanf(stripVPrefix(latestVersion.c_str()), "%d.%d.%d", &latestMajor, &latestMinor, &latestPatch);
+  sscanf(stripVPrefix(currentVersion), "%d.%d.%d", &currentMajor, &currentMinor, &currentPatch);
 
   /*
    * Compare major versions.
