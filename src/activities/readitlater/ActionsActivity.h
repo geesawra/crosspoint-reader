@@ -21,7 +21,7 @@
 class ActionsActivity final : public Activity {
  public:
   ActionsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, Provider* provider,
-                  ReadItLaterArticle article, Provider::FolderInfo folder)
+                  const ReadItLaterArticle& article, Provider::FolderInfo folder)
       : Activity("Actions", renderer, mappedInput), provider(provider), article(article), folder(folder) {}
 
   void onEnter() override;

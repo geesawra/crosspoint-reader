@@ -13,7 +13,8 @@
  */
 class FetchActivity final : public Activity {
  public:
-  FetchActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, Provider* provider, ReadItLaterArticle article)
+  FetchActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, Provider* provider,
+                const ReadItLaterArticle& article)
       : Activity("Fetch", renderer, mappedInput), provider(provider), article(article) {}
 
   void onEnter() override;
