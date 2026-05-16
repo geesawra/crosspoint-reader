@@ -825,10 +825,9 @@ std::optional<CssStyle> CssParser::loadRuleBySelector(const std::string& selecto
 
 // Pre-warm LRU cache with common HTML element selectors
 void CssParser::prewarmCommonSelectors() {
-  static constexpr const char* COMMON[] = {"p",   "div",        "span", "h1", "h2",     "h3",
-                                           "h4",  "h5",         "h6",   "a",  "em",     "strong",
-                                           "i",   "b",          "li",   "ul", "ol",     "body",
-                                           "img", "blockquote", "pre",  "br", "section"};
+  static constexpr const char* COMMON[] = {"p",  "div",  "span", "h1",         "h2",  "h3", "h4",     "h5",
+                                           "h6", "a",    "em",   "strong",     "i",   "b",  "li",     "ul",
+                                           "ol", "body", "img",  "blockquote", "pre", "br", "section"};
   for (const char* sel : COMMON) {
     (void)loadRuleBySelector(sel);  // Result intentionally discarded; side effect is LRU insertion
   }

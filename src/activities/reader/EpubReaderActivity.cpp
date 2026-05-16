@@ -10,11 +10,14 @@
 #include <Logging.h>
 #include <esp_system.h>
 
+#include <algorithm>
 #include <iterator>
 #include <limits>
 
+#include "../settings/DictionarySelectActivity.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
+#include "DictionaryWordSelectActivity.h"
 #include "EpubReaderChapterSelectionActivity.h"
 #include "EpubReaderFootnotesActivity.h"
 #include "EpubReaderPercentSelectionActivity.h"
@@ -24,6 +27,7 @@
 #ifdef READ_IT_LATER_ENABLED
 #include "ProgressSync.h"
 #endif
+#include "LookedUpWordsActivity.h"
 #include "MappedInputManager.h"
 #include "ProgressMapper.h"
 #include "QrDisplayActivity.h"
@@ -31,6 +35,7 @@
 #include "RecentBooksStore.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "util/Dictionary.h"
 #include "util/ScreenshotUtil.h"
 
 namespace {
@@ -175,38 +180,36 @@ void EpubReaderActivity::loop() {
     }
   }
 
+  // Hold Confirm → direct word-select (fire at threshold, 600ms).
+  if (SETTINGS.holdToLookup && mappedInput.isPressed(MappedInputManager::Button::Confirm) &&
+      mappedInput.getHeldTime() >= Dictionary::LONG_PRESS_MS && section &&
+      Dictionary::exists(epub->getCachePath().c_str())) {
+    openWordSelect(/*framebufferContainsPage=*/true);
+    return;
+  }
+
   // Enter reader menu activity.
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    const int currentPage = section ? section->currentPage + 1 : 0;
-    const int totalPages = section ? section->pageCount : 0;
-    float bookProgress = 0.0f;
-    if (epub->getBookSize() > 0 && section && section->pageCount > 0) {
-      const float chapterProgress = static_cast<float>(section->currentPage) / static_cast<float>(section->pageCount);
-      bookProgress = epub->calculateProgress(currentSpineIndex, chapterProgress) * 100.0f;
-    }
-    const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
-    startActivityForResult(std::make_unique<EpubReaderMenuActivity>(
-                               renderer, mappedInput, epub->getTitle(), currentPage, totalPages, bookProgressPercent,
-                               SETTINGS.orientation, !currentPageFootnotes.empty()),
-                           [this](const ActivityResult& result) {
-                             // Always apply orientation change even if the menu was cancelled
-                             const auto& menu = std::get<MenuResult>(result.data);
-                             applyOrientation(menu.orientation);
-                             toggleAutoPageTurn(menu.pageTurnOption);
-                             if (!result.isCancelled) {
-                               onReaderMenuConfirm(static_cast<EpubReaderMenuActivity::MenuAction>(menu.action));
-                             }
-                           });
+    openReaderMenu();
+  }
+
+  // Suppress Back bleed-through after dictionary chain exit. Capture the flag BEFORE
+  // updating it so the release frame itself is gated — otherwise the flag clears and
+  // wasReleased(Back) fires onGoHome() on the same tick the user lets go.
+  const bool suppressBack = ignoreBackUntilRelease;
+  if (ignoreBackUntilRelease && !mappedInput.isPressed(MappedInputManager::Button::Back)) {
+    ignoreBackUntilRelease = false;
   }
 
   // Long press BACK (1s+) goes to file selection
-  if (mappedInput.isPressed(MappedInputManager::Button::Back) && mappedInput.getHeldTime() >= ReaderUtils::GO_HOME_MS) {
+  if (!suppressBack && mappedInput.isPressed(MappedInputManager::Button::Back) &&
+      mappedInput.getHeldTime() >= ReaderUtils::GO_HOME_MS) {
     activityManager.goToFileBrowser(epub ? epub->getPath() : "");
     return;
   }
 
   // Short press BACK goes directly to home (or restores position if viewing footnote)
-  if (mappedInput.wasReleased(MappedInputManager::Button::Back) &&
+  if (!suppressBack && mappedInput.wasReleased(MappedInputManager::Button::Back) &&
       mappedInput.getHeldTime() < ReaderUtils::GO_HOME_MS) {
     if (footnoteDepth > 0) {
       restoreSavedPosition();
@@ -336,6 +339,101 @@ void EpubReaderActivity::jumpToPercent(int percent) {
     pendingPercentJump = true;
     section.reset();
   }
+}
+
+void EpubReaderActivity::openReaderMenu() {
+  const int currentPage = section ? section->currentPage + 1 : 0;
+  const int totalPages = section ? section->pageCount : 0;
+  float bookProgress = 0.0f;
+  if (epub->getBookSize() > 0 && section && section->pageCount > 0) {
+    const float chapterProgress = static_cast<float>(section->currentPage) / static_cast<float>(section->pageCount);
+    bookProgress = epub->calculateProgress(currentSpineIndex, chapterProgress) * 100.0f;
+  }
+  const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
+
+  // Extract the folder name from the active dictionary path for display in the menu.
+  // Path format: /dictionary/<folder>/<stem> — we want <folder>.
+  std::string activeDictName;
+  {
+    const std::string rawDictPath = Dictionary::readDictPath(epub->getCachePath().c_str());
+    if (rawDictPath.empty()) {
+      activeDictName = tr(STR_DICT_NONE);
+    } else {
+      const size_t lastSlash = rawDictPath.rfind('/');
+      if (lastSlash != std::string::npos && lastSlash > 0) {
+        const size_t prevSlash = rawDictPath.rfind('/', lastSlash - 1);
+        activeDictName = (prevSlash != std::string::npos) ? rawDictPath.substr(prevSlash + 1, lastSlash - prevSlash - 1)
+                                                          : rawDictPath.substr(0, lastSlash);
+      } else {
+        activeDictName = rawDictPath;
+      }
+    }
+  }
+
+  startActivityForResult(
+      std::make_unique<EpubReaderMenuActivity>(
+          renderer, mappedInput, epub->getTitle(), currentPage, totalPages, bookProgressPercent, SETTINGS.orientation,
+          !currentPageFootnotes.empty(), Dictionary::exists(epub->getCachePath().c_str()), std::move(activeDictName)),
+      [this](const ActivityResult& result) {
+        // Always apply orientation change even if the menu was cancelled
+        const auto& menu = std::get<MenuResult>(result.data);
+        applyOrientation(menu.orientation);
+        toggleAutoPageTurn(menu.pageTurnOption);
+        if (!result.isCancelled) {
+          onReaderMenuConfirm(static_cast<EpubReaderMenuActivity::MenuAction>(menu.action));
+        }
+      });
+}
+
+void EpubReaderActivity::openWordSelect(bool framebufferContainsPage) {
+  auto pageForLookup = section ? section->loadPageFromSectionFile() : nullptr;
+  if (!pageForLookup) {
+    requestUpdate();
+    return;
+  }
+  int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
+  renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
+                                   &orientedMarginLeft);
+  orientedMarginTop += SETTINGS.screenMargin;
+  orientedMarginLeft += SETTINGS.screenMargin;
+
+  // Bottom reserved-area height (matches renderContents() at line 695-703). The
+  // word-select activity uses this to clear exactly the strip we drew the
+  // status-bar / auto-turn label into, so its first frame matches the menu
+  // path which wipes everything via clearScreen + page->render.
+  const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();
+  const int reservedBottomHeight =
+      (automaticPageTurnActive &&
+       (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight()))
+          ? std::max(
+                SETTINGS.screenMargin,
+                static_cast<uint8_t>(statusBarHeight + UITheme::getInstance().getMetrics().statusBarVerticalMargin))
+          : std::max(SETTINGS.screenMargin, statusBarHeight);
+  std::string nextPageFirstWord;
+  if (section && section->currentPage < section->pageCount - 1) {
+    int savedPage = section->currentPage;
+    section->currentPage = savedPage + 1;
+    auto nextPage = section->loadPageFromSectionFile();
+    section->currentPage = savedPage;
+    if (nextPage && !nextPage->elements.empty()) {
+      const auto it = std::find_if(nextPage->elements.begin(), nextPage->elements.end(),
+                                   [](const auto& el) { return el->getTag() == TAG_PageLine; });
+      if (it != nextPage->elements.end()) {
+        const auto* firstLine = static_cast<const PageLine*>(it->get());
+        if (firstLine->getBlock() && !firstLine->getBlock()->getWords().empty()) {
+          nextPageFirstWord = firstLine->getBlock()->getWords().front();
+        }
+      }
+    }
+  }
+  const std::string bookCachePath = epub->getCachePath();
+  startActivityForResult(std::make_unique<DictionaryWordSelectActivity>(
+                             renderer, mappedInput, std::move(pageForLookup), orientedMarginLeft, orientedMarginTop,
+                             bookCachePath, nextPageFirstWord, framebufferContainsPage, reservedBottomHeight),
+                         [this](const ActivityResult&) {
+                           ignoreBackUntilRelease = true;
+                           requestUpdate();
+                         });
 }
 
 void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action) {
@@ -489,6 +587,25 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
             renderer, mappedInput, savedEpubPath, currentSpineIndex, currentPage, totalPages, std::move(localKoPos),
             std::move(localChapterName), paragraphIndex));
       }
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::LOOKUP: {
+      // Menu activity rendered over the page; the framebuffer no longer
+      // matches what DictionaryWordSelectActivity expects.
+      openWordSelect(/*framebufferContainsPage=*/false);
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::LOOKUP_HISTORY: {
+      startActivityForResult(std::make_unique<LookedUpWordsActivity>(renderer, mappedInput, epub->getCachePath()),
+                             [this](const ActivityResult&) {
+                               ignoreBackUntilRelease = true;
+                               requestUpdate();
+                             });
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::SET_BOOK_DICTIONARY: {
+      startActivityForResult(std::make_unique<DictionarySelectActivity>(renderer, mappedInput, epub->getCachePath()),
+                             [this](const ActivityResult&) { openReaderMenu(); });
       break;
     }
   }

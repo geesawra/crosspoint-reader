@@ -3,8 +3,8 @@
 #include <Provider.h>
 
 #include "InstapaperClient.h"
-#include "InstapaperCredentialStore.h"
 #include "InstapaperCoverAsset.h"
+#include "InstapaperCredentialStore.h"
 
 /**
  * Instapaper implementation of the Provider interface.

@@ -31,6 +31,7 @@ class EpubReaderActivity final : public Activity {
   bool pendingSyncSaveError = false;
   bool skipNextButtonCheck = false;  // Skip button processing for one frame after subactivity exit
   bool automaticPageTurnActive = false;
+  bool ignoreBackUntilRelease = false;  // Suppress Back bleed-through after dictionary chain exit
 
   // Footnote support
   std::vector<FootnoteEntry> currentPageFootnotes;
@@ -49,6 +50,14 @@ class EpubReaderActivity final : public Activity {
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
   // Jump to a percentage of the book (0-100), mapping it to spine and page.
   void jumpToPercent(int percent);
+  void openReaderMenu();
+  // framebufferContainsPage = true means the caller guarantees the framebuffer
+  // currently shows the page at the renderer's oriented page margins. The
+  // DictionaryWordSelectActivity will skip its initial clearScreen +
+  // page->render in that case. Only the hold-to-lookup path can pass true;
+  // the reader-menu → Lookup path must pass false because the menu has
+  // overwritten the framebuffer.
+  void openWordSelect(bool framebufferContainsPage);
   void onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action);
   void applyOrientation(uint8_t orientation);
   void toggleAutoPageTurn(uint8_t selectedPageTurnOption);

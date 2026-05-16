@@ -116,8 +116,8 @@ std::vector<std::string> extractImageUrlsFromFile(FsFile& file, size_t maxUrls) 
       while (end < n && combined[end] != '>') end++;
       if (end >= n) break;  // Incomplete tag — will be completed in next iteration
       for (size_t p = i + 4; p + 4 < end; p++) {
-        if ((combined[p] | 0x20) == 's' && (combined[p + 1] | 0x20) == 'r' &&
-            (combined[p + 2] | 0x20) == 'c' && combined[p + 3] == '=') {
+        if ((combined[p] | 0x20) == 's' && (combined[p + 1] | 0x20) == 'r' && (combined[p + 2] | 0x20) == 'c' &&
+            combined[p + 3] == '=') {
           size_t vs = p + 4;
           char quote = 0;
           if (vs < end && (combined[vs] == '"' || combined[vs] == '\'')) {
@@ -179,9 +179,8 @@ void replaceNonXmlEntities(std::string& s) {
 //     typically < 1 KB.
 // ---------------------------------------------------------------------------
 
-bool EpubBuilder::sanitizeHtmlBodyStreaming(FsFile& inFile,
-                                             FsFile& outFile,
-                                             const std::unordered_map<std::string, std::string>* imageMap) {
+bool EpubBuilder::sanitizeHtmlBodyStreaming(FsFile& inFile, FsFile& outFile,
+                                            const std::unordered_map<std::string, std::string>* imageMap) {
   constexpr size_t BUF_SIZE = 2048;
   uint8_t buf[BUF_SIZE];
   size_t bufLen = 0;
@@ -209,11 +208,17 @@ bool EpubBuilder::sanitizeHtmlBodyStreaming(FsFile& inFile,
         // Pass through likely entities (&amp; &nbsp; etc.), escape bare &.
         bool isEntity = false;
         for (size_t j = k + 1; j < len && j < k + 10; j++) {
-          if (s[j] == ';') { isEntity = (j > k + 1); break; }
+          if (s[j] == ';') {
+            isEntity = (j > k + 1);
+            break;
+          }
           if (!std::isalnum(static_cast<unsigned char>(s[j])) && s[j] != '#') break;
         }
-        if (isEntity) { if (!writeOut("&", 1)) return false; }
-        else          { if (!writeOut("&amp;", 5)) return false; }
+        if (isEntity) {
+          if (!writeOut("&", 1)) return false;
+        } else {
+          if (!writeOut("&amp;", 5)) return false;
+        }
       } else {
         if (!writeOut(s + k, 1)) return false;
       }
@@ -297,12 +302,15 @@ bool EpubBuilder::sanitizeHtmlBodyStreaming(FsFile& inFile,
       // Search remaining buffer for '-->'
       bool found = false;
       while (!found) {
-        const char* p = std::strstr(reinterpret_cast<const char*>(buf + i),  "-->");
+        const char* p = std::strstr(reinterpret_cast<const char*>(buf + i), "-->");
         if (p) {
           i = static_cast<size_t>(reinterpret_cast<const uint8_t*>(p) - buf) + 3;
           found = true;
         } else {
-          if (!inFile.available()) { i = bufLen; break; }
+          if (!inFile.available()) {
+            i = bufLen;
+            break;
+          }
           refill(bufLen > 3 ? bufLen - 3 : 0);  // keep last 3 bytes for overlap
           i = 0;
         }
@@ -317,13 +325,15 @@ bool EpubBuilder::sanitizeHtmlBodyStreaming(FsFile& inFile,
     const bool isClose = (tag[1] == '/');
     const size_t nameStart = 1 + (isClose ? 1 : 0);
     size_t nameEnd = nameStart;
-    while (nameEnd < tagLen - 1 &&
-           !std::isspace(static_cast<unsigned char>(tag[nameEnd])) &&
-           tag[nameEnd] != '/' && tag[nameEnd] != '>') {
+    while (nameEnd < tagLen - 1 && !std::isspace(static_cast<unsigned char>(tag[nameEnd])) && tag[nameEnd] != '/' &&
+           tag[nameEnd] != '>') {
       nameEnd++;
     }
     const size_t nameLen2 = nameEnd - nameStart;
-    if (nameLen2 == 0) { i = end + 1; continue; }
+    if (nameLen2 == 0) {
+      i = end + 1;
+      continue;
+    }
 
     const char* name = tag + nameStart;
 
@@ -332,10 +342,14 @@ bool EpubBuilder::sanitizeHtmlBodyStreaming(FsFile& inFile,
     bool isEnvelope = false;
     for (const char* env : envelopeTags) {
       if (std::strlen(env) == nameLen2 && caseInsensitiveEquals(name, env, nameLen2)) {
-        isEnvelope = true; break;
+        isEnvelope = true;
+        break;
       }
     }
-    if (isEnvelope) { i = end + 1; continue; }
+    if (isEnvelope) {
+      i = end + 1;
+      continue;
+    }
 
     // Drop tags — skip entire subtree by scanning for closing tag.
     if (!isClose && matchesAny(name, nameLen2, DROP_TAGS, DROP_TAG_COUNT)) {
@@ -343,7 +357,8 @@ bool EpubBuilder::sanitizeHtmlBodyStreaming(FsFile& inFile,
       char needle[32];
       size_t nLen = 2 + nameLen2 + 1;
       if (nLen < sizeof(needle)) {
-        needle[0] = '<'; needle[1] = '/';
+        needle[0] = '<';
+        needle[1] = '/';
         std::memcpy(needle + 2, name, nameLen2);
         needle[2 + nameLen2] = '>';
         needle[nLen] = '\0';
@@ -359,7 +374,10 @@ bool EpubBuilder::sanitizeHtmlBodyStreaming(FsFile& inFile,
             }
           }
           if (!found) {
-            if (!inFile.available()) { i = bufLen; break; }
+            if (!inFile.available()) {
+              i = bufLen;
+              break;
+            }
             refill(bufLen > nLen ? bufLen - nLen : 0);
             i = 0;
           }
@@ -376,8 +394,9 @@ bool EpubBuilder::sanitizeHtmlBodyStreaming(FsFile& inFile,
         // Find src= within this tag.
         const char* srcAt = nullptr;
         for (const char* p = tag; p + 4 < tag + tagLen; p++) {
-          if ((p[0]|0x20)=='s' && (p[1]|0x20)=='r' && (p[2]|0x20)=='c' && p[3]=='=') {
-            srcAt = p + 4; break;
+          if ((p[0] | 0x20) == 's' && (p[1] | 0x20) == 'r' && (p[2] | 0x20) == 'c' && p[3] == '=') {
+            srcAt = p + 4;
+            break;
           }
         }
         if (srcAt) {
@@ -484,7 +503,7 @@ bool EpubBuilder::sanitizeHtmlBodyStreaming(FsFile& inFile,
 }
 
 std::string EpubBuilder::sanitizeHtmlBody(const char* rawHtml,
-                                           const std::unordered_map<std::string, std::string>* imageMap) {
+                                          const std::unordered_map<std::string, std::string>* imageMap) {
   if (!rawHtml) return {};
 
   std::string out;
@@ -697,20 +716,13 @@ std::string EpubBuilder::escapeXml(const char* s) {
 
 std::string EpubBuilder::pathFor(const char* cacheDir, uint64_t articleId) {
   char buf[128];
-  std::snprintf(buf, sizeof(buf), "%s/article_v2_%llu.epub", cacheDir,
-                static_cast<unsigned long long>(articleId));
+  std::snprintf(buf, sizeof(buf), "%s/article_v2_%llu.epub", cacheDir, static_cast<unsigned long long>(articleId));
   return std::string(buf);
 }
 
-std::string EpubBuilder::build(const char* cacheDir,
-                               const char* coverPngData, size_t coverPngLen,
-                               uint64_t articleId,
-                               const char* title,
-                               const char* author,
-                               const char* htmlPath,
-                               ProgressCallback cb, void* ctx,
-                               bool includeImages,
-                               const char* outPath) {
+std::string EpubBuilder::build(const char* cacheDir, const char* coverPngData, size_t coverPngLen, uint64_t articleId,
+                               const char* title, const char* author, const char* htmlPath, ProgressCallback cb,
+                               void* ctx, bool includeImages, const char* outPath) {
   auto report = [&](int pct, const char* label) {
     if (cb) cb(ctx, pct, label);
   };
@@ -790,8 +802,8 @@ std::string EpubBuilder::build(const char* cacheDir,
       report(pct, label);
 
       char base[128];
-      std::snprintf(base, sizeof(base), "%s/tmp_img_%llu_%zu", fullDir,
-                    static_cast<unsigned long long>(articleId), idx);
+      std::snprintf(base, sizeof(base), "%s/tmp_img_%llu_%zu", fullDir, static_cast<unsigned long long>(articleId),
+                    idx);
       const auto result = ImageFetcher::download(imageUrls[idx], base);
       if (result.localPath.empty()) continue;
       char zipName[32];
@@ -956,7 +968,8 @@ std::string EpubBuilder::build(const char* cacheDir,
   }
 
   if (!zip.addFile("mimetype", MIMETYPE, sizeof(MIMETYPE) - 1)) return fail("ZIP: mimetype");
-  if (!zip.addFile("META-INF/container.xml", CONTAINER_XML, sizeof(CONTAINER_XML) - 1)) return fail("ZIP: container.xml");
+  if (!zip.addFile("META-INF/container.xml", CONTAINER_XML, sizeof(CONTAINER_XML) - 1))
+    return fail("ZIP: container.xml");
   if (!zip.addFile("OEBPS/content.opf", opf.data(), opf.size())) return fail("ZIP: content.opf");
   if (!zip.addFile("OEBPS/nav.xhtml", navDoc.data(), navDoc.size())) return fail("ZIP: nav.xhtml");
   if (!zip.addFile("OEBPS/cover.png", coverPngData, coverPngLen)) return fail("ZIP: cover.png");

@@ -155,8 +155,7 @@ bool HalTiltSensor::deepSleep() {
   }
 }
 
-void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const bool autoRotate,
-                            const bool inReader) {
+void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const bool autoRotate, const bool inReader) {
   if (!_available) {
     return;
   }

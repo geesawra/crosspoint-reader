@@ -21,8 +21,7 @@ std::string pathFor(const char* providerKey, const char* folderId) {
 }
 }  // namespace
 
-bool StateCache::save(const char* providerKey, const char* folderId,
-                      const std::vector<ReadItLaterArticle>& articles) {
+bool StateCache::save(const char* providerKey, const char* folderId, const std::vector<ReadItLaterArticle>& articles) {
   Storage.mkdir(cacheDirFor(providerKey).c_str());
 
   JsonDocument doc;
@@ -58,8 +57,8 @@ bool StateCache::save(const char* providerKey, const char* folderId,
   return true;
 }
 
-bool StateCache::load(const char* providerKey, const char* folderId,
-                      std::vector<ReadItLaterArticle>& articles, time_t* outSyncedAt) {
+bool StateCache::load(const char* providerKey, const char* folderId, std::vector<ReadItLaterArticle>& articles,
+                      time_t* outSyncedAt) {
   articles.clear();
   const std::string path = pathFor(providerKey, folderId);
   if (!Storage.exists(path.c_str())) return false;

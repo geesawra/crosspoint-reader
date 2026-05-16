@@ -29,6 +29,7 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/ButtonNavigator.h"
+#include "util/Dictionary.h"
 #include "util/ScreenshotUtil.h"
 
 MappedInputManager mappedInputManager(gpio);
@@ -44,26 +45,26 @@ EpdFont bookerly14BoldFont(&bookerly_14_bold);
 EpdFont bookerly14ItalicFont(&bookerly_14_italic);
 EpdFont bookerly14BoldItalicFont(&bookerly_14_bolditalic);
 EpdFontFamily bookerly14FontFamily(&bookerly14RegularFont, &bookerly14BoldFont, &bookerly14ItalicFont,
-                                    &bookerly14BoldItalicFont);
+                                   &bookerly14BoldItalicFont);
 #ifndef OMIT_FONTS
 EpdFont bookerly10RegularFont(&bookerly_10_regular);
 EpdFont bookerly10BoldFont(&bookerly_10_bold);
 EpdFont bookerly10ItalicFont(&bookerly_10_italic);
 EpdFont bookerly10BoldItalicFont(&bookerly_10_bolditalic);
 EpdFontFamily bookerly10FontFamily(&bookerly10RegularFont, &bookerly10BoldFont, &bookerly10ItalicFont,
-                                    &bookerly10BoldItalicFont);
+                                   &bookerly10BoldItalicFont);
 EpdFont bookerly12RegularFont(&bookerly_12_regular);
 EpdFont bookerly12BoldFont(&bookerly_12_bold);
 EpdFont bookerly12ItalicFont(&bookerly_12_italic);
 EpdFont bookerly12BoldItalicFont(&bookerly_12_bolditalic);
 EpdFontFamily bookerly12FontFamily(&bookerly12RegularFont, &bookerly12BoldFont, &bookerly12ItalicFont,
-                                    &bookerly12BoldItalicFont);
+                                   &bookerly12BoldItalicFont);
 EpdFont bookerly16RegularFont(&bookerly_16_regular);
 EpdFont bookerly16BoldFont(&bookerly_16_bold);
 EpdFont bookerly16ItalicFont(&bookerly_16_italic);
 EpdFont bookerly16BoldItalicFont(&bookerly_16_bolditalic);
 EpdFontFamily bookerly16FontFamily(&bookerly16RegularFont, &bookerly16BoldFont, &bookerly16ItalicFont,
-                                    &bookerly16BoldItalicFont);
+                                   &bookerly16BoldItalicFont);
 EpdFont notosans10RegularFont(&notosans_10_regular);
 EpdFont notosans10BoldFont(&notosans_10_bold);
 EpdFont notosans10ItalicFont(&notosans_10_italic);
@@ -93,29 +94,32 @@ EpdFont notoserif10BoldFont(&notoserif_10_bold);
 EpdFont notoserif10ItalicFont(&notoserif_10_italic);
 EpdFont notoserif10BoldItalicFont(&notoserif_10_bolditalic);
 EpdFontFamily notoserif10FontFamily(&notoserif10RegularFont, &notoserif10BoldFont, &notoserif10ItalicFont,
-                                     &notoserif10BoldItalicFont);
+                                    &notoserif10BoldItalicFont);
 EpdFont notoserif12RegularFont(&notoserif_12_regular);
 EpdFont notoserif12BoldFont(&notoserif_12_bold);
 EpdFont notoserif12ItalicFont(&notoserif_12_italic);
 EpdFont notoserif12BoldItalicFont(&notoserif_12_bolditalic);
 EpdFontFamily notoserif12FontFamily(&notoserif12RegularFont, &notoserif12BoldFont, &notoserif12ItalicFont,
-                                     &notoserif12BoldItalicFont);
+                                    &notoserif12BoldItalicFont);
 EpdFont notoserif14RegularFont(&notoserif_14_regular);
 EpdFont notoserif14BoldFont(&notoserif_14_bold);
 EpdFont notoserif14ItalicFont(&notoserif_14_italic);
 EpdFont notoserif14BoldItalicFont(&notoserif_14_bolditalic);
 EpdFontFamily notoserif14FontFamily(&notoserif14RegularFont, &notoserif14BoldFont, &notoserif14ItalicFont,
-                                     &notoserif14BoldItalicFont);
+                                    &notoserif14BoldItalicFont);
 EpdFont notoserif16RegularFont(&notoserif_16_regular);
 EpdFont notoserif16BoldFont(&notoserif_16_bold);
 EpdFont notoserif16ItalicFont(&notoserif_16_italic);
 EpdFont notoserif16BoldItalicFont(&notoserif_16_bolditalic);
 EpdFontFamily notoserif16FontFamily(&notoserif16RegularFont, &notoserif16BoldFont, &notoserif16ItalicFont,
-                                     &notoserif16BoldItalicFont);
+                                    &notoserif16BoldItalicFont);
 #endif  // OMIT_FONTS
 
 EpdFont smallFont(&notosans_8_regular);
 EpdFontFamily smallFontFamily(&smallFont);
+
+EpdFont ipaFont(&ipa_16_regular);
+EpdFontFamily ipaFontFamily(&ipaFont);
 
 EpdFont ui10RegularFont(&ubuntu_10_regular);
 EpdFont ui10BoldFont(&ubuntu_10_bold);
@@ -183,7 +187,7 @@ void waitForPowerRelease() {
 // Enter deep sleep mode
 void enterDeepSleep() {
   HalPowerManager::Lock powerLock;  // Ensure we are at normal CPU frequency for sleep preparation
-  APP_STATE.lastSleepFromReader = activityManager.isReaderActivity();
+  APP_STATE.lastSleepFromReader = activityManager.isInReaderContext();
   APP_STATE.saveToFile();
 
   activityManager.goToSleep();
@@ -228,6 +232,7 @@ void setupDisplayAndFonts() {
   renderer.insertFont(UI_10_FONT_ID, ui10FontFamily);
   renderer.insertFont(UI_12_FONT_ID, ui12FontFamily);
   renderer.insertFont(SMALL_FONT_ID, smallFontFamily);
+  renderer.insertFont(IPA_FONT_ID, ipaFontFamily);
 
   // Discover and load SD card fonts
   sdFontSystem.begin(renderer);
@@ -268,6 +273,15 @@ void setup() {
   HalSystem::checkPanic();
 
   SETTINGS.loadFromFile();
+
+  // Clamp lookup history cap to valid range
+  if (SETTINGS.lookupHistoryCap < CrossPointSettings::HIST_CAP_MIN ||
+      SETTINGS.lookupHistoryCap > CrossPointSettings::HIST_CAP_MAX ||
+      SETTINGS.lookupHistoryCap % CrossPointSettings::HIST_CAP_STEP != 0) {
+    SETTINGS.lookupHistoryCap = CrossPointSettings::HIST_CAP_DEFAULT;
+  }
+  // Validate the stored dictionary path still exists on the SD card.
+  Dictionary::isValidDictionary();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
   KOREADER_STORE.loadFromFile();
   OPDS_STORE.loadFromFile();
@@ -354,10 +368,10 @@ void loop() {
 
   gpio.update();
   halTiltSensor.update(SETTINGS.tiltPageTurn, SETTINGS.orientation, SETTINGS.autoRotate,
-                        activityManager.isReaderActivity());
+                       activityManager.isInReaderContext());
 
   // Auto-rotate: if the physically detected orientation differs from settings, notify the current activity
-  if (SETTINGS.autoRotate && activityManager.isReaderActivity()) {
+  if (SETTINGS.autoRotate && activityManager.isInReaderContext()) {
     const uint8_t detectedOrientation = halTiltSensor.getDetectedOrientation();
     if (detectedOrientation != SETTINGS.orientation) {
       LOG_INF("MAIN", "Auto-rotate: orientation changed from %u to %u", SETTINGS.orientation, detectedOrientation);

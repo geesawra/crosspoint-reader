@@ -3,10 +3,9 @@
 #include <memory>
 #include <vector>
 
+#include "Provider.h"
 #include "activities/Activity.h"
 #include "util/ButtonNavigator.h"
-
-#include "Provider.h"
 
 /**
  * Top-level Read-it-Later screen: lists configured providers.

@@ -121,9 +121,9 @@ class CssParser {
   std::string cachePath;
 
   // Index-based lazy loading (version 5+ cache format)
-  std::vector<CssIndexEntry> index_;          // Sorted by selectorHash for binary search
-  mutable FsFile cacheFile_;                  // Kept open for random-access reads
-  mutable uint32_t rulesDataOffset_ = 0;      // Offset to rules data section in cache file
+  std::vector<CssIndexEntry> index_;      // Sorted by selectorHash for binary search
+  mutable FsFile cacheFile_;              // Kept open for random-access reads
+  mutable uint32_t rulesDataOffset_ = 0;  // Offset to rules data section in cache file
 
   // LRU cache for frequently accessed rules
   static constexpr size_t LRU_CAPACITY = 256;
