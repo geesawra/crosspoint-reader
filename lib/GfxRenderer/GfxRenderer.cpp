@@ -11,6 +11,19 @@
 
 #include "FontCacheManager.h"
 
+namespace {
+
+const char* resolveVisualText(const char* text, std::string& visualBuffer, int paragraphLevel);
+
+/**
+ * Resolves the requested style to the best available style in the given SD card font.
+ * Falls back gracefully when the font lacks the requested variant.
+ */
+uint8_t resolveSdCardStyle(const SdCardFont& font, const EpdFontFamily::Style style) {
+  return font.resolveStyle(static_cast<uint8_t>(style));
+}
+}  // namespace
+
 const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const EpdGlyph* glyph) const {
   if (fontData->groups != nullptr) {
     auto* fd = fontCacheManager_ ? fontCacheManager_->getDecompressor() : nullptr;
@@ -42,10 +55,21 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
 void GfxRenderer::ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_t styleMask) const {
   auto it = sdCardFonts_.find(fontId);
   if (it != sdCardFonts_.end()) {
+    int missed = it->second->buildAdvanceTable(utf8Text, styleMask);
+    if (missed > 0) {
+      LOG_DBG("GFX", "ensureSdCardFontReady: %d glyph(s) not found", missed);
+    }
+  }
+}
+
+void GfxRenderer::ensureSdCardFontReady(int fontId, const std::vector<std::string>& words, bool includeHyphen,
+                                        uint8_t styleMask) const {
+  auto it = sdCardFonts_.find(fontId);
+  if (it != sdCardFonts_.end()) {
     // Augment the persistent advance-only table for layout measurement.
     // The table survives across paragraphs/sections (capped per font), so
     // repeated indexing of the same SD font amortizes glyph-metric SD reads.
-    int missed = it->second->buildAdvanceTable(utf8Text, styleMask);
+    int missed = it->second->buildAdvanceTable(words, includeHyphen, styleMask);
     if (missed > 0) {
       LOG_DBG("GFX", "ensureSdCardFontReady: %d glyph(s) not found", missed);
     }
@@ -1237,7 +1261,8 @@ int GfxRenderer::getSpaceWidth(const int fontId, const EpdFontFamily::Style styl
   // Advance table fast-path for SD card fonts during layout
   auto sdIt = sdCardFonts_.find(fontId);
   if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
-    return fp4::toPixel(sdIt->second->getAdvance(' ', static_cast<uint8_t>(style)));
+    const uint8_t resolvedStyle = resolveSdCardStyle(*sdIt->second, style);
+    return fp4::toPixel(sdIt->second->getAdvance(' ', resolvedStyle));
   }
 
   const auto fontIt = fontMap.find(fontId);
@@ -1257,7 +1282,8 @@ int GfxRenderer::getSpaceAdvance(const int fontId, const uint32_t leftCp, const 
   // so we return just the space advance without kerning.
   auto sdIt = sdCardFonts_.find(fontId);
   if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
-    return fp4::toPixel(sdIt->second->getAdvance(' ', static_cast<uint8_t>(style)));
+    const uint8_t resolvedStyle = resolveSdCardStyle(*sdIt->second, style);
+    return fp4::toPixel(sdIt->second->getAdvance(' ', resolvedStyle));
   }
 
   const auto fontIt = fontMap.find(fontId);
@@ -1287,7 +1313,7 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
   auto sdIt = sdCardFonts_.find(fontId);
   if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
     int32_t widthFP = 0;
-    const uint8_t styleIdx = static_cast<uint8_t>(style);
+    const uint8_t styleIdx = resolveSdCardStyle(*sdIt->second, style);
     while (uint32_t cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text))) {
       widthFP += sdIt->second->getAdvance(cp, styleIdx);
     }
