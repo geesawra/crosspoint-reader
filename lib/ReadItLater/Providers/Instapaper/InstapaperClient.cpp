@@ -35,6 +35,13 @@ constexpr char URL_DELETE[] = "https://www.instapaper.com/api/1/bookmarks/delete
 void ensureTimeSynced() {
   if (::time(nullptr) > 1600000000) return;
 
+  // NTP sync requires a working network connection; skip if WiFi is down
+  // to avoid blocking for 15 seconds on an operation that will fail anyway.
+  if (WiFi.status() != WL_CONNECTED) {
+    LOG_DBG("INSTA", "Skipping NTP sync (no WiFi)");
+    return;
+  }
+
   if (!esp_sntp_enabled()) {
     esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
@@ -248,6 +255,10 @@ static int parseBookmarksStreaming(WiFiClient* stream, std::vector<InstapaperArt
 // Returns 0 on success. The caller is responsible for calling http.end().
 static int signedPostStreaming(const char* url, const std::vector<OAuth1Signer::Param>& bodyParams,
                                int (*parseFn)(WiFiClient*, void*), void* parseCtx) {
+  if (WiFi.status() != WL_CONNECTED) {
+    LOG_ERR("INSTA", "No WiFi — cannot perform network operation");
+    return -1;
+  }
   if (!INSTAPAPER_CREDENTIALS.hasTokens()) {
     return -1;
   }
@@ -295,6 +306,10 @@ static int signedPostStreaming(const char* url, const std::vector<OAuth1Signer::
 // Used by action endpoints that return tiny responses.
 static int signedPostSmallBuffer(const char* url, const std::vector<OAuth1Signer::Param>& bodyParams,
                                  std::string* outBody) {
+  if (WiFi.status() != WL_CONNECTED) {
+    LOG_ERR("INSTA", "No WiFi — cannot perform network operation");
+    return -1;
+  }
   if (!INSTAPAPER_CREDENTIALS.hasTokens()) {
     return -1;
   }
@@ -354,6 +369,10 @@ static int signedPostSmallBuffer(const char* url, const std::vector<OAuth1Signer
 
 // Stream HTML response directly to an SD file. Used for article body downloads.
 int signedPostStreamingToFile(const char* url, const std::vector<OAuth1Signer::Param>& bodyParams, FsFile& outFile) {
+  if (WiFi.status() != WL_CONNECTED) {
+    LOG_ERR("INSTA", "No WiFi — cannot perform network operation");
+    return -1;
+  }
   if (!INSTAPAPER_CREDENTIALS.hasTokens()) {
     return -1;
   }

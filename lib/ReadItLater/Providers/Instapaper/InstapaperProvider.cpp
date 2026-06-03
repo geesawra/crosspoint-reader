@@ -2,6 +2,7 @@
 
 #include <HalStorage.h>
 #include <Logging.h>
+#include <WiFi.h>
 
 #include <cstring>
 
@@ -68,6 +69,8 @@ Provider::Result InstapaperProvider::listFolders(std::vector<FolderInfo>& out) {
 
 Provider::Result InstapaperProvider::listArticles(const FolderInfo& folder, int limit,
                                                   std::vector<ReadItLaterArticle>& out) {
+  if (WiFi.status() != WL_CONNECTED) return Result::NETWORK_FAILED;
+
   std::vector<InstapaperArticle> instaArticles;
   const auto r = InstapaperClient::listBookmarks(toInstapaperFolder(folder.id), limit, instaArticles);
   if (r != InstapaperClient::OK) {
@@ -93,6 +96,7 @@ Provider::Result InstapaperProvider::listArticles(const FolderInfo& folder, int 
 }
 
 Provider::Result InstapaperProvider::fetchText(uint64_t articleId, const std::string& outPath) {
+  if (WiFi.status() != WL_CONNECTED) return Result::NETWORK_FAILED;
   return fromInstapaperResult(InstapaperClient::getText(articleId, outPath));
 }
 
@@ -120,6 +124,8 @@ std::vector<Provider::Action> InstapaperProvider::availableActions(const FolderI
 }
 
 Provider::Result InstapaperProvider::performAction(uint64_t articleId, Action action) {
+  if (WiFi.status() != WL_CONNECTED) return Result::NETWORK_FAILED;
+
   InstapaperClient::Result r = InstapaperClient::OK;
   switch (action) {
     case Action::Star:
@@ -142,6 +148,7 @@ Provider::Result InstapaperProvider::performAction(uint64_t articleId, Action ac
 }
 
 Provider::Result InstapaperProvider::updateProgress(uint64_t articleId, float progress) {
+  if (WiFi.status() != WL_CONNECTED) return Result::NETWORK_FAILED;
   return fromInstapaperResult(InstapaperClient::updateReadProgress(articleId, progress));
 }
 

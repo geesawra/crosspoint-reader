@@ -4,6 +4,7 @@
 #include <HalStorage.h>
 #include <Logging.h>
 #include <NetworkClientSecure.h>
+#include <WiFi.h>
 #include <WiFiClient.h>
 
 #include <cstring>
@@ -29,6 +30,13 @@ ImageFetcher::Result ImageFetcher::download(const std::string& url, const std::s
   Result out;
   if (url.empty()) return out;
   if (!startsWith(url, "http://") && !startsWith(url, "https://")) return out;
+
+  // Network fetch — must have WiFi up or the lwIP TCP/IP mutex may
+  // not be initialised, causing a null-pointer assert on first DNS lookup.
+  if (WiFi.status() != WL_CONNECTED) {
+    LOG_ERR("IMG", "No WiFi — cannot download image");
+    return out;
+  }
 
   HTTPClient http;
   NetworkClientSecure tls;
