@@ -20,7 +20,7 @@
 #include "fontIds.h"
 
 namespace {
-constexpr int LIST_LIMIT = 25;
+constexpr int LIST_LIMIT = 200;
 }  // namespace
 
 void ArticleListActivity::onEnter() {

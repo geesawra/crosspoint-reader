@@ -210,10 +210,11 @@ static void bookmarkOnObjectEnd(void* ctx) {
   b->in_bookmark = false;
 }
 
-// Parse a JSON array of bookmarks by streaming from the WiFiClient stream.
-// Returns 0 on success, -1 on failure.
-static int parseBookmarksStreaming(WiFiClient* stream, std::vector<InstapaperArticle>& out) {
-  if (!stream) return -1;
+// Parse a JSON array of bookmarks by streaming from an SD file (already
+// written by signedPostStreamingToFile). Returns 0 on success, -1 on failure.
+static int parseBookmarksFromFile(FsFile& file, std::vector<InstapaperArticle>& out) {
+  if (!file) return -1;
+  file.seek(0);
 
   BookmarkParseCtx ctx;
   ctx.out = &out;
@@ -232,75 +233,23 @@ static int parseBookmarksStreaming(WiFiClient* stream, std::vector<InstapaperArt
   StreamingJsonParser parser(cbs);
   uint8_t buf[512];
 
-  while (stream->available()) {
-    const int n = stream->read(buf, sizeof(buf));
+  while (file.available()) {
+    const int n = file.read(buf, sizeof(buf));
     if (n <= 0) break;
     parser.feed(reinterpret_cast<const char*>(buf), static_cast<size_t>(n));
     if (parser.hasError()) {
-      LOG_ERR("INSTA", "Streaming JSON parse error");
+      LOG_ERR("INSTA", "Streaming JSON parse error from file");
       return -1;
     }
   }
 
-  LOG_DBG("INSTA", "Parsed %zu bookmarks from stream", out.size());
+  LOG_DBG("INSTA", "Parsed %zu bookmarks from file", out.size());
   return 0;
 }
 
 // ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
-
-// Send a signed POST request and stream the response. `parseFn` is called
-// with the stream and user `ctx` after HTTP headers are consumed.
-// Returns 0 on success. The caller is responsible for calling http.end().
-static int signedPostStreaming(const char* url, const std::vector<OAuth1Signer::Param>& bodyParams,
-                               int (*parseFn)(WiFiClient*, void*), void* parseCtx) {
-  if (WiFi.status() != WL_CONNECTED) {
-    LOG_ERR("INSTA", "No WiFi — cannot perform network operation");
-    return -1;
-  }
-  if (!INSTAPAPER_CREDENTIALS.hasTokens()) {
-    return -1;
-  }
-
-  ensureTimeSynced();
-
-  const std::string authHeader = OAuth1Signer::buildAuthHeader(
-      "POST", url, bodyParams, INSTAPAPER_CREDENTIALS.getConsumerKey().c_str(),
-      INSTAPAPER_CREDENTIALS.getConsumerSecret().c_str(), INSTAPAPER_CREDENTIALS.getOauthToken().c_str(),
-      INSTAPAPER_CREDENTIALS.getOauthTokenSecret().c_str());
-  if (authHeader.empty()) {
-    LOG_ERR("INSTA", "Failed to build Authorization header");
-    return -1;
-  }
-
-  const std::string body = buildFormBody(bodyParams);
-
-  NetworkClientSecure tls;
-  tls.setInsecure();
-  HTTPClient http;
-
-  if (!http.begin(tls, url)) {
-    LOG_ERR("INSTA", "HTTPClient.begin failed for %s", url);
-    return -1;
-  }
-  http.addHeader("Authorization", authHeader.c_str());
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  http.addHeader("Accept", "application/json");
-
-  const int code = http.POST(const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(body.data())), body.size());
-
-  WiFiClient* stream = http.getStreamPtr();
-  if (code >= 200 && code < 300 && parseFn) {
-    if (parseFn(stream, parseCtx) != 0) {
-      http.end();
-      return -1;
-    }
-  }
-
-  http.end();
-  return code;
-}
 
 // Stream JSON from HTTP response into a small fixed buffer for error checking.
 // Used by action endpoints that return tiny responses.
@@ -367,8 +316,10 @@ static int signedPostSmallBuffer(const char* url, const std::vector<OAuth1Signer
   return code;
 }
 
-// Stream HTML response directly to an SD file. Used for article body downloads.
-int signedPostStreamingToFile(const char* url, const std::vector<OAuth1Signer::Param>& bodyParams, FsFile& outFile) {
+// Stream response directly to an SD file. Used for article body downloads
+// and bookmark list JSON.
+static int signedPostStreamingToFile(const char* url, const std::vector<OAuth1Signer::Param>& bodyParams,
+                                     FsFile& outFile, const char* acceptHeader = "text/html,*/*") {
   if (WiFi.status() != WL_CONNECTED) {
     LOG_ERR("INSTA", "No WiFi — cannot perform network operation");
     return -1;
@@ -394,7 +345,7 @@ int signedPostStreamingToFile(const char* url, const std::vector<OAuth1Signer::P
   if (!http.begin(tls, url)) return -1;
   http.addHeader("Authorization", authHeader.c_str());
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  http.addHeader("Accept", "text/html,*/*");
+  http.addHeader("Accept", acceptHeader);
 
   const int code = http.POST(const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(body.data())), body.size());
   if (code >= 200 && code < 300) {
@@ -499,18 +450,6 @@ InstapaperClient::ActionResult InstapaperClient::listBookmarks(InstapaperFolder 
     return {NO_TOKENS, "Instapaper credentials not loaded — run instapaper_auth.py"};
   if (limit < 1) limit = 100;
 
-  // Calculate required heap: each InstapaperArticle is ~280 bytes.
-  // Add a 90 KB buffer for the WiFi / TLS / parser overhead.
-  constexpr size_t NETWORK_OVERHEAD = 90 * 1024;
-  const size_t required = NETWORK_OVERHEAD + static_cast<size_t>(limit) * sizeof(InstapaperArticle);
-  const size_t freeHeap = ESP.getFreeHeap();
-  if (freeHeap < required) {
-    char msg[80];
-    std::snprintf(msg, sizeof(msg), "Not enough memory (%zu KB free, %zu KB needed)", freeHeap / 1024, required / 1024);
-    LOG_ERR("INSTA", "Heap too low (%zu bytes) to fetch %d bookmarks", freeHeap, limit);
-    return {INSUFFICIENT_MEMORY, msg};
-  }
-
   char limitStr[8];
   std::snprintf(limitStr, sizeof(limitStr), "%d", limit);
 
@@ -518,20 +457,51 @@ InstapaperClient::ActionResult InstapaperClient::listBookmarks(InstapaperFolder 
   params.push_back({"limit", limitStr});
   params.push_back({"folder_id", folderId(folder)});
 
-  // Use streaming JSON parser — no heap allocation proportional to response.
-  const int code = signedPostStreaming(
-      URL_LIST, params,
-      [](WiFiClient* stream, void* ctx) -> int {
-        return parseBookmarksStreaming(stream, *static_cast<std::vector<InstapaperArticle>*>(ctx));
-      },
-      &out);
+  // Stream JSON response to a temp file on SD so the HTTP body never
+  // competes with the output vector for heap.
+  constexpr char TMP_PATH[] = "/.crosspoint/read-it-later/.insta_list.tmp";
+  FsFile tmpFile;
+  if (!Storage.openFileForWrite("INSTA", TMP_PATH, tmpFile)) {
+    LOG_ERR("INSTA", "Cannot open temp file for bookmark list");
+    return {INSUFFICIENT_MEMORY, "Cannot write to SD card"};
+  }
+
+  const int code = signedPostStreamingToFile(URL_LIST, params, tmpFile, "application/json");
+  tmpFile.close();
+
+  ActionResult result;
+  if (code < 0) {
+    result = {NETWORK_FAILED, "SSL or DNS failure"};
+  } else {
+    result = mapHttpCode(code, {});
+  }
+
+  if (!result.isOk()) {
+    Storage.remove(TMP_PATH);
+    return result;
+  }
+
+  // Parse the JSON from SD into the output vector.
+  HalFile readFile;
+  if (!Storage.openFileForRead("INSTA", TMP_PATH, readFile)) {
+    Storage.remove(TMP_PATH);
+    return {PARSE_FAILED, "Failed to reopen temp file for parsing"};
+  }
+
+  if (parseBookmarksFromFile(readFile, out) != 0) {
+    readFile.close();
+    Storage.remove(TMP_PATH);
+    return {PARSE_FAILED, "Failed to parse bookmark JSON"};
+  }
+  readFile.close();
+  Storage.remove(TMP_PATH);
 
   // Sort most-recent-first by saved_at. Instapaper's default order is usually
   // chronological but not contractually guaranteed; enforce it here.
   std::sort(out.begin(), out.end(),
             [](const InstapaperArticle& a, const InstapaperArticle& b) { return a.saved_at > b.saved_at; });
 
-  return mapHttpCode(code, {});
+  return {OK, {}};
 }
 
 InstapaperClient::ActionResult InstapaperClient::getText(uint64_t bookmarkId, const std::string& outPath) {
