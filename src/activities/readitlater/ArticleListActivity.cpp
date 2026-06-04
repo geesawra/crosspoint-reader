@@ -256,8 +256,7 @@ void ArticleListActivity::render(RenderLock&&) {
   }
 
   if (state == FETCH_FAILED) {
-    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 30, errorMessage.c_str(), true,
-                              EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 30, errorMessage.c_str(), true, EpdFontFamily::BOLD);
     if (!errorDetail.empty()) {
       renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 5, errorDetail.c_str());
     }
