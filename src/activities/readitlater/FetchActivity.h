@@ -35,6 +35,7 @@ class FetchActivity final : public Activity {
   ReadItLaterArticle article;
   State state = FETCHING_TEXT;
   std::string errorMessage;
+  std::string errorDetail;
   std::string epubPath;
   int buildPercent = 0;
   std::string buildLabel;

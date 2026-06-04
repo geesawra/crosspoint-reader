@@ -40,6 +40,7 @@ class ArticleListActivity final : public Activity {
   ButtonNavigator buttonNavigator;
   std::vector<ReadItLaterArticle> articles;
   std::string errorMessage;
+  std::string errorDetail;
   time_t lastSyncedAt = 0;
   bool offline = false;
   bool pendingRefresh = false;

@@ -201,8 +201,6 @@ void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const 
       const float absY = fabsf(ay);
       const float absZ = fabsf(az);
 
-      LOG_DBG("GYR", "Accel: x=%.2f y=%.2f z=%.2f", ax, ay, az);
-
       uint8_t newOrientation = orientation;
       if (absZ > ACCEL_FLAT_THRESHOLD && absZ > absX && absZ > absY) {
         // Device is roughly flat; keep current orientation

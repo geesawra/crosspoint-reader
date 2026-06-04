@@ -20,7 +20,7 @@
 #include "fontIds.h"
 
 namespace {
-constexpr int LIST_LIMIT = 50;
+constexpr int LIST_LIMIT = 25;
 }  // namespace
 
 void ArticleListActivity::onEnter() {
@@ -81,6 +81,7 @@ void ArticleListActivity::performFetch(bool showProgress) {
     } else {
       state = FETCH_FAILED;
       errorMessage = "No WiFi";
+      errorDetail.clear();
     }
     requestUpdate();
     return;
@@ -125,10 +126,12 @@ void ArticleListActivity::performFetch(bool showProgress) {
       // Stay on cached data, just mark as offline.
       offline = true;
       errorMessage = Provider::errorString(r.code);
+      errorDetail = r.message;
       state = SHOWING_LIST;
     } else {
       state = FETCH_FAILED;
       errorMessage = Provider::errorString(r.code);
+      errorDetail = r.message;
     }
   }
   requestUpdate(true);
@@ -253,10 +256,11 @@ void ArticleListActivity::render(RenderLock&&) {
   }
 
   if (state == FETCH_FAILED) {
-    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 30, tr(STR_INSTAPAPER_AUTH_FAILED), true,
+    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 30, errorMessage.c_str(), true,
                               EpdFontFamily::BOLD);
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_INSTAPAPER_AUTH_HINT));
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 25, errorMessage.c_str());
+    if (!errorDetail.empty()) {
+      renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 5, errorDetail.c_str());
+    }
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
     renderer.displayBuffer();

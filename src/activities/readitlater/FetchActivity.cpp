@@ -87,6 +87,7 @@ void FetchActivity::performWork() {
     RenderLock lock(*this);
     state = FAILED;
     errorMessage = Provider::errorString(fetchResult.code);
+    errorDetail = fetchResult.message;
     requestUpdate(true);
     return;
   }
@@ -167,10 +168,11 @@ void FetchActivity::render(RenderLock&&) {
     std::snprintf(pctStr, sizeof(pctStr), "%d%%", buildPercent);
     renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 40, pctStr);
   } else if (state == FAILED) {
-    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 30, tr(STR_INSTAPAPER_AUTH_FAILED), true,
+    renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 30, errorMessage.c_str(), true,
                               EpdFontFamily::BOLD);
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_INSTAPAPER_AUTH_HINT));
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 25, errorMessage.c_str());
+    if (!errorDetail.empty()) {
+      renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 5, errorDetail.c_str());
+    }
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
