@@ -223,7 +223,9 @@ bool HalGPIO::wasAnyReleased() const { return inputMgr.wasAnyReleased(); }
 
 unsigned long HalGPIO::getHeldTime() const { return inputMgr.getHeldTime(); }
 
-unsigned long HalGPIO::getPowerButtonHeldTime() const { return inputMgr.getHeldTime(); }  // TODO: getPowerButtonHeldTime missing in SDK
+unsigned long HalGPIO::getPowerButtonHeldTime() const {
+  return inputMgr.getHeldTime();
+}  // TODO: getPowerButtonHeldTime missing in SDK
 
 void HalGPIO::startDeepSleep() {
   // Ensure that the power button has been released to avoid immediately turning back on if you're holding it

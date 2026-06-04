@@ -41,17 +41,39 @@ InstapaperFolder InstapaperProvider::toInstapaperFolder(const char* folderId) {
 Provider::Result InstapaperProvider::fromInstapaperResult(const InstapaperClient::ActionResult& ar) {
   Provider::Result::Code code;
   switch (ar.result) {
-    case InstapaperClient::OK:                 code = Provider::Result::Code::OK; break;
-    case InstapaperClient::NO_TOKENS:          code = Provider::Result::Code::NO_TOKENS; break;
-    case InstapaperClient::AUTH_FAILED:        code = Provider::Result::Code::AUTH_FAILED; break;
-    case InstapaperClient::FORBIDDEN:          code = Provider::Result::Code::FORBIDDEN; break;
-    case InstapaperClient::NOT_FOUND:          code = Provider::Result::Code::NOT_FOUND; break;
-    case InstapaperClient::NETWORK_FAILED:     code = Provider::Result::Code::NETWORK_FAILED; break;
-    case InstapaperClient::PARSE_FAILED:       code = Provider::Result::Code::PARSE_FAILED; break;
-    case InstapaperClient::RATE_LIMITED:       code = Provider::Result::Code::RATE_LIMITED; break;
-    case InstapaperClient::INSUFFICIENT_MEMORY: code = Provider::Result::Code::INSUFFICIENT_MEMORY; break;
-    case InstapaperClient::INTERNAL_ERROR:     code = Provider::Result::Code::INTERNAL_ERROR; break;
-    default:                                    code = Provider::Result::Code::INTERNAL_ERROR; break;
+    case InstapaperClient::OK:
+      code = Provider::Result::Code::OK;
+      break;
+    case InstapaperClient::NO_TOKENS:
+      code = Provider::Result::Code::NO_TOKENS;
+      break;
+    case InstapaperClient::AUTH_FAILED:
+      code = Provider::Result::Code::AUTH_FAILED;
+      break;
+    case InstapaperClient::FORBIDDEN:
+      code = Provider::Result::Code::FORBIDDEN;
+      break;
+    case InstapaperClient::NOT_FOUND:
+      code = Provider::Result::Code::NOT_FOUND;
+      break;
+    case InstapaperClient::NETWORK_FAILED:
+      code = Provider::Result::Code::NETWORK_FAILED;
+      break;
+    case InstapaperClient::PARSE_FAILED:
+      code = Provider::Result::Code::PARSE_FAILED;
+      break;
+    case InstapaperClient::RATE_LIMITED:
+      code = Provider::Result::Code::RATE_LIMITED;
+      break;
+    case InstapaperClient::INSUFFICIENT_MEMORY:
+      code = Provider::Result::Code::INSUFFICIENT_MEMORY;
+      break;
+    case InstapaperClient::INTERNAL_ERROR:
+      code = Provider::Result::Code::INTERNAL_ERROR;
+      break;
+    default:
+      code = Provider::Result::Code::INTERNAL_ERROR;
+      break;
   }
   return {code, ar.message};
 }
@@ -67,8 +89,7 @@ Provider::Result InstapaperProvider::listFolders(std::vector<FolderInfo>& out) {
 
 Provider::Result InstapaperProvider::listArticles(const FolderInfo& folder, int limit,
                                                   std::vector<ReadItLaterArticle>& out) {
-  if (WiFi.status() != WL_CONNECTED)
-    return {Provider::Result::Code::NETWORK_FAILED, "No WiFi connection"};
+  if (WiFi.status() != WL_CONNECTED) return {Provider::Result::Code::NETWORK_FAILED, "No WiFi connection"};
 
   std::vector<InstapaperArticle> instaArticles;
   const auto r = InstapaperClient::listBookmarks(toInstapaperFolder(folder.id), limit, instaArticles);
@@ -95,8 +116,7 @@ Provider::Result InstapaperProvider::listArticles(const FolderInfo& folder, int 
 }
 
 Provider::Result InstapaperProvider::fetchText(uint64_t articleId, const std::string& outPath) {
-  if (WiFi.status() != WL_CONNECTED)
-    return {Provider::Result::Code::NETWORK_FAILED, "No WiFi connection"};
+  if (WiFi.status() != WL_CONNECTED) return {Provider::Result::Code::NETWORK_FAILED, "No WiFi connection"};
   return fromInstapaperResult(InstapaperClient::getText(articleId, outPath));
 }
 
@@ -124,8 +144,7 @@ std::vector<Provider::Action> InstapaperProvider::availableActions(const FolderI
 }
 
 Provider::Result InstapaperProvider::performAction(uint64_t articleId, Action action) {
-  if (WiFi.status() != WL_CONNECTED)
-    return {Provider::Result::Code::NETWORK_FAILED, "No WiFi connection"};
+  if (WiFi.status() != WL_CONNECTED) return {Provider::Result::Code::NETWORK_FAILED, "No WiFi connection"};
 
   InstapaperClient::ActionResult r;
   switch (action) {
@@ -149,8 +168,7 @@ Provider::Result InstapaperProvider::performAction(uint64_t articleId, Action ac
 }
 
 Provider::Result InstapaperProvider::updateProgress(uint64_t articleId, float progress) {
-  if (WiFi.status() != WL_CONNECTED)
-    return {Provider::Result::Code::NETWORK_FAILED, "No WiFi connection"};
+  if (WiFi.status() != WL_CONNECTED) return {Provider::Result::Code::NETWORK_FAILED, "No WiFi connection"};
   return fromInstapaperResult(InstapaperClient::updateReadProgress(articleId, progress));
 }
 

@@ -506,8 +506,7 @@ InstapaperClient::ActionResult InstapaperClient::listBookmarks(InstapaperFolder 
   const size_t freeHeap = ESP.getFreeHeap();
   if (freeHeap < required) {
     char msg[80];
-    std::snprintf(msg, sizeof(msg), "Not enough memory (%zu KB free, %zu KB needed)",
-                  freeHeap / 1024, required / 1024);
+    std::snprintf(msg, sizeof(msg), "Not enough memory (%zu KB free, %zu KB needed)", freeHeap / 1024, required / 1024);
     LOG_ERR("INSTA", "Heap too low (%zu bytes) to fetch %d bookmarks", freeHeap, limit);
     return {INSUFFICIENT_MEMORY, msg};
   }
@@ -544,8 +543,7 @@ InstapaperClient::ActionResult InstapaperClient::getText(uint64_t bookmarkId, co
   const size_t freeHeap = ESP.getFreeHeap();
   if (freeHeap < MIN_HEAP) {
     char msg[64];
-    std::snprintf(msg, sizeof(msg), "Not enough memory (%zu KB free, %zu KB needed)",
-                  freeHeap / 1024, MIN_HEAP / 1024);
+    std::snprintf(msg, sizeof(msg), "Not enough memory (%zu KB free, %zu KB needed)", freeHeap / 1024, MIN_HEAP / 1024);
     LOG_ERR("INSTA", "Heap too low (%zu bytes) to fetch article", freeHeap);
     return {INSUFFICIENT_MEMORY, msg};
   }
@@ -579,8 +577,7 @@ InstapaperClient::ActionResult InstapaperClient::getText(uint64_t bookmarkId, co
 
 namespace {
 InstapaperClient::ActionResult actionWithBookmarkId(const char* url, uint64_t bookmarkId) {
-  if (!INSTAPAPER_CREDENTIALS.hasTokens())
-    return {InstapaperClient::NO_TOKENS, "Instapaper credentials not loaded"};
+  if (!INSTAPAPER_CREDENTIALS.hasTokens()) return {InstapaperClient::NO_TOKENS, "Instapaper credentials not loaded"};
   char idStr[24];
   std::snprintf(idStr, sizeof(idStr), "%llu", static_cast<unsigned long long>(bookmarkId));
   std::vector<OAuth1Signer::Param> params;
@@ -592,8 +589,7 @@ InstapaperClient::ActionResult actionWithBookmarkId(const char* url, uint64_t bo
 }  // namespace
 
 InstapaperClient::ActionResult InstapaperClient::updateReadProgress(uint64_t bookmarkId, float progress) {
-  if (!INSTAPAPER_CREDENTIALS.hasTokens())
-    return {NO_TOKENS, "Instapaper credentials not loaded"};
+  if (!INSTAPAPER_CREDENTIALS.hasTokens()) return {NO_TOKENS, "Instapaper credentials not loaded"};
   if (progress < 0.0f) progress = 0.0f;
   if (progress > 1.0f) progress = 1.0f;
 
@@ -617,5 +613,9 @@ InstapaperClient::ActionResult InstapaperClient::updateReadProgress(uint64_t boo
 InstapaperClient::ActionResult InstapaperClient::star(uint64_t id) { return actionWithBookmarkId(URL_STAR, id); }
 InstapaperClient::ActionResult InstapaperClient::unstar(uint64_t id) { return actionWithBookmarkId(URL_UNSTAR, id); }
 InstapaperClient::ActionResult InstapaperClient::archive(uint64_t id) { return actionWithBookmarkId(URL_ARCHIVE, id); }
-InstapaperClient::ActionResult InstapaperClient::unarchive(uint64_t id) { return actionWithBookmarkId(URL_UNARCHIVE, id); }
-InstapaperClient::ActionResult InstapaperClient::deleteBookmark(uint64_t id) { return actionWithBookmarkId(URL_DELETE, id); }
+InstapaperClient::ActionResult InstapaperClient::unarchive(uint64_t id) {
+  return actionWithBookmarkId(URL_UNARCHIVE, id);
+}
+InstapaperClient::ActionResult InstapaperClient::deleteBookmark(uint64_t id) {
+  return actionWithBookmarkId(URL_DELETE, id);
+}
