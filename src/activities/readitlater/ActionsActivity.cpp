@@ -73,7 +73,7 @@ void ActionsActivity::runSelectedAction() {
   const auto r = provider->performAction(article.id, action);
 
   // Best-effort local cache cleanup on destructive actions.
-  if (r == Provider::Result::OK && action == Provider::Action::Delete) {
+  if (r.isOk() && action == Provider::Action::Delete) {
     const std::string epubPath = provider->epubPathFor(article.id);
     if (Storage.exists(epubPath.c_str())) {
       Storage.remove(epubPath.c_str());
@@ -82,12 +82,12 @@ void ActionsActivity::runSelectedAction() {
 
   {
     RenderLock lock(*this);
-    if (r == Provider::Result::OK) {
+    if (r.isOk()) {
       state = DONE;
       message = labelFor(action);
     } else {
       state = FAILED;
-      message = provider->errorString(r);
+      message = Provider::errorString(r.code);
     }
   }
   requestUpdate(true);

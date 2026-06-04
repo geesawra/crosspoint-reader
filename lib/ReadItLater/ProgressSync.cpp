@@ -29,8 +29,8 @@ bool ProgressSync::pushForPath(const std::string& epubPath, float progress) {
     const uint64_t articleId = provider->extractArticleId(epubPath);
     if (articleId != 0) {
       const auto r = provider->updateProgress(articleId, progress);
-      if (r != Provider::Result::OK) {
-        LOG_ERR("RIL", "Progress sync failed for %s: %s", provider->name(), Provider::errorString(r));
+      if (!r.isOk()) {
+        LOG_ERR("RIL", "Progress sync failed for %s: %s", provider->name(), Provider::errorString(r.code));
         return false;
       }
       LOG_DBG("RIL", "Synced progress via %s: id=%llu progress=%.3f", provider->name(),

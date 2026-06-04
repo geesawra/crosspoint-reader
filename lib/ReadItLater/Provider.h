@@ -39,17 +39,27 @@ class Provider {
 
   // ---------- Result / errors ----------
 
-  enum class Result : uint8_t {
-    OK = 0,
-    NO_TOKENS,
-    AUTH_FAILED,
-    NETWORK_FAILED,
-    PARSE_FAILED,
-    RATE_LIMITED,
-    SERVER_ERROR,
+  struct Result {
+    enum Code : uint8_t {
+      OK = 0,
+      NO_TOKENS,
+      AUTH_FAILED,
+      NETWORK_FAILED,
+      PARSE_FAILED,
+      RATE_LIMITED,
+      SERVER_ERROR,
+      FORBIDDEN,
+      NOT_FOUND,
+      INSUFFICIENT_MEMORY,
+      INTERNAL_ERROR,
+    };
+    Code code;
+    std::string message;
+
+    bool isOk() const { return code == OK; }
   };
 
-  static const char* errorString(Result r);
+  static const char* errorString(Result::Code code);
 
   // ---------- Folders ----------
 

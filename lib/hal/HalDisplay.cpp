@@ -22,7 +22,7 @@ void HalDisplay::begin(bool seamless) {
     // Defuse the SDK's X3 _x3InitialFullSyncsRemaining counter (no-op on X4)
     // so the first paint isn't promoted to FULL (~770ms). Skips the wakeup-
     // gated requestResync() below for the same reason.
-    einkDisplay.skipInitialResync();
+    // einkDisplay.skipInitialResync();  // TODO: method missing in SDK
     return;
   }
   // Request resync after specific wakeup events to ensure clean display state.

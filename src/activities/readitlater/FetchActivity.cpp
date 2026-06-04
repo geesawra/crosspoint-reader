@@ -83,10 +83,10 @@ void FetchActivity::performWork() {
   const std::string htmlTmpPath(htmlTmpBuf);
 
   const auto fetchResult = provider->fetchText(article.id, htmlTmpPath);
-  if (fetchResult != Provider::Result::OK) {
+  if (!fetchResult.isOk()) {
     RenderLock lock(*this);
     state = FAILED;
-    errorMessage = provider->errorString(fetchResult);
+    errorMessage = Provider::errorString(fetchResult.code);
     requestUpdate(true);
     return;
   }

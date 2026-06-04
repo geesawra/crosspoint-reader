@@ -427,23 +427,41 @@ int signedPostStreamingToFile(const char* url, const std::vector<OAuth1Signer::P
 // Response mapping
 // ---------------------------------------------------------------------------
 
-static InstapaperClient::Result mapHttpCode(int code, const std::string& jsonBody) {
-  if (code < 0) return InstapaperClient::NETWORK_FAILED;
-  if (code == 401 || code == 403) return InstapaperClient::AUTH_FAILED;
-  if (code == 429) return InstapaperClient::RATE_LIMITED;
+static InstapaperClient::ActionResult mapHttpCode(int code, const std::string& jsonBody) {
+  const auto makeResult = [&](InstapaperClient::Result r, const char* defaultMsg) -> InstapaperClient::ActionResult {
+    if (!jsonBody.empty()) {
+      size_t msgPos = jsonBody.find("\"message\":\"");
+      if (msgPos != std::string::npos) {
+        msgPos += 11;
+        size_t msgEnd = jsonBody.find('"', msgPos);
+        if (msgEnd != std::string::npos) {
+          return {r, jsonBody.substr(msgPos, msgEnd - msgPos)};
+        }
+      }
+    }
+    return {r, defaultMsg};
+  };
+
+  if (code < 0) return {InstapaperClient::NETWORK_FAILED, "SSL or DNS failure"};
+  if (code == 401) return makeResult(InstapaperClient::AUTH_FAILED, "Access denied — token may be invalid or expired");
+  if (code == 403) return makeResult(InstapaperClient::FORBIDDEN, "Access forbidden — account may be restricted");
+  if (code == 404) return makeResult(InstapaperClient::NOT_FOUND, "The requested resource was not found");
+  if (code == 429) return makeResult(InstapaperClient::RATE_LIMITED, "Too many requests — please wait a few minutes");
   if (code >= 200 && code < 300) {
     if (!jsonBody.empty() && jsonBody.find("\"type\":\"error\"") != std::string::npos) {
-      if (jsonBody.find("\"error_code\":1040") != std::string::npos) return InstapaperClient::RATE_LIMITED;
-      if (jsonBody.find("\"error_code\":403") != std::string::npos ||
-          jsonBody.find("\"error_code\":1420") != std::string::npos ||
-          jsonBody.find("\"error_code\":1430") != std::string::npos) {
-        return InstapaperClient::AUTH_FAILED;
-      }
-      return InstapaperClient::SERVER_ERROR;
+      if (jsonBody.find("\"error_code\":1040") != std::string::npos)
+        return makeResult(InstapaperClient::RATE_LIMITED, "Too many requests — please wait a few minutes");
+      if (jsonBody.find("\"error_code\":403") != std::string::npos)
+        return makeResult(InstapaperClient::FORBIDDEN, "Access forbidden — account may be restricted");
+      if (jsonBody.find("\"error_code\":1420") != std::string::npos)
+        return makeResult(InstapaperClient::FORBIDDEN, "Account suspended or access revoked");
+      if (jsonBody.find("\"error_code\":1430") != std::string::npos)
+        return makeResult(InstapaperClient::FORBIDDEN, "Account subscription expired");
+      return makeResult(InstapaperClient::INTERNAL_ERROR, "Unknown API error");
     }
-    return InstapaperClient::OK;
+    return {InstapaperClient::OK, {}};
   }
-  return InstapaperClient::SERVER_ERROR;
+  return makeResult(InstapaperClient::INTERNAL_ERROR, "Server error");
 }
 
 }  // namespace
@@ -456,31 +474,42 @@ const char* InstapaperClient::errorString(Result r) {
       return "No tokens loaded";
     case AUTH_FAILED:
       return "Auth failed";
+    case FORBIDDEN:
+      return "Access denied";
+    case NOT_FOUND:
+      return "Not found";
     case NETWORK_FAILED:
       return "Network error";
     case PARSE_FAILED:
       return "Response parse error";
     case RATE_LIMITED:
       return "Rate limited";
-    case SERVER_ERROR:
-      return "Server error";
+    case INSUFFICIENT_MEMORY:
+      return "Device memory low";
+    case INTERNAL_ERROR:
+      return "Internal error";
   }
   return "Unknown";
 }
 
-InstapaperClient::Result InstapaperClient::listBookmarks(InstapaperFolder folder, int limit,
-                                                         std::vector<InstapaperArticle>& out) {
+InstapaperClient::ActionResult InstapaperClient::listBookmarks(InstapaperFolder folder, int limit,
+                                                               std::vector<InstapaperArticle>& out) {
   out.clear();
-  if (!INSTAPAPER_CREDENTIALS.hasTokens()) return NO_TOKENS;
-  if (limit < 1) limit = 100;  // Instapaper API default; streaming parser handles any size safely
+  if (!INSTAPAPER_CREDENTIALS.hasTokens())
+    return {NO_TOKENS, "Instapaper credentials not loaded — run instapaper_auth.py"};
+  if (limit < 1) limit = 100;
 
-  // Guardrail: refuse to fetch if heap is critically low. Even though JSON
-  // parsing is now streaming, the output vector grows proportionally to
-  // `limit` (each InstapaperArticle is ~150 bytes).  With WiFi stack taking
-  // ~80 KB, we need at least 100 KB free to avoid OOM.
-  if (ESP.getFreeHeap() < 100 * 1024) {
-    LOG_ERR("INSTA", "Heap too low (%d bytes) to fetch bookmarks", ESP.getFreeHeap());
-    return NETWORK_FAILED;
+  // Calculate required heap: each InstapaperArticle is ~280 bytes.
+  // Add a 90 KB buffer for the WiFi / TLS / parser overhead.
+  constexpr size_t NETWORK_OVERHEAD = 90 * 1024;
+  const size_t required = NETWORK_OVERHEAD + static_cast<size_t>(limit) * sizeof(InstapaperArticle);
+  const size_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < required) {
+    char msg[80];
+    std::snprintf(msg, sizeof(msg), "Not enough memory (%zu KB free, %zu KB needed)",
+                  freeHeap / 1024, required / 1024);
+    LOG_ERR("INSTA", "Heap too low (%zu bytes) to fetch %d bookmarks", freeHeap, limit);
+    return {INSUFFICIENT_MEMORY, msg};
   }
 
   char limitStr[8];
@@ -506,13 +535,19 @@ InstapaperClient::Result InstapaperClient::listBookmarks(InstapaperFolder folder
   return mapHttpCode(code, {});
 }
 
-InstapaperClient::Result InstapaperClient::getText(uint64_t bookmarkId, const std::string& outPath) {
-  if (!INSTAPAPER_CREDENTIALS.hasTokens()) return NO_TOKENS;
+InstapaperClient::ActionResult InstapaperClient::getText(uint64_t bookmarkId, const std::string& outPath) {
+  if (!INSTAPAPER_CREDENTIALS.hasTokens())
+    return {NO_TOKENS, "Instapaper credentials not loaded — run instapaper_auth.py"};
 
   // Guardrail: refuse if heap is critically low.
-  if (ESP.getFreeHeap() < 64 * 1024) {
-    LOG_ERR("INSTA", "Heap too low (%d bytes) to fetch article", ESP.getFreeHeap());
-    return NETWORK_FAILED;
+  constexpr size_t MIN_HEAP = 64 * 1024;
+  const size_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < MIN_HEAP) {
+    char msg[64];
+    std::snprintf(msg, sizeof(msg), "Not enough memory (%zu KB free, %zu KB needed)",
+                  freeHeap / 1024, MIN_HEAP / 1024);
+    LOG_ERR("INSTA", "Heap too low (%zu bytes) to fetch article", freeHeap);
+    return {INSUFFICIENT_MEMORY, msg};
   }
 
   char idStr[24];
@@ -524,7 +559,7 @@ InstapaperClient::Result InstapaperClient::getText(uint64_t bookmarkId, const st
   FsFile file;
   if (!Storage.openFileForWrite("INSTA", outPath.c_str(), file)) {
     LOG_ERR("INSTA", "Cannot open HTML temp file: %s", outPath.c_str());
-    return NETWORK_FAILED;
+    return {NETWORK_FAILED, "Cannot write to SD card"};
   }
 
   const int code = signedPostStreamingToFile(URL_GET_TEXT, params, file);
@@ -532,19 +567,20 @@ InstapaperClient::Result InstapaperClient::getText(uint64_t bookmarkId, const st
 
   if (code < 0) {
     Storage.remove(outPath.c_str());
-    return NETWORK_FAILED;
+    return {NETWORK_FAILED, "SSL or DNS failure"};
   }
 
-  const Result r = mapHttpCode(code, {});
-  if (r != OK) {
+  ActionResult r = mapHttpCode(code, {});
+  if (!r.isOk()) {
     Storage.remove(outPath.c_str());
   }
   return r;
 }
 
 namespace {
-InstapaperClient::Result actionWithBookmarkId(const char* url, uint64_t bookmarkId) {
-  if (!INSTAPAPER_CREDENTIALS.hasTokens()) return InstapaperClient::NO_TOKENS;
+InstapaperClient::ActionResult actionWithBookmarkId(const char* url, uint64_t bookmarkId) {
+  if (!INSTAPAPER_CREDENTIALS.hasTokens())
+    return {InstapaperClient::NO_TOKENS, "Instapaper credentials not loaded"};
   char idStr[24];
   std::snprintf(idStr, sizeof(idStr), "%llu", static_cast<unsigned long long>(bookmarkId));
   std::vector<OAuth1Signer::Param> params;
@@ -555,8 +591,9 @@ InstapaperClient::Result actionWithBookmarkId(const char* url, uint64_t bookmark
 }
 }  // namespace
 
-InstapaperClient::Result InstapaperClient::updateReadProgress(uint64_t bookmarkId, float progress) {
-  if (!INSTAPAPER_CREDENTIALS.hasTokens()) return NO_TOKENS;
+InstapaperClient::ActionResult InstapaperClient::updateReadProgress(uint64_t bookmarkId, float progress) {
+  if (!INSTAPAPER_CREDENTIALS.hasTokens())
+    return {NO_TOKENS, "Instapaper credentials not loaded"};
   if (progress < 0.0f) progress = 0.0f;
   if (progress > 1.0f) progress = 1.0f;
 
@@ -577,8 +614,8 @@ InstapaperClient::Result InstapaperClient::updateReadProgress(uint64_t bookmarkI
   return mapHttpCode(code, body);
 }
 
-InstapaperClient::Result InstapaperClient::star(uint64_t id) { return actionWithBookmarkId(URL_STAR, id); }
-InstapaperClient::Result InstapaperClient::unstar(uint64_t id) { return actionWithBookmarkId(URL_UNSTAR, id); }
-InstapaperClient::Result InstapaperClient::archive(uint64_t id) { return actionWithBookmarkId(URL_ARCHIVE, id); }
-InstapaperClient::Result InstapaperClient::unarchive(uint64_t id) { return actionWithBookmarkId(URL_UNARCHIVE, id); }
-InstapaperClient::Result InstapaperClient::deleteBookmark(uint64_t id) { return actionWithBookmarkId(URL_DELETE, id); }
+InstapaperClient::ActionResult InstapaperClient::star(uint64_t id) { return actionWithBookmarkId(URL_STAR, id); }
+InstapaperClient::ActionResult InstapaperClient::unstar(uint64_t id) { return actionWithBookmarkId(URL_UNSTAR, id); }
+InstapaperClient::ActionResult InstapaperClient::archive(uint64_t id) { return actionWithBookmarkId(URL_ARCHIVE, id); }
+InstapaperClient::ActionResult InstapaperClient::unarchive(uint64_t id) { return actionWithBookmarkId(URL_UNARCHIVE, id); }
+InstapaperClient::ActionResult InstapaperClient::deleteBookmark(uint64_t id) { return actionWithBookmarkId(URL_DELETE, id); }

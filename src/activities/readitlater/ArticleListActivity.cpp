@@ -99,7 +99,7 @@ void ArticleListActivity::performFetch(bool showProgress) {
   std::vector<ReadItLaterArticle> fresh;
   const auto r = provider->listArticles(folder, LIST_LIMIT, fresh);
 
-  if (r == Provider::Result::OK) {
+  if (r.isOk()) {
     StateCache::save(provider->cacheDirName(), folder.id, fresh);
     {
       RenderLock lock(*this);
@@ -124,11 +124,11 @@ void ArticleListActivity::performFetch(bool showProgress) {
     if (hadCachedList) {
       // Stay on cached data, just mark as offline.
       offline = true;
-      errorMessage = provider->errorString(r);
+      errorMessage = Provider::errorString(r.code);
       state = SHOWING_LIST;
     } else {
       state = FETCH_FAILED;
-      errorMessage = provider->errorString(r);
+      errorMessage = Provider::errorString(r.code);
     }
   }
   requestUpdate(true);

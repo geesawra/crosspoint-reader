@@ -37,5 +37,5 @@ class InstapaperProvider : public Provider {
 
  private:
   static InstapaperFolder toInstapaperFolder(const char* folderId);
-  static Result fromInstapaperResult(InstapaperClient::Result r);
+  static Result fromInstapaperResult(const InstapaperClient::ActionResult& ar);
 };

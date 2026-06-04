@@ -92,8 +92,8 @@ void DownloadAllActivity::performDownloads() {
     }
 
     const auto r = provider->fetchText(a.id, htmlTmpPath);
-    if (r != Provider::Result::OK) {
-      LOG_ERR("RIL", "Download-all: %s failed (%s)", a.title, provider->errorString(r));
+    if (!r.isOk()) {
+      LOG_ERR("RIL", "Download-all: %s failed (%s)", a.title, Provider::errorString(r.code));
       Storage.remove(htmlTmpPath.c_str());
       failed++;
     } else {
