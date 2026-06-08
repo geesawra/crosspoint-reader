@@ -76,6 +76,7 @@ The sections below summarise what this fork adds or changes compared to upstream
 | **CSS lazy-loading** | CSS rules are loaded on-demand from an indexed SD cache instead of all-at-once, reducing peak RAM usage during EPUB rendering. |
 | **"Both Forward" side button layout** | New side-button arrangement where both the front and back buttons advance the page forward. |
 | **Bookerly font** | Bookerly is retained as a reader font. Upstream replaced it with Noto Serif for licensing reasons; this fork restores it and removes OpenDyslexic instead. |
+| **Smart WiFi auto-connect** | When connecting to WiFi, scans for available networks first and auto-connects to the strongest saved network in range — not just the last-used one. From Settings you see the full scan list so you can always override. |
 | **Custom wallpaper script** | `convert_wallpaper.py` to prepare personal sleep-screen images. |
 | **Crash dump decoder** | `decode_crash.py` to translate raw ESP32-C3 crash logs into readable stack traces. |
 

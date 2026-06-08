@@ -43,26 +43,10 @@ void WifiSelectionActivity::onEnter() {
   // Trigger first update to show scanning message
   requestUpdate();
 
-  // Attempt to auto-connect to the last network
-  if (allowAutoConnect) {
-    const std::string lastSsid = WIFI_STORE.getLastConnectedSsid();
-    if (!lastSsid.empty()) {
-      const auto* cred = WIFI_STORE.findCredential(lastSsid);
-      if (cred) {
-        LOG_DBG("WIFI", "Attempting to auto-connect to %s", lastSsid.c_str());
-        selectedSSID = cred->ssid;
-        enteredPassword = cred->password;
-        selectedRequiresPassword = !cred->password.empty();
-        usedSavedPassword = true;
-        autoConnecting = true;
-        attemptConnection();
-        requestUpdate();
-        return;
-      }
-    }
-  }
-
-  // Fallback to scanning
+  // Always scan first. If autoConnect is enabled, we'll pick the strongest
+  // saved network from scan results (rather than blindly reconnecting to the
+  // last-used network, which may no longer be in range or the strongest).
+  autoConnectAfterScan = allowAutoConnect;
   startWifiScan();
 }
 
@@ -158,6 +142,45 @@ void WifiSelectionActivity::processWifiScanResults() {
   });
 
   WiFi.scanDelete();
+
+  // If autoConnect is enabled, try to connect to the strongest saved network in range
+  if (autoConnectAfterScan) {
+    autoConnectAfterScan = false;
+
+    // Find the strongest saved network among scan results
+    const WifiNetworkInfo* bestSaved = nullptr;
+    int32_t bestRssi = -999;
+    for (const auto& network : networks) {
+      if (network.hasSavedPassword) {
+        const auto* cred = WIFI_STORE.findCredential(network.ssid);
+        // Only consider credentials that have a password (or open networks)
+        if (cred && (!network.isEncrypted || !cred->password.empty())) {
+          if (network.rssi > bestRssi) {
+            bestRssi = network.rssi;
+            bestSaved = &network;
+          }
+        }
+      }
+    }
+
+    if (bestSaved) {
+      // Auto-connect to the strongest saved network in range
+      const auto* cred = WIFI_STORE.findCredential(bestSaved->ssid);
+      LOG_DBG("WIFI", "Auto-connecting to strongest saved network: %s (RSSI: %d)", bestSaved->ssid.c_str(),
+              bestSaved->rssi);
+      selectedSSID = bestSaved->ssid;
+      selectedRequiresPassword = bestSaved->isEncrypted;
+      enteredPassword = cred ? cred->password : "";
+      usedSavedPassword = true;
+      autoConnecting = true;
+      attemptConnection();
+      requestUpdate();
+      return;
+    }
+    // No saved networks in range — fall through to show the full list
+    LOG_DBG("WIFI", "No saved networks found in scan results, showing network list");
+  }
+
   state = WifiSelectionState::NETWORK_LIST;
   selectedNetworkIndex = 0;
   requestUpdate();

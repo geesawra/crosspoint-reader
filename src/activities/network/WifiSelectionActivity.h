@@ -75,6 +75,9 @@ class WifiSelectionActivity final : public Activity {
   // Whether we are attempting to auto-connect
   bool autoConnecting = false;
 
+  // Whether to attempt auto-connect to the strongest saved network after scan completes
+  bool autoConnectAfterScan = false;
+
   // Save/forget prompt selection (0 = Yes, 1 = No)
   int savePromptSelection = 0;
   int forgetPromptSelection = 0;
