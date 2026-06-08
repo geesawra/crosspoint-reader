@@ -40,7 +40,8 @@ void ArticleListActivity::onEnter() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    performFetch();
+    pendingRefresh = true;
+    requestUpdate();
     return;
   }
 
@@ -61,9 +62,8 @@ void ArticleListActivity::onWifiSelectionComplete(bool success) {
     finish();
     return;
   }
-  state = FETCHING;
+  pendingRefresh = true;
   requestUpdate();
-  performFetch();
 }
 
 void ArticleListActivity::performFetch(bool showProgress) {
@@ -90,7 +90,7 @@ void ArticleListActivity::performFetch(bool showProgress) {
   // If we already have cached data on screen, keep showing it while the
   // refresh runs rather than blanking to a "fetching" spinner — unless an
   // explicit refresh was requested by the user.
-  const bool hadCachedList = (state == SHOWING_LIST && !articles.empty());
+  const bool hadCachedList = !articles.empty();
   if (!hadCachedList || showProgress) {
     RenderLock lock(*this);
     state = FETCHING;
@@ -229,7 +229,10 @@ void ArticleListActivity::render(RenderLock&&) {
 
   char subtitleBuf[48];
   const char* subtitle = nullptr;
-  if (offline && lastSyncedAt > 0) {
+  if (offline && !errorMessage.empty()) {
+    std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · %s", errorMessage.c_str());
+    subtitle = subtitleBuf;
+  } else if (offline && lastSyncedAt > 0) {
     const time_t age = ::time(nullptr) - lastSyncedAt;
     if (age < 120) {
       std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline");
