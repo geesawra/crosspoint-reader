@@ -4,11 +4,7 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <Provider.h>
-#include <StateCache.h>
 #include <WiFi.h>
-#include <time.h>
-
-#include <cstdio>
 
 #include "ActionsActivity.h"
 #include "ArticleListMenuActivity.h"
@@ -29,24 +25,9 @@ void ArticleListActivity::onEnter() {
   pendingRefresh = false;
   errorMessage.clear();
 
-  // Populate from SD cache first so the list appears instantly, even if the
-  // follow-up live refresh is slow or fails entirely (offline re-entry).
-  const bool hadCache = StateCache::load(provider->cacheDirName(), folder.id, articles, &lastSyncedAt);
-  if (hadCache && !articles.empty()) {
-    state = SHOWING_LIST;
-    selectedIndex = 0;
-    offline = true;
-    requestUpdate();
-  }
-
   if (WiFi.status() == WL_CONNECTED) {
     pendingRefresh = true;
     requestUpdate();
-    return;
-  }
-
-  if (hadCache) {
-    // Stay on cached data; don't force the user onto the WiFi picker.
     return;
   }
 
@@ -76,22 +57,14 @@ void ArticleListActivity::performFetch(bool showProgress) {
       return;
     }
     RenderLock lock(*this);
-    if (state == SHOWING_LIST && !articles.empty()) {
-      offline = true;
-    } else {
-      state = FETCH_FAILED;
-      errorMessage = "No WiFi";
-      errorDetail.clear();
-    }
+    state = FETCH_FAILED;
+    errorMessage = "No WiFi";
+    errorDetail.clear();
     requestUpdate();
     return;
   }
 
-  // If we already have cached data on screen, keep showing it while the
-  // refresh runs rather than blanking to a "fetching" spinner — unless an
-  // explicit refresh was requested by the user.
-  const bool hadCachedList = !articles.empty();
-  if (!hadCachedList || showProgress) {
+  {
     RenderLock lock(*this);
     state = FETCHING;
   }
@@ -101,19 +74,14 @@ void ArticleListActivity::performFetch(bool showProgress) {
   const auto r = provider->listArticles(folder, LIST_LIMIT, fresh);
 
   if (r.isOk()) {
-    StateCache::save(provider->cacheDirName(), folder.id, fresh);
-    {
-      RenderLock lock(*this);
-      articles = std::move(fresh);
-      offline = false;
-      lastSyncedAt = ::time(nullptr);
-      if (articles.empty()) {
-        state = EMPTY_LIST;
-      } else {
-        state = SHOWING_LIST;
-        if (selectedIndex >= static_cast<int>(articles.size())) {
-          selectedIndex = 0;
-        }
+    RenderLock lock(*this);
+    articles = std::move(fresh);
+    if (articles.empty()) {
+      state = EMPTY_LIST;
+    } else {
+      state = SHOWING_LIST;
+      if (selectedIndex >= static_cast<int>(articles.size())) {
+        selectedIndex = 0;
       }
     }
     requestUpdate(true);
@@ -122,17 +90,9 @@ void ArticleListActivity::performFetch(bool showProgress) {
 
   {
     RenderLock lock(*this);
-    if (hadCachedList) {
-      // Stay on cached data, just mark as offline.
-      offline = true;
-      errorMessage = Provider::errorString(r.code);
-      errorDetail = r.message;
-      state = SHOWING_LIST;
-    } else {
-      state = FETCH_FAILED;
-      errorMessage = Provider::errorString(r.code);
-      errorDetail = r.message;
-    }
+    state = FETCH_FAILED;
+    errorMessage = Provider::errorString(r.code);
+    errorDetail = r.message;
   }
   requestUpdate(true);
 }
@@ -227,28 +187,9 @@ void ArticleListActivity::render(RenderLock&&) {
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
 
-  char subtitleBuf[48];
-  const char* subtitle = nullptr;
-  if (offline && !errorMessage.empty()) {
-    std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · %s", errorMessage.c_str());
-    subtitle = subtitleBuf;
-  } else if (offline && lastSyncedAt > 0) {
-    const time_t age = ::time(nullptr) - lastSyncedAt;
-    if (age < 120) {
-      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline");
-    } else if (age < 3600) {
-      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · %dm", static_cast<int>(age / 60));
-    } else if (age < 86400) {
-      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · %dh", static_cast<int>(age / 3600));
-    } else {
-      std::snprintf(subtitleBuf, sizeof(subtitleBuf), "Offline · %dd", static_cast<int>(age / 86400));
-    }
-    subtitle = subtitleBuf;
-  }
-
   const char* headerLabel =
       (folder.label && folder.label[0] != '\0') ? folder.label : (provider ? provider->name() : "");
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, headerLabel, subtitle);
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, headerLabel, nullptr);
 
   if (state == FETCHING || state == WIFI_SELECTION) {
     renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2, tr(STR_INSTAPAPER_REFRESHING), true, EpdFontFamily::BOLD);

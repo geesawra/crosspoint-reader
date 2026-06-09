@@ -23,22 +23,8 @@ void FetchActivity::onEnter() {
     return;
   }
 
-  // If the article is already cached on SD, skip the API call and jump
-  // straight to the reader. Flush button state first so the Confirm that
-  // got us here doesn't ride through to the reader's first loop.
-  const std::string cached = provider->epubPathFor(article.id, article.title);
-  if (Storage.exists(cached.c_str())) {
-    LOG_DBG("RIL", "Using cached EPUB: %s", cached.c_str());
-    mappedInput.update();
-    delay(10);
-    mappedInput.update();
-    activityManager.goToReader(cached);
-    return;
-  }
-
   // Network work ahead — require WiFi. Without it, the lwIP core mutex may
-  // not be initialized yet (cached-list path lets the user reach here
-  // offline), and any DNS lookup would assert inside lwIP.
+  // not be initialized yet, and any DNS lookup would assert inside lwIP.
   if (WiFi.status() != WL_CONNECTED) {
     state = WIFI_SELECTION;
     requestUpdate();
@@ -163,10 +149,6 @@ void FetchActivity::render(RenderLock&&) {
 
     const int barWidth = pageWidth - 80;
     GUI.drawProgressBar(renderer, Rect{40, pageHeight / 2 + 10, barWidth, 12}, buildPercent, 100);
-
-    char pctStr[8];
-    std::snprintf(pctStr, sizeof(pctStr), "%d%%", buildPercent);
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 40, pctStr);
   } else if (state == FAILED) {
     renderer.drawCenteredText(UI_12_FONT_ID, pageHeight / 2 - 30, errorMessage.c_str(), true, EpdFontFamily::BOLD);
     if (!errorDetail.empty()) {

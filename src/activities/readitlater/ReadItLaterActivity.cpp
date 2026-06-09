@@ -5,8 +5,8 @@
 #include <Logging.h>
 #include <Provider.h>
 
+#include "ArticleListActivity.h"
 #include "MappedInputManager.h"
-#include "ProviderFolderActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -63,7 +63,8 @@ void ReadItLaterActivity::loop() {
 
   if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
     Provider* provider = providers[selectedIndex].get();
-    activityManager.pushActivity(std::make_unique<ProviderFolderActivity>(renderer, mappedInput, provider));
+    Provider::FolderInfo unreadFolder{"unread", "Unread"};
+    activityManager.pushActivity(std::make_unique<ArticleListActivity>(renderer, mappedInput, provider, unreadFolder));
   }
 }
 

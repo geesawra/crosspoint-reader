@@ -41,8 +41,6 @@ class ArticleListActivity final : public Activity {
   std::vector<ReadItLaterArticle> articles;
   std::string errorMessage;
   std::string errorDetail;
-  time_t lastSyncedAt = 0;
-  bool offline = false;
   bool pendingRefresh = false;
 
   void onWifiSelectionComplete(bool success);
