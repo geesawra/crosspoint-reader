@@ -10,7 +10,9 @@
 #include "util/ButtonNavigator.h"
 
 #ifndef FONT_MANIFEST_URL
-#define FONT_MANIFEST_URL "https://raw.githubusercontent.com/jpirnay/witchhunt-reader/master/assets/sd-fonts/fonts.json"
+#define FONT_MANIFEST_URL                                                                                      \
+  "https://raw.githubusercontent.com/" CROSSPOINT_GIT_REPOSITORY "/" CROSSPOINT_GIT_BRANCH "/assets/sd-fonts/" \
+                                                                                           "fonts.json"
 #endif
 
 class FontDownloadActivity : public Activity {

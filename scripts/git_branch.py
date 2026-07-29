@@ -187,6 +187,10 @@ def inject_version(env):
         env.Append(CPPDEFINES=[('CROSSPOINT_GIT_REPOSITORY', f'\\"{git_repository}\\"')])
         print(f'CrossPoint Git repository: {git_repository}')
 
+    git_branch = get_git_branch(project_dir)
+    env.Append(CPPDEFINES=[('CROSSPOINT_GIT_BRANCH', f'\\"{git_branch}\\"')])
+    print(f'CrossPoint Git branch: {git_branch}')
+
     # Which display/hardware SDK this firmware links against, for the System
     # Information screen. Injected for every environment (unlike the version).
     display_sdk = get_display_sdk(project_dir)

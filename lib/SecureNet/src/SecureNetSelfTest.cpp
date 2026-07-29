@@ -23,7 +23,7 @@ namespace crosspoint {
 
 void secureNetSelfTest() {
   static const char* kHosts[] = {
-      "https://api.github.com/repos/jpirnay/witchhunt-reader/releases/latest",
+      "https://api.github.com/repos/geesawra/crosspoint-reader/releases/latest",
       "https://sync.koreader.rocks/",
       "https://timeapi.io/api/time/current/zone?timeZone=UTC",
   };

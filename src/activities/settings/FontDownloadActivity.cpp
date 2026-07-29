@@ -136,7 +136,13 @@ bool FontDownloadActivity::fetchAndParseManifest() {
     return false;
   }
 
-  baseUrl_ = doc["baseUrl"] | "";
+  // Derive the base URL from the manifest URL so font downloads stay on the
+  // same branch/repository as the manifest (no hardcoded branch names).
+  {
+    const std::string manifestUrl = FONT_MANIFEST_URL;
+    const size_t slashPos = manifestUrl.rfind('/');
+    baseUrl_ = (slashPos != std::string::npos) ? manifestUrl.substr(0, slashPos + 1) : manifestUrl;
+  }
   families_.clear();
 
   JsonArray familiesArr = doc["families"].as<JsonArray>();

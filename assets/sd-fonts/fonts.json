@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "baseUrl": "https://raw.githubusercontent.com/jpirnay/witchhunt-reader/master/assets/sd-fonts/",
+  "baseUrl": "",
   "families": [
     {
       "name": "Alegreya",
