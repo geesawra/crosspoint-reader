@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -15,12 +16,16 @@ class SdCardFontManager {
   SdCardFontManager(const SdCardFontManager&) = delete;
   SdCardFontManager& operator=(const SdCardFontManager&) = delete;
 
-  // Load the font file matching fontSizeEnum (EXTRA_SMALL=0 .. LARGE=3) by
-  // ordinal position in the family's sorted size list. Only one .cpfont file
-  // is loaded; other sizes remain on disk. This keeps resident interval +
-  // kern/ligature tables to one size's worth of memory.
+  // Load the single size closest to targetPtSize for a discovered family.
+  // Only one .cpfont file is loaded; other sizes remain on disk. This keeps
+  // resident interval + kern/ligature tables to one size's worth of memory
+  // (see PR #1327 discussion re: Literata OOM).
   // Returns true on success.
-  bool loadFamily(const SdCardFontFamilyInfo& family, GfxRenderer& renderer, uint8_t fontSizeEnum);
+  // onColdLoad (if set) is invoked once, just before the slow path that writes the
+  // font into the flash partition (i.e. only on a genuine first load, not on a
+  // flash-cache mmap hit) — callers use it to show a "loading font" popup.
+  bool loadFamily(const SdCardFontFamilyInfo& family, GfxRenderer& renderer, uint8_t targetPtSize,
+                  const std::function<void()>& onColdLoad = {});
 
   // Unload everything, unregister from renderer.
   void unloadAll(GfxRenderer& renderer);
@@ -44,6 +49,7 @@ class SdCardFontManager {
   };
   static int computeFontId(uint32_t contentHash, const char* familyName, uint8_t pointSize);
 
+  GfxRenderer* renderer_ = nullptr;
   std::string loadedFamilyName_;
   uint8_t loadedPointSize_ = 0;
   std::vector<LoadedFont> loaded_;

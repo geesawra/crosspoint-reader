@@ -30,9 +30,17 @@ void ReleaseJsonParser::reset() {
   firmwareSize = 0;
   tagFound = false;
   firmwareFound = false;
+  topLevelArray = false;
   currentAssetName[0] = '\0';
   currentAssetUrl[0] = '\0';
   currentAssetSize = 0;
+}
+
+bool ReleaseJsonParser::inReleaseObject() const {
+  if (!topLevelArray) {
+    return depth == 1;
+  }
+  return depth == 2;
 }
 
 void ReleaseJsonParser::feed(const char* data, size_t len) { parser.feed(data, len); }
@@ -54,14 +62,12 @@ void ReleaseJsonParser::commitAsset() {
   currentAssetSize = 0;
 }
 
-// -- SAX callbacks (static trampolines) -------------------------------------
-
 void ReleaseJsonParser::sOnKey(void* ctx, const char* key, size_t len) {
   auto* self = static_cast<ReleaseJsonParser*>(ctx);
 
   switch (self->position) {
     case Position::TOP_LEVEL:
-      if (self->depth == 1) {
+      if (self->inReleaseObject()) {
         if (len == 8 && memcmp(key, "tag_name", 8) == 0)
           self->lastKey = LastKey::TAG_NAME;
         else if (len == 6 && memcmp(key, "assets", 6) == 0)
@@ -92,7 +98,7 @@ void ReleaseJsonParser::sOnString(void* ctx, const char* value, size_t len) {
 
   switch (self->lastKey) {
     case LastKey::TAG_NAME:
-      if (self->position == Position::TOP_LEVEL && self->depth == 1) {
+      if (self->position == Position::TOP_LEVEL && self->inReleaseObject()) {
         safeCopy(self->tagName, sizeof(self->tagName), value, len);
         self->tagFound = true;
       }
@@ -174,7 +180,10 @@ void ReleaseJsonParser::sOnArrayStart(void* ctx) {
 
   switch (self->position) {
     case Position::TOP_LEVEL:
-      if (self->lastKey == LastKey::ASSETS && self->depth == 1) {
+      if (self->depth == 0) {
+        self->topLevelArray = true;
+        self->depth++;
+      } else if (self->lastKey == LastKey::ASSETS && self->inReleaseObject()) {
         self->position = Position::IN_ASSETS_ARRAY;
       } else {
         self->depth++;
@@ -195,7 +204,12 @@ void ReleaseJsonParser::sOnArrayEnd(void* ctx) {
 
   switch (self->position) {
     case Position::TOP_LEVEL:
-      if (self->depth > 0) self->depth--;
+      if (self->depth > 0) {
+        self->depth--;
+      }
+      if (self->topLevelArray && self->depth == 0) {
+        self->topLevelArray = false;
+      }
       break;
     case Position::IN_ASSETS_ARRAY:
       self->position = Position::TOP_LEVEL;

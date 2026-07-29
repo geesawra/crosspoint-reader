@@ -25,11 +25,12 @@ class OpdsSettingsActivity final : public Activity {
  private:
   ButtonNavigator buttonNavigator;
 
-  size_t selectedIndex = 0;
+  int selectedIndex = 0;
   int serverIndex;
   OpdsServer editServer;
   bool isNewServer = false;
   bool showSaveError = false;
+  std::string popupMessage;
 
   int getMenuItemCount() const;
   void handleSelection();

@@ -1,0 +1,11 @@
+{
+  "name": "ReadItLater",
+  "version": "1.0.0",
+  "description": "Generic Read-it-Later framework with Instapaper provider",
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "build": {
+    "srcDir": ".",
+    "includeDir": "."
+  }
+}

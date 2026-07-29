@@ -31,9 +31,7 @@ constexpr uint32_t XTH_MAGIC = 0x00485458;  // "XTH\0" for 2-bit page data
 constexpr uint16_t DISPLAY_WIDTH = 480;
 constexpr uint16_t DISPLAY_HEIGHT = 800;
 
-constexpr uint64_t XTC_LEGACY_HEADER_SIZE = 0x30;  // Original header before chapterOffset was added.
-
-// XTC file header (56 bytes; legacy files may start the page table at 48 bytes)
+// XTC file header (56 bytes)
 #pragma pack(push, 1)
 struct XtcHeader {
   uint32_t magic;            // 0x00: Magic number "XTC\0" (0x00435458)
@@ -88,7 +86,7 @@ struct XtgPageHeader {
 };
 #pragma pack(pop)
 
-// Page information (internal use, optimized for memory)
+// Page information (internal use)
 struct PageInfo {
   uint64_t offset;   // File offset to page data
   uint32_t size;     // Data size (bytes)
@@ -96,7 +94,7 @@ struct PageInfo {
   uint16_t height;   // Page height
   uint8_t bitDepth;  // 1 = XTG (1-bit), 2 = XTH (2-bit grayscale)
   uint8_t padding;   // Alignment padding
-};
+};  // 20 bytes total
 
 struct ChapterInfo {
   std::string name;

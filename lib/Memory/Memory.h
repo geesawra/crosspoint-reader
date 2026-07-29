@@ -9,6 +9,9 @@
 // Nothrow versions of std::make_unique. Return nullptr on allocation failure
 // instead of calling abort() (the default when exceptions are disabled on ESP32).
 //
+// Adapted from the sibling crosspoint-reader project (lib/Memory/Memory.h),
+// introduced here alongside the flat-TextBlock port (crosspoint-reader PR #2547).
+//
 // Single object:
 //   auto obj = makeUniqueNoThrow<PNG>();
 //   if (!obj) { LOG_ERR("TAG", "OOM"); return false; }
@@ -32,23 +35,3 @@ std::unique_ptr<T> makeUniqueNoThrow(size_t count) {
   using Elem = std::remove_extent_t<T>;
   return std::unique_ptr<T>(new (std::nothrow) Elem[count]());
 }
-
-// Helper struct to call a cleanup function on exit from any scope.
-// Use with a lambda to avoid unnecessary allocations from std::function/std::bind:
-// Example:
-//   auto jpeg = makeUniqueNoThrow<JPEGDEC>();
-//   ScopedCleanup cleanup{[&jpeg]{ jpeg->close(); }};
-//
-template <typename F>
-struct [[nodiscard]] ScopedCleanup final {
-  const F fn;
-  explicit ScopedCleanup(F f) : fn{std::move(f)} {}
-  ScopedCleanup(const ScopedCleanup&) = delete;
-  ScopedCleanup& operator=(const ScopedCleanup&) = delete;
-  ScopedCleanup(ScopedCleanup&&) = delete;
-  ScopedCleanup& operator=(ScopedCleanup&&) = delete;
-  ~ScopedCleanup() { fn(); }
-};
-
-template <typename F>
-ScopedCleanup(F) -> ScopedCleanup<F>;

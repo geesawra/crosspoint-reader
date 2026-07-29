@@ -9,9 +9,6 @@
 #include "activities/Activity.h"
 #include "util/ButtonNavigator.h"
 
-struct Rect;
-struct ThemeMetrics;
-
 // Structure to hold WiFi network information
 struct WifiNetworkInfo {
   std::string ssid;
@@ -24,6 +21,7 @@ struct WifiNetworkInfo {
 // WiFi selection states
 enum class WifiSelectionState {
   AUTO_CONNECTING,    // Trying to connect to the last known network
+  AUTO_CYCLING,       // Cycling through remaining saved credentials after AUTO_CONNECTING failed
   SCANNING,           // Scanning for networks
   NETWORK_LIST,       // Displaying available networks
   PASSWORD_ENTRY,     // Entering password for selected network
@@ -31,7 +29,8 @@ enum class WifiSelectionState {
   CONNECTED,          // Successfully connected
   SAVE_PROMPT,        // Asking user if they want to save the password
   CONNECTION_FAILED,  // Connection failed
-  FORGET_PROMPT       // Asking user if they want to forget the network
+  FORGET_PROMPT,      // Asking user if they want to forget the network
+  CAPTIVE_PORTAL      // Connected but network requires web-based login
 };
 
 /**
@@ -49,7 +48,7 @@ class WifiSelectionActivity final : public Activity {
   ButtonNavigator buttonNavigator;
 
   WifiSelectionState state = WifiSelectionState::SCANNING;
-  size_t selectedNetworkIndex = 0;
+  int selectedNetworkIndex = 0;
   std::vector<WifiNetworkInfo> networks;
 
   // Selected network for connection
@@ -75,33 +74,65 @@ class WifiSelectionActivity final : public Activity {
   // Whether we are attempting to auto-connect
   bool autoConnecting = false;
 
-  // Whether to attempt auto-connect to the strongest saved network after scan completes
-  bool autoConnectAfterScan = false;
+  // Saved-credential candidates for auto-cycling (SSIDs visible in scan, sorted by RSSI desc)
+  std::vector<std::string> autoCycleCandidates;
+  size_t autoCycleCandidateIndex = 0;
+  bool autoCycleAfterScan = false;  // Scan was triggered to build cycle candidates
 
   // Save/forget prompt selection (0 = Yes, 1 = No)
   int savePromptSelection = 0;
   int forgetPromptSelection = 0;
 
-  // Connection timeout
+  // Connection timeouts
   static constexpr unsigned long CONNECTION_TIMEOUT_MS = 15000;
+  static constexpr unsigned long AUTO_CYCLE_TIMEOUT_MS = 5000;
+  // Faster timeout for the first hint-based attempt before falling back to full scan.
+  // Hint-based connect on the correct channel usually completes in <2 s; if it doesn't,
+  // the AP has likely moved (mesh roam, channel change) so it's cheaper to bail and rescan.
+  static constexpr unsigned long HINT_ATTEMPT_TIMEOUT_MS = 3000;
   unsigned long connectionStartTime = 0;
 
-  void renderNetworkList(const Rect* screen, const ThemeMetrics* metrics) const;
-  void renderPasswordEntry(const Rect* screen, const ThemeMetrics* metrics) const;
-  void renderConnecting(const Rect* screen, const ThemeMetrics* metrics) const;
-  void renderConnected(const Rect* screen, const ThemeMetrics* metrics) const;
-  void renderSavePrompt(const Rect* screen, const ThemeMetrics* metrics) const;
-  void renderConnectionFailed(const Rect* screen, const ThemeMetrics* metrics) const;
-  void renderForgetPrompt(const Rect* screen, const ThemeMetrics* metrics) const;
+  // BSSID/channel hint used on the current attempt (channel==0 means no hint).
+  uint8_t currentAttemptBssid[6] = {0};
+  uint8_t currentAttemptChannel = 0;
+  volatile bool currentAttemptAssociated = false;
+  // Whether we've already done the silent fallback retry without the hint for this
+  // user-initiated connection. Prevents loops if the AP genuinely isn't reachable.
+  bool hintFallbackDone = false;
+
+  // WiFi event handler IDs so we can deregister on exit.
+  uint16_t evtIdConnected = 0;
+  uint16_t evtIdGotIp = 0;
+
+  void renderNetworkList() const;
+  void renderPasswordEntry() const;
+  void renderConnecting() const;
+  void renderConnected() const;
+  void renderSavePrompt() const;
+  void renderConnectionFailed() const;
+  void renderForgetPrompt() const;
+  void renderCaptivePortal() const;
 
   void startWifiScan();
   void processWifiScanResults();
+  void buildAutoCycleCandidates();
+  void tryNextAutoCycleCandidate();
   void selectNetwork(int index);
   void attemptConnection();
   void checkConnectionStatus();
+  // Issues WiFi.begin() either with the cached BSSID/channel hint (fast path) or without
+  // (full scan fallback). `useHint=false` clears currentAttemptChannel so the success path
+  // doesn't double-store the same hint.
+  void issueWifiBegin(bool useHint);
+  // Prepares the WiFi stack for a connect attempt: ensures STA mode and a clean state,
+  // sets a deterministic hostname. Skips the expensive disconnect(true,true) when WiFi
+  // is already idle so the warm reconnect path doesn't pay an NVS-erase cost.
+  void prepareForConnect();
+  bool checkCaptivePortal();
   std::string getSignalStrengthIndicator(int32_t rssi) const;
 
-  void refreshMacAddress();
+  std::string captivePortalUrl;
+
   void onComplete(bool connected);
 
  public:

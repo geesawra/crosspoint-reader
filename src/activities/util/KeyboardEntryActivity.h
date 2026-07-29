@@ -6,7 +6,7 @@
 #include <string>
 #include <utility>
 
-#include "activities/Activity.h"
+#include "../Activity.h"
 #include "util/ButtonNavigator.h"
 
 struct KeyDef {

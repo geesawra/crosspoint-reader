@@ -4,25 +4,15 @@
 #include <HalGPIO.h>
 #include <Logging.h>
 #include <SdCardFont.h>
+#include <SmallCaps.h>
 #include <Utf8.h>
+#include <esp_heap_caps.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 
 #include "FontCacheManager.h"
-
-namespace {
-
-const char* resolveVisualText(const char* text, std::string& visualBuffer, int paragraphLevel);
-
-/**
- * Resolves the requested style to the best available style in the given SD card font.
- * Falls back gracefully when the font lacks the requested variant.
- */
-uint8_t resolveSdCardStyle(const SdCardFont& font, const EpdFontFamily::Style style) {
-  return font.resolveStyle(static_cast<uint8_t>(style));
-}
-}  // namespace
 
 const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const EpdGlyph* glyph) const {
   if (fontData->groups != nullptr) {
@@ -52,28 +42,39 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
   return &fontData->bitmap[glyph->dataOffset];
 }
 
-void GfxRenderer::ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_t styleMask) const {
+void GfxRenderer::ensureFontReady(int fontId, const char* utf8Text) const {
   auto it = sdCardFonts_.find(fontId);
-  if (it != sdCardFonts_.end()) {
-    int missed = it->second->buildAdvanceTable(utf8Text, styleMask);
-    if (missed > 0) {
-      LOG_DBG("GFX", "ensureSdCardFontReady: %d glyph(s) not found", missed);
-    }
+  if (it == sdCardFonts_.end()) return;  // no-op for built-in fonts
+  // Metadata-only: loads glyph metrics (advanceX) without bitmap data.
+  // Saves ~50-100 KB heap vs full prewarm — layout only needs advance widths.
+  int missed = it->second->prewarm(utf8Text, 0x0F, /*metadataOnly=*/true,
+                                   /*loadKernLigatureData=*/true);
+  if (missed > 0) {
+    LOG_DBG("GFX", "ensureFontReady: %d glyph(s) not found", missed);
   }
 }
 
-void GfxRenderer::ensureSdCardFontReady(int fontId, const std::vector<std::string>& words, bool includeHyphen,
-                                        uint8_t styleMask) const {
-  auto it = sdCardFonts_.find(fontId);
-  if (it != sdCardFonts_.end()) {
-    // Augment the persistent advance-only table for layout measurement.
-    // The table survives across paragraphs/sections (capped per font), so
-    // repeated indexing of the same SD font amortizes glyph-metric SD reads.
-    int missed = it->second->buildAdvanceTable(words, includeHyphen, styleMask);
-    if (missed > 0) {
-      LOG_DBG("GFX", "ensureSdCardFontReady: %d glyph(s) not found", missed);
+void GfxRenderer::clearFontAccumulation() const {
+  for (auto& [id, font] : sdCardFonts_) {
+    font->clearAccumulation();
+  }
+}
+
+void GfxRenderer::dropFontMetadata() const {
+  for (auto& [id, font] : sdCardFonts_) {
+    font->unloadMetadata();
+  }
+}
+
+bool GfxRenderer::restoreFontMetadata() const {
+  bool ok = true;
+  for (auto& [id, font] : sdCardFonts_) {
+    if (!font->reloadMetadata()) {
+      LOG_ERR("GFX", "Failed to reload metadata for font %d", id);
+      ok = false;
     }
   }
+  return ok;
 }
 
 void GfxRenderer::begin() {
@@ -86,8 +87,14 @@ void GfxRenderer::begin() {
   panelHeight = display.getDisplayHeight();
   panelWidthBytes = display.getDisplayWidthBytes();
   frameBufferSize = display.getBufferSize();
-  bwBufferChunks.assign((frameBufferSize + BW_BUFFER_CHUNK_SIZE - 1) / BW_BUFFER_CHUNK_SIZE, nullptr);
+  bwSnapshotRowStart = 0;
+  bwSnapshotRowEnd = 0;
+  bwSnapshotSizeBytes = 0;
+  bwBufferChunkSize = BW_BUFFER_CHUNK_SIZE;
+  bwBufferChunks.assign((frameBufferSize + bwBufferChunkSize - 1) / bwBufferChunkSize, nullptr);
 }
+
+bool GfxRenderer::isFontCacheScanning() const { return fontCacheManager_ && fontCacheManager_->isScanning(); }
 
 void GfxRenderer::insertFont(const int fontId, EpdFontFamily font) {
   auto result = fontMap.insert({fontId, font});
@@ -130,71 +137,617 @@ static inline void rotateCoordinates(const GfxRenderer::Orientation orientation,
   }
 }
 
-// Output of screenRectToAlignedMemRect: a rectangle in panel-memory
-// coordinates whose x and width are guaranteed to be multiples of 8 (the
-// SDK's EInkDisplay::displayWindow alignment requirement). `valid == false`
-// means the input was empty or fully outside the panel.
-struct AlignedMemRect {
-  uint16_t x = 0;
-  uint16_t y = 0;
-  uint16_t w = 0;
-  uint16_t h = 0;
-  bool valid = false;
-};
+enum class TextRotation { None, Rotated90CW };
 
-// Translate a screen-coordinate rectangle (the coordinate system used by
-// fillRect / drawText / the rest of the renderer's public API) into a
-// panel-memory rectangle suitable for direct framebuffer indexing and for the
-// SDK's EInkDisplay::displayWindow API. Output x and width are snapped
-// outward to multiples of 8 (left edge down, right edge up) and clamped to
-// panel bounds.
+// =============================================================================
+// Fast-path glyph rendering helpers (1-bit BW fonts, TextRotation::None)
+// =============================================================================
 //
-// Approach: rotate the screen rectangle's two opposite corners into memory
-// coordinates using rotateCoordinates(), take the bounding box of the
-// rotated corners (which naturally swaps width/height in Portrait /
-// PortraitInverted), then snap the x extent to byte boundaries.
+// OVERVIEW
+// --------
+// The legacy path called drawPixel() once per set glyph pixel.  drawPixel()
+// invokes rotateCoordinates() (a switch), does a bounds check, logs on OOB,
+// then writes one bit.  For a typical 10×14 UI glyph that is ~100 calls.
 //
-// Precondition: panelWidth and panelHeight are multiples of 8 (true for the
-// 800x480 panel). The alignment math relies on this so clamping cannot
-// re-break alignment.
-static AlignedMemRect screenRectToAlignedMemRect(GfxRenderer::Orientation orientation, int sx, int sy, int sw, int sh,
-                                                 uint16_t panelWidth, uint16_t panelHeight) {
-  AlignedMemRect out;
-  if (sw <= 0 || sh <= 0) return out;
+// This fast path eliminates drawPixel() entirely by writing directly to the
+// framebuffer in up to 8-pixel chunks via writeRowBits().
+//
+// FRAMEBUFFER LAYOUT
+// ------------------
+// 1 bpp, MSB-first, DISPLAY_WIDTH (800) pixels per row stored in
+// DISPLAY_WIDTH_BYTES (100) bytes.  Bit 7 of byte 0 = leftmost pixel of
+// row 0.  "Physical row" phyY occupies bytes [phyY*100 .. phyY*100+99].
+// A set bit (1) is WHITE; a cleared bit (0) is BLACK.
+//
+// LANDSCAPE ORIENTATIONS  (2.5–3.1× speedup vs legacy)
+// -------------------------------------------------------
+// phyX and phyY are both linear functions of glyphX/glyphY in these modes,
+// so each glyph row maps directly to a physical framebuffer row.
+//
+//   LandscapeCounterClockwise:  phyX = screenXBase+glyphX,  phyY = screenYBase+glyphY
+//   LandscapeClockwise:         phyX = W-1-screenXBase-glyphX, phyY = H-1-screenYBase-glyphY
+//
+// Strategy: outer loop over glyphY (one physical row per iteration), inner
+// loop reads 8-pixel chunks of that glyph row with bitmapExtract() and writes
+// them with writeRowBits().  Bitmap access is purely sequential — fastest.
+// LandscapeClockwise iterates glyph chunks right-to-left and applies
+// reverseBits8() to flip horizontal direction.
+//
+// PORTRAIT ORIENTATIONS  (~2× speedup vs legacy)
+// -----------------------------------------------
+// Portrait (90° CW panel rotation):
+//   phyX = screenYBase+glyphY,  phyY = H-1-screenXBase-glyphX
+// PortraitInverted (90° CCW panel rotation):
+//   phyX = W-1-screenYBase-glyphY, phyY = screenXBase+glyphX
+//
+// Here glyph COLUMNS map to physical rows.  Naively iterating column-by-column
+// reads the bitmap with stride glyphWidth — cache-unfriendly and one bit at a
+// time.  Instead we use an 8×8 bit-matrix transpose:
+//
+//   For each 8-row × 8-column glyph block:
+//     1. Read 8 consecutive glyph rows (sequential bitmap access) into the
+//        top 8 bytes of a uint64_t (one bitmapExtract per row).
+//     2. Call transpose8x8() — an O(log 8) butterfly transform — to swap
+//        the role of rows and columns in 3 passes of XOR-masking.
+//     3. The resulting uint64_t holds 8 column bytes: byte k contains the
+//        bits for glyph column glyphX+k, one per physical row, MSB-aligned.
+//     4. Write each column byte with writeRowBits() to its physical row.
+//
+// For PortraitInverted the glyph rows are packed in reverse order (last row
+// at MSB of the uint64_t) before transposing.  This ensures the post-transpose
+// column bytes are already correctly ordered (MSB = leftmost phyX) without any
+// per-column bit-reversal step.
+//
+// PARAMETERS
+// ----------
+//   screenXBase = cursorX + glyph->left  (logical X of glyph pixel [0,0])
+//   screenYBase = cursorY - glyph->top   (logical Y of glyph pixel [0,0])
 
-  int x0, y0, x1, y1;
-  rotateCoordinates(orientation, sx, sy, &x0, &y0, panelWidth, panelHeight);
-  rotateCoordinates(orientation, sx + sw - 1, sy + sh - 1, &x1, &y1, panelWidth, panelHeight);
-
-  const int memXLo = std::min(x0, x1);
-  const int memYLo = std::min(y0, y1);
-  const int memXHi = std::max(x0, x1) + 1;  // exclusive upper bound
-  const int memYHi = std::max(y0, y1) + 1;
-
-  // Snap x outward to multiples of 8.
-  int alignedXLo = memXLo & ~0x7;        // round down
-  int alignedXHi = (memXHi + 7) & ~0x7;  // round up
-
-  // Clamp to panel bounds. Panel dims are multiples of 8 so this preserves
-  // alignment.
-  if (alignedXLo < 0) alignedXLo = 0;
-  if (alignedXHi > panelWidth) alignedXHi = panelWidth;
-  int clampedYLo = memYLo;
-  int clampedYHi = memYHi;
-  if (clampedYLo < 0) clampedYLo = 0;
-  if (clampedYHi > panelHeight) clampedYHi = panelHeight;
-
-  if (alignedXHi <= alignedXLo || clampedYHi <= clampedYLo) return out;
-
-  out.x = static_cast<uint16_t>(alignedXLo);
-  out.y = static_cast<uint16_t>(clampedYLo);
-  out.w = static_cast<uint16_t>(alignedXHi - alignedXLo);
-  out.h = static_cast<uint16_t>(clampedYHi - clampedYLo);
-  out.valid = true;
-  return out;
+// Reverse all 8 bits of a byte (bit 7 ↔ bit 0).
+static inline uint8_t reverseBits8(uint8_t b) {
+  b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
+  b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
+  b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
+  return b;
 }
 
-enum class TextRotation { None, Rotated90CW };
+// Transpose an 8×8 bit matrix packed into a uint64_t.
+//
+// Input layout (row-major, row 0 at MSB):
+//   bit (63 - 8*r - c)  =  matrix[r][c]   (r=row 0..7, c=col 0..7)
+//
+// After transposition:
+//   bit (63 - 8*c - r)  =  matrix[r][c]
+//   i.e. byte k = bits [63-8k .. 56-8k] holds column k, MSB = row 0.
+//
+// Uses the classic 3-pass butterfly (Warren, "Hacker's Delight" §7-3):
+//   pass 1 swaps adjacent bit-pairs across a stride of 7 (nibble level),
+//   pass 2 swaps across stride 14 (byte level),
+//   pass 3 swaps across stride 28 (half-word level).
+static inline uint64_t transpose8x8(uint64_t x) {
+  uint64_t t;
+  t = (x ^ (x >> 7)) & 0x00AA00AA00AA00AAULL;
+  x ^= t ^ (t << 7);
+  t = (x ^ (x >> 14)) & 0x0000CCCC0000CCCCULL;
+  x ^= t ^ (t << 14);
+  t = (x ^ (x >> 28)) & 0x00000000F0F0F0F0ULL;
+  x ^= t ^ (t << 28);
+  return x;
+}
+
+// Extract up to 8 bits from a 1-bit MSB-first packed bitmap starting at bit
+// position 'bitPos'.  Returns them MSB-aligned (bit 7 = first extracted bit);
+// the lower (8-count) bits are zeroed.
+// All 'count' bits must lie within the valid bitmap byte range.
+static inline uint8_t bitmapExtract(const uint8_t* bitmap, const int bitPos, const int count) {
+  const int byteIdx = bitPos >> 3;
+  const int bitOff = bitPos & 7;
+  uint8_t result;
+  if (bitOff == 0) {
+    result = bitmap[byteIdx];
+  } else if (count <= 8 - bitOff) {
+    result = bitmap[byteIdx] << bitOff;  // all bits inside first byte
+  } else {
+    result = (uint8_t)(((uint16_t)bitmap[byteIdx] << 8 | bitmap[byteIdx + 1]) >> (8 - bitOff));
+  }
+  if (count < 8) result &= static_cast<uint8_t>(0xFF << (8 - count));
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Fast glyph render pipeline
+// ---------------------------------------------------------------------------
+// Both 1-bit (BW) and 2-bit (antialiased) paths share the same structure:
+//
+//   gather → [reindex] → scatter
+//
+// The glyph bitmap is a row-major 2D tensor [glyphHeight][glyphWidth].
+// The framebuffer is a row-major 2D tensor [DISPLAY_HEIGHT][DISPLAY_WIDTH_BYTES]
+// (1 bpp) with a fixed row stride of DISPLAY_WIDTH_BYTES bytes.
+//
+// Non-rotated (Landscape): glyph rows map 1-to-1 to framebuffer rows.
+// Reindex is a no-op; the pipeline is a tight per-row gather+scatter loop.
+//
+// Rotated 90° (Portrait): glyph rows become framebuffer columns.
+// A row↔column axis swap (reindex) is required before scattering.
+//
+// 1-bit pipeline
+//   gather  : extractGlyphBlock        reads an 8×8 glyph tile into a
+//                                      contiguous uint64_t block
+//                                      (≈ glyphTensor[tile].contiguous())
+//   reindex : transpose8x8             swaps row↔column axes in the uint64_t;
+//                                      pure index transform, no data movement
+//   scatter : scatterBlockToFrameBuffer → writeRowBits
+//                                      writes each column-byte to its row
+//
+// 2-bit pipeline (why it differs)
+//   The glyph stores 4 gray levels (0–3). Rendering reduces these to a 1-bit
+//   draw/skip decision via a render-mode threshold. That reduction is
+//   information-lossy, so gather and threshold cannot be separated — there is
+//   no contiguous 2-bit block to transpose. The two steps are fused:
+//
+//   gather+threshold : build2BitRowMask  Landscape — samples along glyph X
+//                      build2BitColMask  Portrait  — samples along glyph Y
+//                      both return a 1-bit mask ready for writeRowBits
+//   scatter          : writeRowBits      same atom as the 1-bit path
+// ---------------------------------------------------------------------------
+
+// Scatter atom: merges 8 MSB-aligned bits into the framebuffer row at physical bit offset phyBitPos.
+// Shared by both pipelines (1-bit: via scatterBlockToFrameBuffer; 2-bit: called directly).
+//   bits      — MSB-aligned; bit 7 = pixel at phyBitPos, lower (8-count) bits are zero.
+//   phyBitPos — physical X of the MSB pixel; may be negative for left-edge partial chunks.
+//   pixelState true → black (clear bits to 0), false → white (set bits to 1).
+static inline void writeRowBits(uint8_t* const row, const int phyBitPos, const uint8_t bits, const bool pixelState,
+                                const int widthBytes) {
+  uint8_t effectiveBits = bits;
+  int byteIdx;
+  int shift;
+  if (phyBitPos < 0) {
+    // Chunk starts off-screen left: clip by shifting out the off-screen MSBs.
+    // bits is MSB-aligned, so (bits << neg) discards the neg off-screen pixels
+    // and leaves the on-screen pixels MSB-aligned starting at physical X=0.
+    const int neg = -phyBitPos;
+    if (neg >= 8) return;  // entire chunk is off-screen left
+    effectiveBits = bits << neg;
+    byteIdx = 0;
+    shift = 0;
+  } else {
+    byteIdx = phyBitPos >> 3;
+    shift = phyBitPos & 7;
+  }
+  if (pixelState) {
+    row[byteIdx] &= ~(effectiveBits >> shift);
+    if (shift > 0 && byteIdx + 1 < widthBytes) row[byteIdx + 1] &= ~(uint8_t)(effectiveBits << (8 - shift));
+  } else {
+    row[byteIdx] |= (effectiveBits >> shift);
+    if (shift > 0 && byteIdx + 1 < widthBytes) row[byteIdx + 1] |= (uint8_t)(effectiveBits << (8 - shift));
+  }
+}
+
+// 1-bit pipeline step 1 — gather: reads an up-to-8×8 tile from the glyph tensor
+// ([glyphHeight][glyphWidth], 1 bpp, row stride = glyphWidth bits) into a contiguous uint64_t.
+// Equivalent to glyphTensor[glyphY:+rowCount, glyphX:+colCount].contiguous().
+// Byte 7 = first source row (MSB-aligned). reverseRows implements a negative-stride gather along Y
+// (reads rows bottom-to-top), needed for PortraitInverted.
+// Full pipeline: extractGlyphBlock (gather) → transpose8x8 (reindex) → scatterBlockToFrameBuffer (scatter).
+static inline uint64_t extractGlyphBlock(const uint8_t* const bitmap, const int stride, const int glyphX,
+                                         const int glyphY, const int rowCount, const int colCount,
+                                         const bool reverseRows) {
+  uint64_t pack = 0;
+  int bitStart = glyphY * stride + glyphX;
+  for (int n = 0; n < rowCount; n++, bitStart += stride) {
+    const int slot = reverseRows ? (rowCount - 1 - n) : n;
+    pack |= static_cast<uint64_t>(bitmapExtract(bitmap, bitStart, colCount)) << (56 - 8 * slot);
+  }
+  return pack;
+}
+
+// 1-bit pipeline step 3 — scatter: writes column-bytes of the transposed block into framebuffer rows.
+// The framebuffer is a 2D tensor [DISPLAY_HEIGHT][DISPLAY_WIDTH_BYTES] with non-unit row stride;
+// phyYStride=±1 selects the traversal direction along Y (positive = top-to-bottom, negative = inverted).
+// Each column k maps to row (phyYBase + k*phyYStride) via writeRowBits.
+static inline void scatterBlockToFrameBuffer(uint8_t* const frameBuffer, const uint64_t pack, const int colCount,
+                                             const int phyYBase, const int phyYStride, const int phyBitPos,
+                                             const bool pixelState, const int displayHeight, const int widthBytes) {
+  for (int k = 0; k < colCount; k++) {
+    const uint8_t cols_k = static_cast<uint8_t>(pack >> (56 - 8 * k));
+    if (cols_k == 0) continue;
+    const int phyY = phyYBase + k * phyYStride;
+    if (phyY < 0 || phyY >= displayHeight) continue;
+    writeRowBits(frameBuffer + phyY * widthBytes, phyBitPos, cols_k, pixelState, widthBytes);
+  }
+}
+
+static void renderGlyphFastBW(uint8_t* const frameBuffer, const uint8_t* const bitmap, const int glyphWidth,
+                              const int glyphHeight, const int screenXBase, const int screenYBase,
+                              const bool pixelState, const GfxRenderer::Orientation orientation, const int displayWidth,
+                              const int displayHeight, const int widthBytes) {
+  switch (orientation) {
+    case GfxRenderer::LandscapeCounterClockwise: {
+      for (int glyphY = 0; glyphY < glyphHeight; glyphY++) {
+        const int phyY = screenYBase + glyphY;
+        if (phyY < 0 || phyY >= displayHeight) continue;
+        uint8_t* const row = frameBuffer + phyY * widthBytes;
+        const int rowBitStart = glyphY * glyphWidth;
+        for (int glyphX = 0; glyphX < glyphWidth; glyphX += 8) {
+          const int count = std::min(8, glyphWidth - glyphX);
+          const uint8_t gbyte = bitmapExtract(bitmap, rowBitStart + glyphX, count);
+          if (gbyte == 0) continue;
+          const int phyBitPos = screenXBase + glyphX;
+          if (phyBitPos + count <= 0 || phyBitPos >= displayWidth) continue;
+          writeRowBits(row, phyBitPos, gbyte, pixelState, widthBytes);
+        }
+      }
+      break;
+    }
+
+    case GfxRenderer::LandscapeClockwise: {
+      for (int glyphY = 0; glyphY < glyphHeight; glyphY++) {
+        const int phyY = displayHeight - 1 - (screenYBase + glyphY);
+        if (phyY < 0 || phyY >= displayHeight) continue;
+        uint8_t* const row = frameBuffer + phyY * widthBytes;
+        const int rowBitStart = glyphY * glyphWidth;
+        for (int chunkEnd = glyphWidth - 1; chunkEnd >= 0; chunkEnd -= 8) {
+          const int chunkStart = std::max(0, chunkEnd - 7);
+          const int count = chunkEnd - chunkStart + 1;
+          const uint8_t gbyte_fwd = bitmapExtract(bitmap, rowBitStart + chunkStart, count);
+          const uint8_t gbyte = reverseBits8(gbyte_fwd >> (8 - count));
+          if (gbyte == 0) continue;
+          const int phyBitPos = displayWidth - 1 - screenXBase - chunkEnd;
+          if (phyBitPos + count <= 0 || phyBitPos >= displayWidth) continue;
+          writeRowBits(row, phyBitPos, gbyte, pixelState, widthBytes);
+        }
+      }
+      break;
+    }
+
+    case GfxRenderer::Portrait: {
+      for (int glyphY = 0; glyphY < glyphHeight; glyphY += 8) {
+        const int rowCount = std::min(8, glyphHeight - glyphY);
+        const int phyBitPos = screenYBase + glyphY;
+        if (phyBitPos + rowCount <= 0 || phyBitPos >= displayWidth) continue;
+        for (int glyphX = 0; glyphX < glyphWidth; glyphX += 8) {
+          const int colCount = std::min(8, glyphWidth - glyphX);
+          const uint64_t pack =
+              transpose8x8(extractGlyphBlock(bitmap, glyphWidth, glyphX, glyphY, rowCount, colCount, false));
+          scatterBlockToFrameBuffer(frameBuffer, pack, colCount, displayHeight - 1 - screenXBase - glyphX, -1,
+                                    phyBitPos, pixelState, displayHeight, widthBytes);
+        }
+      }
+      break;
+    }
+
+    case GfxRenderer::PortraitInverted: {
+      for (int glyphY = 0; glyphY < glyphHeight; glyphY += 8) {
+        const int rowCount = std::min(8, glyphHeight - glyphY);
+        const int phyBitPos = displayWidth - 1 - screenYBase - (glyphY + rowCount - 1);
+        if (phyBitPos + rowCount <= 0 || phyBitPos >= displayWidth) continue;
+        for (int glyphX = 0; glyphX < glyphWidth; glyphX += 8) {
+          const int colCount = std::min(8, glyphWidth - glyphX);
+          const uint64_t pack =
+              transpose8x8(extractGlyphBlock(bitmap, glyphWidth, glyphX, glyphY, rowCount, colCount, true));
+          scatterBlockToFrameBuffer(frameBuffer, pack, colCount, screenXBase + glyphX, 1, phyBitPos, pixelState,
+                                    displayHeight, widthBytes);
+        }
+      }
+      break;
+    }
+  }
+}
+
+// Read one pixel from a tightly-packed 2-bit-per-pixel glyph bitmap.
+// The bitmap is a row-major tensor [glyphHeight][glyphWidth] with no row padding;
+// its pixel-row stride equals glyphWidth.  pixelPosition = row * glyphWidth + col.
+// Returns the raw font value: 0=white, 1=light-gray, 2=dark-gray, 3=black.
+static inline uint8_t get2BitPixel(const uint8_t* const bitmap, const int pixelPosition) {
+  return (bitmap[pixelPosition >> 2] >> ((3 - (pixelPosition & 3)) * 2)) & 0x3;
+}
+
+// Convenience overload using explicit row/col/stride (tensor element access).
+static inline uint8_t get2BitPixel(const uint8_t* const bitmap, const int stride, const int row, const int col) {
+  return get2BitPixel(bitmap, row * stride + col);
+}
+
+// Compute the runtime drawMask for a given render mode and text darkness.
+// Bit N set ⇒ draw when raw 2-bit font value == N
+// (raw: 0=white, 1=light gray, 2=dark gray, 3=black).
+//
+// BW always draws every non-white pixel (darkness has no effect).
+// For grayscale modes, increasing darkness folds more AA shades into the
+// "draw" set so text becomes progressively bolder. The default darkness=1
+// keeps the historical behavior (MSB pass draws both AA shades, LSB pass
+// draws only the dark AA shade).
+//
+// At "Maximum" (darkness>=3) the grayscale passes are suppressed entirely
+// (drawMask 0x00). The BW pass already writes raw {1,2,3} as solid black,
+// so AA pixels render as hard black with no gray-LUT softening — visibly
+// darker than darkness=2 because the gray waveform is skipped.
+//
+//    darkness | GRAYSCALE_MSB           | GRAYSCALE_LSB
+//    --------- ------------------------- -------------------------
+//    0        | 0x02 (raw {1})          | 0x04 (raw {2})
+//    1        | 0x06 (raw {1,2}) ←dflt  | 0x04 (raw {2})   ←dflt
+//    2        | 0x06 (raw {1,2})        | 0x06 (raw {1,2})
+//    3+       | 0x00 (none)             | 0x00 (none)
+//
+// ─── Worked example ────────────────────────────────────────────────────────
+// Imagine a 2-bit antialiased glyph for the diagonal stroke of a letter 'A'.
+// Each cell holds the raw font value at that pixel:
+//
+//   raw values             . . . 2 3       legend:
+//                          . . 2 3 1         . = 0 (white, never drawn)
+//                          . 2 3 1 .         1 = light gray AA
+//                          2 3 1 . .         2 = dark gray AA
+//                          3 1 . . .         3 = solid black (stroke core)
+//
+// Three render passes write to three independent planes; the panel's
+// grayscale waveform combines the BW plane with (MSB,LSB) into 4 shades:
+//
+//   (MSB, LSB)  →  panel shade
+//      (0,0)    →  white
+//      (1,0)    →  light gray
+//      (0,1)    →  dark gray
+//      (1,1)    →  black
+//
+// Per-pixel result for each darkness level (●=black, ▓=dark gray,
+// ░=light gray, ·=white):
+//
+//   darkness=0  Normal — true 4-level AA
+//     . . . ▓ ●        raw=1 → (1,0) light gray
+//     . . ▓ ● ░        raw=2 → (0,1) dark gray
+//     . ▓ ● ░ .        raw=3 → BW black
+//     ▓ ● ░ . .        Crisp edges, lightest stroke. Best for thin/serif fonts.
+//     ● ░ . . .
+//
+//   darkness=1  Dark — historical default
+//     . . . ● ●        raw=1 → (1,0) light gray (unchanged)
+//     . . ● ● ░        raw=2 → (1,1) black  (was dark gray)
+//     . ● ● ░ .        Dark-gray fringe collapses to black; light fringe
+//     ● ● ░ . .        survives. Stroke core thickens by ~1px on the
+//     ● ░ . . .        steep side of the slope.
+//
+//   darkness=2  Extra Dark — both AA shades go black
+//     . . . ● ●        raw=1 → (1,1) black
+//     . . ● ● ●        raw=2 → (1,1) black
+//     . ● ● ● .        All AA pixels are pushed to "black" in the gray
+//     ● ● ● . .        plane. The gray waveform still runs, so pixels
+//     ● ● . . .        share the gray-pass voltage profile (slightly
+//                      softer than Maximum).
+//
+//   darkness=3  Maximum — grayscale pass skipped entirely
+//     . . . ● ●        Both grayscale drawMasks are 0x00; nothing is
+//     . . ● ● ●        written to the (MSB,LSB) planes. The BW pass —
+//     . ● ● ● .        which already writes raw {1,2,3} as solid black —
+//     ● ● ● . .        is the only pass the panel sees, refreshed with
+//     ● ● . . .        the hard FAST waveform. Visually identical pixel
+//                      footprint to darkness=2 but driven harder, so
+//                      strokes look noticeably bolder/blacker on the
+//                      physical e-ink panel.
+// ───────────────────────────────────────────────────────────────────────────
+static inline uint8_t drawMaskFor2BitMode(const GfxRenderer::RenderMode mode, const uint8_t darkness) {
+  if (mode == GfxRenderer::BW) return 0x0E;  // draw raw {1,2,3}
+  if (darkness >= 3) return 0x00;            // skip grayscale entirely (Maximum)
+  if (mode == GfxRenderer::GRAYSCALE_MSB) {
+    return (darkness == 0) ? 0x02 : 0x06;
+  }
+  // GRAYSCALE_LSB
+  return (darkness >= 2) ? 0x06 : 0x04;
+}
+
+// 2-bit pipeline — fused gather+threshold (X axis): the 2-bit analog of extractGlyphBlock, but
+// gather and threshold are collapsed into one pass. The threshold (2-bit raw value → 1-bit on/off)
+// is information-lossy, so no contiguous 2-bit intermediate block can be formed mid-pipeline.
+// The resulting 1-bit mask feeds writeRowBits directly (scatter). build2BitColMask is the Y-axis counterpart.
+//
+// Templated on the drawMask byte (a non-type template parameter) so each render-mode/darkness
+// combination compiles to its own specialization with the mask folded into a constant.
+template <uint8_t drawMask>
+static inline uint8_t build2BitRowMask(const uint8_t* const bitmap, const int rowStartPixel, const int glyphXStartOrEnd,
+                                       const int count, const bool reverseXInChunk) {
+  // drawMask uses raw 2-bit glyph values directly from font bitmaps:
+  // raw 0=white, 1=light gray, 2=dark gray, 3=black.
+  // Bit N set means: draw/update when raw==N.
+  uint8_t mask = 0;
+  for (int i = 0; i < count; i++) {
+    const int logicalX = reverseXInChunk ? (glyphXStartOrEnd - i) : (glyphXStartOrEnd + i);
+    const uint8_t raw = get2BitPixel(bitmap, rowStartPixel + logicalX);
+    if ((drawMask >> raw) & 0x01) mask |= static_cast<uint8_t>(1u << (7 - i));
+  }
+  return mask;
+}
+
+// Fast-path 2-bit mask builder for 8 byte-aligned pixels.
+//
+// The 2-bit glyph bitmap stores 4 pixels per byte, MSB-first:
+//   byte b = [p0.msb p0.lsb  p1.msb p1.lsb  p2.msb p2.lsb  p3.msb p3.lsb]
+//
+// For each drawMask the draw decision collapses to a two-bit boolean:
+//   0x0E (raw ∈ {1,2,3}): msb | lsb
+//   0x06 (raw ∈ {1,2}):   msb ^ lsb
+//   0x04 (raw == 2):      msb & ~lsb
+//   0x02 (raw == 1):      ~msb & lsb
+//
+// Derivation for one byte:
+//   msb_bits = b & 0xAA  →  bits 7,5,3,1 hold p0.msb … p3.msb; bits 6,4,2,0 = 0
+//   lsb_bits = (b & 0x55) << 1  →  same positions hold p0.lsb … p3.lsb
+//   draw_bits = msb_bits OP lsb_bits  →  bits 7,5,3,1 are the per-pixel draw flags
+//
+// compact4: squeezes those 4 draw flags from bit positions 7,5,3,1
+//   into the top nibble (bits 7,6,5,4 → pixels 0,1,2,3).
+//
+// Two bytes b0 (pixels 0–3) and b1 (pixels 4–7) are combined:
+//   mask = compact4(draw(b0)) | (compact4(draw(b1)) >> 4)
+//
+// This avoids the 8-iteration per-pixel loop in build2BitRowMask and
+// processes the full 8-pixel chunk in ~16 ALU ops instead of ~56.
+// The caller is responsible for only calling this when pixelStart is
+// 4-pixel (1-byte) aligned (pixelStart & 3 == 0) and count == 8.
+template <uint8_t drawMask>
+static inline uint8_t build2BitRowMaskFromTwoBytes(const uint8_t b0, const uint8_t b1) {
+  const uint8_t msb0 = b0 & 0xAA;
+  const uint8_t lsb0 = (b0 & 0x55) << 1;
+  const uint8_t msb1 = b1 & 0xAA;
+  const uint8_t lsb1 = (b1 & 0x55) << 1;
+
+  uint8_t draw0, draw1;
+  if constexpr (drawMask == 0x0E) {  // glyph BW: raw ∈ {1,2,3}
+    draw0 = msb0 | lsb0;
+    draw1 = msb1 | lsb1;
+  } else if constexpr (drawMask == 0x07) {  // image BW: raw ∈ {0,1,2} (not white)
+    draw0 = ~(msb0 & lsb0) & 0xAA;
+    draw1 = ~(msb1 & lsb1) & 0xAA;
+  } else if constexpr (drawMask == 0x06) {  // raw ∈ {1,2}
+    draw0 = msb0 ^ lsb0;
+    draw1 = msb1 ^ lsb1;
+  } else if constexpr (drawMask == 0x04) {  // raw == 2 (dark gray)
+    draw0 = msb0 & ~lsb0;
+    draw1 = msb1 & ~lsb1;
+  } else {  // drawMask == 0x02, raw == 1 (light gray)
+    static_assert(drawMask == 0x02, "unsupported drawMask in build2BitRowMaskFromTwoBytes");
+    draw0 = ~msb0 & lsb0;
+    draw1 = ~msb1 & lsb1;
+  }
+
+  // Compact each nibble's draw flags from bit positions 7,5,3,1 → 7,6,5,4.
+  auto compact4 = [](const uint8_t d) -> uint8_t {
+    return (d & 0x80) | ((d & 0x20) << 1) | ((d & 0x08) << 2) | ((d & 0x02) << 3);
+  };
+  return compact4(draw0) | (compact4(draw1) >> 4);
+}
+
+// 2-bit pipeline — fused gather+threshold (Y axis): column-direction counterpart to build2BitRowMask.
+// Samples count pixels down glyph column glyphX starting at row glyphYStart; reverseRows implements
+// a negative-stride view along Y (reads bottom-to-top), needed for PortraitInverted.
+template <uint8_t drawMask>
+static inline uint8_t build2BitColMask(const uint8_t* const bitmap, const int glyphWidth, const int glyphX,
+                                       const int glyphYStart, const int count, const bool reverseRows) {
+  uint8_t mask = 0;
+  for (int i = 0; i < count; i++) {
+    const int row = reverseRows ? (glyphYStart + count - 1 - i) : (glyphYStart + i);
+    const uint8_t raw = get2BitPixel(bitmap, glyphWidth, row, glyphX);
+    if ((drawMask >> raw) & 0x01) mask |= static_cast<uint8_t>(1u << (7 - i));
+  }
+  return mask;
+}
+
+// Shared body for Portrait and PortraitInverted 2-bit rendering.
+// inverted=false → Portrait (phyY counts down, phyBitPos counts up).
+// inverted=true  → PortraitInverted (phyY counts up, phyBitPos counts down).
+// Both template params are compile-time constants; all ternaries fold away.
+// `frameBuffer` may be a strip scratch covering only rows [fbOriginY, fbOriginY+fbRows);
+// the writer subtracts fbOriginY when indexing and drops rows outside the band.
+// In non-strip mode the caller passes fbOriginY=0, fbRows=displayHeight, so the
+// translation is a no-op and the existing absolute-row indexing is preserved.
+template <uint8_t drawMask, bool inverted>
+static void renderGlyphFast2BitPortrait(uint8_t* const frameBuffer, const uint8_t* const bitmap, const int glyphWidth,
+                                        const int glyphHeight, const int screenXBase, const int screenYBase,
+                                        const bool writeState, const int displayWidth, const int displayHeight,
+                                        const int widthBytes, const int fbOriginY, const int fbRows) {
+  for (int glyphX = 0; glyphX < glyphWidth; glyphX++) {
+    const int phyY = inverted ? (screenXBase + glyphX) : (displayHeight - 1 - (screenXBase + glyphX));
+    // Single unsigned compare drops both off-band rows (strip mode) and any
+    // out-of-frame row (full-frame mode: fbOriginY=0, fbRows=displayHeight),
+    // matching what the Landscape* cases above do.
+    const int rowY = phyY - fbOriginY;
+    if (static_cast<unsigned>(rowY) >= static_cast<unsigned>(fbRows)) continue;
+    uint8_t* const row = frameBuffer + rowY * widthBytes;
+    for (int glyphY = 0; glyphY < glyphHeight; glyphY += 8) {
+      const int count = std::min(8, glyphHeight - glyphY);
+      const uint8_t mask = build2BitColMask<drawMask>(bitmap, glyphWidth, glyphX, glyphY, count, inverted);
+      if (mask == 0) continue;
+      const int phyBitPos = inverted ? (displayWidth - 1 - screenYBase - (glyphY + count - 1)) : (screenYBase + glyphY);
+      if (phyBitPos + count <= 0 || phyBitPos >= displayWidth) continue;
+      writeRowBits(row, phyBitPos, mask, writeState, widthBytes);
+    }
+  }
+}
+
+template <uint8_t drawMask>
+static void renderGlyphFast2Bit(uint8_t* const frameBuffer, const uint8_t* const bitmap, const int glyphWidth,
+                                const int glyphHeight, const int screenXBase, const int screenYBase,
+                                const bool pixelState, const GfxRenderer::Orientation orientation,
+                                const int displayWidth, const int displayHeight, const int widthBytes,
+                                const int fbOriginY, const int fbRows) {
+  // Non-rotated text fast path for 2-bit glyphs. Writes compact masks directly to framebuffer rows.
+  // TextRotation::Rotated90CW keeps the legacy per-pixel fallback path for safety and readability.
+  // BW (drawMask 0x0E) honors the caller's pixelState; grayscale passes always clear the bit.
+  //
+  // Tiled grayscale: `frameBuffer` may be a strip scratch with origin fbOriginY
+  // and fbRows; we subtract the origin when indexing and clip rows outside the
+  // band. The unsigned compare drops both off-band rows (strip mode) and any
+  // out-of-frame row (full-frame mode) in one branch.
+  const bool writeState = (drawMask == 0x0E) ? pixelState : false;
+
+  switch (orientation) {
+    case GfxRenderer::LandscapeCounterClockwise: {
+      for (int glyphY = 0; glyphY < glyphHeight; glyphY++) {
+        const int phyY = screenYBase + glyphY;
+        const int rowY = phyY - fbOriginY;
+        if (static_cast<unsigned>(rowY) >= static_cast<unsigned>(fbRows)) continue;
+        uint8_t* const row = frameBuffer + rowY * widthBytes;
+        const int rowStartPixel = glyphY * glyphWidth;
+        for (int glyphX = 0; glyphX < glyphWidth; glyphX += 8) {
+          const int count = std::min(8, glyphWidth - glyphX);
+          const int pixelStart = rowStartPixel + glyphX;
+          uint8_t mask;
+          if (count == 8 && (pixelStart & 3) == 0) {
+            const int srcByteIdx = pixelStart >> 2;
+            mask = build2BitRowMaskFromTwoBytes<drawMask>(bitmap[srcByteIdx], bitmap[srcByteIdx + 1]);
+          } else {
+            mask = build2BitRowMask<drawMask>(bitmap, rowStartPixel, glyphX, count, false);
+          }
+          if (mask == 0) continue;
+          const int phyBitPos = screenXBase + glyphX;
+          if (phyBitPos + count <= 0 || phyBitPos >= displayWidth) continue;
+          writeRowBits(row, phyBitPos, mask, writeState, widthBytes);
+        }
+      }
+      break;
+    }
+
+    case GfxRenderer::LandscapeClockwise: {
+      // Row-outer/chunk-inner: framebuffer rows are written at stride widthBytes
+      // (phyY decreases as glyphY increases). Keeping row-outer preserves sequential access
+      // within each row, which is more cache-friendly than the chunk-outer alternative.
+      for (int glyphY = 0; glyphY < glyphHeight; glyphY++) {
+        const int phyY = displayHeight - 1 - (screenYBase + glyphY);
+        const int rowY = phyY - fbOriginY;
+        if (static_cast<unsigned>(rowY) >= static_cast<unsigned>(fbRows)) continue;
+        uint8_t* const row = frameBuffer + rowY * widthBytes;
+        const int rowStartPixel = glyphY * glyphWidth;
+        for (int chunkEnd = glyphWidth - 1; chunkEnd >= 0; chunkEnd -= 8) {
+          const int chunkStart = std::max(0, chunkEnd - 7);
+          const int count = chunkEnd - chunkStart + 1;
+          const int pixelStart = rowStartPixel + chunkStart;
+          uint8_t mask;
+          if (count == 8 && (pixelStart & 3) == 0) {
+            const int srcByteIdx = pixelStart >> 2;
+            mask = reverseBits8(build2BitRowMaskFromTwoBytes<drawMask>(bitmap[srcByteIdx], bitmap[srcByteIdx + 1]));
+          } else {
+            mask = build2BitRowMask<drawMask>(bitmap, rowStartPixel, chunkEnd, count, true);
+          }
+          if (mask == 0) continue;
+          const int phyBitPos = displayWidth - 1 - screenXBase - chunkEnd;
+          if (phyBitPos + count <= 0 || phyBitPos >= displayWidth) continue;
+          writeRowBits(row, phyBitPos, mask, writeState, widthBytes);
+        }
+      }
+      break;
+    }
+
+    case GfxRenderer::Portrait:
+      renderGlyphFast2BitPortrait<drawMask, false>(frameBuffer, bitmap, glyphWidth, glyphHeight, screenXBase,
+                                                   screenYBase, writeState, displayWidth, displayHeight, widthBytes,
+                                                   fbOriginY, fbRows);
+      break;
+
+    case GfxRenderer::PortraitInverted:
+      renderGlyphFast2BitPortrait<drawMask, true>(frameBuffer, bitmap, glyphWidth, glyphHeight, screenXBase,
+                                                  screenYBase, writeState, displayWidth, displayHeight, widthBytes,
+                                                  fbOriginY, fbRows);
+      break;
+  }
+}
 
 // Shared glyph rendering logic for normal and rotated text.
 // Coordinate mapping and cursor advance direction are selected at compile time via the template parameter.
@@ -215,6 +768,23 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
   const int left = glyph->left;
   const int top = glyph->top;
 
+  // Tiled-grayscale band culling: if this glyph's physical y-extent is entirely
+  // outside the active strip, skip it before the expensive bitmap decode. This
+  // is what makes per-band re-rendering cheap. No-op outside strip mode.
+  if constexpr (rotation == TextRotation::Rotated90CW) {
+    const int ob = cursorX + fontData->ascender - top;
+    const int ib = cursorY - left;
+    if (!renderer.glyphIntersectsStrip(ob, ib - (width - 1), ob + height - 1, ib)) {
+      return;
+    }
+  } else {
+    const int gx0 = cursorX + left;
+    const int gy0 = cursorY - top;
+    if (!renderer.glyphIntersectsStrip(gx0, gy0, gx0 + width - 1, gy0 + height - 1)) {
+      return;
+    }
+  }
+
   const uint8_t* bitmap = renderer.getGlyphBitmap(fontData, glyph);
 
   if (bitmap != nullptr) {
@@ -230,6 +800,52 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
     }
 
     if (is2Bit) {
+      // Compute the drawMask once per glyph from the current render mode + text-darkness setting.
+      // The fast path dispatches on this at runtime to a template specialization so the mask is
+      // a compile-time constant inside the inner loops.
+      const uint8_t drawMask = drawMaskFor2BitMode(renderMode, renderer.getTextDarkness());
+
+      // drawMask == 0 means "draw nothing" — used by Maximum darkness to skip grayscale passes.
+      if (drawMask == 0) return;
+
+      if constexpr (rotation == TextRotation::None) {
+        // Fast path for normal text orientation. Handles all device orientations via renderGlyphFast2Bit.
+        // Strip-aware: getWriteTarget() returns the band scratch when a strip is active, otherwise
+        // the live framebuffer; the (fbOriginY, fbRows) pair tells the writer how to translate phyY
+        // and clip rows outside the band.
+        uint8_t* const fb = renderer.getWriteTarget();
+        const int fbOriginY = renderer.getWriteOriginY();
+        const int fbRows = renderer.getWriteRows();
+        switch (drawMask) {
+          case 0x0E:  // BW
+            renderGlyphFast2Bit<0x0E>(fb, bitmap, width, height, innerBase, outerBase, pixelState,
+                                      renderer.getOrientation(), renderer.getDisplayWidth(),
+                                      renderer.getDisplayHeight(), renderer.getDisplayWidthBytes(), fbOriginY, fbRows);
+            break;
+          case 0x06:  // raw {1,2}
+            renderGlyphFast2Bit<0x06>(fb, bitmap, width, height, innerBase, outerBase, pixelState,
+                                      renderer.getOrientation(), renderer.getDisplayWidth(),
+                                      renderer.getDisplayHeight(), renderer.getDisplayWidthBytes(), fbOriginY, fbRows);
+            break;
+          case 0x04:  // raw {2}
+            renderGlyphFast2Bit<0x04>(fb, bitmap, width, height, innerBase, outerBase, pixelState,
+                                      renderer.getOrientation(), renderer.getDisplayWidth(),
+                                      renderer.getDisplayHeight(), renderer.getDisplayWidthBytes(), fbOriginY, fbRows);
+            break;
+          case 0x02:  // raw {1}
+            renderGlyphFast2Bit<0x02>(fb, bitmap, width, height, innerBase, outerBase, pixelState,
+                                      renderer.getOrientation(), renderer.getDisplayWidth(),
+                                      renderer.getDisplayHeight(), renderer.getDisplayWidthBytes(), fbOriginY, fbRows);
+            break;
+        }
+        return;
+      }
+
+      // Rotated text fallback: per-pixel path. Uses the same drawMask as the fast path so darkness
+      // takes effect uniformly. (Previously this branch had a separate X4-only "draw light gray too"
+      // quirk; that quirk is now subsumed by the default darkness=1 mask, which already includes
+      // both AA shades for the MSB pass.)
+      const bool isBW = (drawMask == 0x0E);
       int pixelPosition = 0;
       for (int glyphY = 0; glyphY < height; glyphY++) {
         const int outerCoord = outerBase + glyphY;
@@ -245,26 +861,30 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
 
           const uint8_t byte = bitmap[pixelPosition >> 2];
           const uint8_t bit_index = (3 - (pixelPosition & 3)) * 2;
-          // the direct bit from the font is 0 -> white, 1 -> light gray, 2 -> dark gray, 3 -> black
-          // we swap this to better match the way images and screen think about colors:
-          // 0 -> black, 1 -> dark grey, 2 -> light grey, 3 -> white
-          const uint8_t bmpVal = 3 - ((byte >> bit_index) & 0x3);
+          // raw value straight from the font: 0=white, 1=light gray, 2=dark gray, 3=black
+          const uint8_t raw = (byte >> bit_index) & 0x3;
 
-          if (renderMode == GfxRenderer::BW && bmpVal < 3) {
-            // Black (also paints over the grays in BW mode)
-            renderer.drawPixel(screenX, screenY, pixelState);
-          } else if (renderMode == GfxRenderer::GRAYSCALE_MSB && (bmpVal == 1 || bmpVal == 2)) {
-            // Light gray (also mark the MSB if it's going to be a dark gray too)
-            // Dedicated X3 gray LUTs now provide proper 4-level gray on both devices
-            // We have to flag pixels in reverse for the gray buffers, as 0 leave alone, 1 update
-            renderer.drawPixel(screenX, screenY, false);
-          } else if (renderMode == GfxRenderer::GRAYSCALE_LSB && bmpVal == 1) {
-            // Dark gray
-            renderer.drawPixel(screenX, screenY, false);
+          if ((drawMask >> raw) & 0x01) {
+            // BW honors caller's pixelState; grayscale passes always clear the bit (false)
+            renderer.drawPixel(screenX, screenY, isBW ? pixelState : false);
           }
         }
       }
     } else {
+      // Fast path: 1-bit BW mode, non-rotated text — byte-level framebuffer writes, no drawPixel() per pixel.
+      // renderGlyphFastBW is NOT strip-aware (no fbOriginY/fbRows in its signature) and would
+      // mis-index into the strip scratch as if it were the full framebuffer. Today no caller
+      // activates a strip in BW mode, but route to the per-pixel fallback (drawPixel is
+      // strip-aware) if that ever changes so we never hand a strip buffer to the fast helper.
+      if constexpr (rotation == TextRotation::None) {
+        if (renderMode == GfxRenderer::BW && !renderer.isStripActive()) {
+          renderGlyphFastBW(renderer.getFrameBuffer(), bitmap, width, height, innerBase, outerBase, pixelState,
+                            renderer.getOrientation(), renderer.getDisplayWidth(), renderer.getDisplayHeight(),
+                            renderer.getDisplayWidthBytes());
+          return;
+        }
+      }
+      // Fallback: rotated text or non-BW render mode — per-pixel drawPixel().
       int pixelPosition = 0;
       for (int glyphY = 0; glyphY < height; glyphY++) {
         const int outerCoord = outerBase + glyphY;
@@ -290,29 +910,194 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
   }
 }
 
+// Render a glyph at an arbitrary scale factor.
+// Used for heading font-size scaling (e.g. h1=1.6×, h2=1.4×, h3=1.2×) and per-word inline
+// sizes, including superscript/subscript (which carry an explicit size percentage instead
+// of a hardwired 50% — the SUP/SUB style bits only shift the baseline).
+// Upscaling (scale > 1.0) uses area-weighted coverage resampling so enlarged headings stay
+// anti-aliased and keep the body font's visual weight instead of the jagged, over-bold look
+// nearest-neighbor produced. Downscaling (scale < 1.0) keeps crisp nearest-neighbor point-
+// sampling.
+static void renderCharAtScale(const GfxRenderer& renderer, GfxRenderer::RenderMode renderMode,
+                              const EpdFontFamily& fontFamily, const uint32_t cp, int cursorX, int cursorY,
+                              const bool pixelState, const EpdFontFamily::Style style, const float scale,
+                              const uint8_t minRaw2Bit = 1) {
+  const EpdGlyph* glyph = fontFamily.getGlyph(cp, style);
+  if (!glyph) return;
+
+  const EpdFontData* fontData = fontFamily.getData(style);
+  const uint8_t* bitmap = renderer.getGlyphBitmap(fontData, glyph);
+  if (!bitmap) return;
+
+  const int srcW = glyph->width;
+  const int srcH = glyph->height;
+  if (srcW <= 0 || srcH <= 0) return;
+
+  const int dstW = static_cast<int>(srcW * scale + 0.5f);
+  const int dstH = static_cast<int>(srcH * scale + 0.5f);
+  if (dstW <= 0 || dstH <= 0) return;
+
+  const int baseX = cursorX + static_cast<int>(glyph->left * scale + 0.5f);
+  const int baseY = cursorY - static_cast<int>(glyph->top * scale + 0.5f);
+
+  // The ESP32-C3 has no FPU — every float op in a per-pixel loop is a soft-float call
+  // costing hundreds of cycles. Both resampling paths therefore run in 16.16 fixed point:
+  // the ONLY float operation per glyph is the one-time conversion of `scale` into a
+  // fixed-point step; the pixel loops are pure integer (the C3's M extension gives a
+  // hardware divider for the one division per upscaled pixel).
+  constexpr int FP_SHIFT = 16;
+  constexpr int32_t FP_ONE = 1 << FP_SHIFT;
+  const int32_t invScaleFP = static_cast<int32_t>(FP_ONE / scale + 0.5f);
+
+  // Per-source-pixel raw ink level: 2-bit fonts carry 4 AA levels (0..3); 1-bit fonts map
+  // to 0 or 3. Shared by both resampling paths below.
+  const bool is2Bit = fontData->is2Bit;
+  auto srcRaw = [&](const int sx, const int sy) -> uint8_t {
+    const int pos = sy * srcW + sx;
+    if (is2Bit) {
+      const uint8_t byte = bitmap[pos >> 2];
+      return (byte >> ((3 - (pos & 3)) * 2)) & 0x3;
+    }
+    const uint8_t byte = bitmap[pos >> 3];
+    return ((byte >> (7 - (pos & 7))) & 1) ? 3 : 0;
+  };
+
+  // Downscaling (small-caps fold, sup/sub, shrunken inline sizes) stays on the crisp
+  // nearest-neighbor point-sample: shrinking already suppresses jaggies, and area-averaging
+  // would only blur thin strokes below the 50% threshold and drop them. Downscalers pass
+  // minRaw2Bit=2 to keep only the dark shades. srcX/srcY advance by a fixed-point step
+  // instead of the historical per-pixel float division (identical floor semantics).
+  if (scale < 1.0f) {
+    const uint8_t minRaw1Bit = 1;  // 1-bit fonts: any ink draws
+    int32_t srcYFP = 0;
+    for (int dstY = 0; dstY < dstH; dstY++, srcYFP += invScaleFP) {
+      const int srcY = srcYFP >> FP_SHIFT;
+      if (srcY >= srcH) break;
+      int32_t srcXFP = 0;
+      for (int dstX = 0; dstX < dstW; dstX++, srcXFP += invScaleFP) {
+        const int srcX = srcXFP >> FP_SHIFT;
+        if (srcX >= srcW) break;
+        const uint8_t raw = srcRaw(srcX, srcY);
+        if (raw >= (is2Bit ? minRaw2Bit : minRaw1Bit)) {
+          renderer.drawPixel(baseX + dstX, baseY + dstY, pixelState);
+        }
+      }
+    }
+    return;
+  }
+
+  // Upscaling (heading scale, e.g. h1=1.6×): area-weighted coverage resampling that preserves the
+  // font's grayscale AA. Nearest-neighbor bloated each source pixel into a scale×scale solid block,
+  // so light-gray AA edge pixels (raw==1, 33% coverage) rendered as full-black blocks — the jagged,
+  // over-bold look.
+  //
+  // Here each destination pixel integrates the fractional source coverage over the source region it
+  // maps back to (0..1), then re-quantizes that coverage into a 2-bit AA level (0=white .. 3=black).
+  // That reconstructed level feeds the SAME multi-pass machinery body text uses: drawMaskFor2BitMode
+  // decides, per render pass and darkness setting, whether this level draws into the current plane.
+  // In grayscale render modes the enlarged heading therefore emits true gray edge pixels (MSB/LSB
+  // planes) instead of a hard 1-bit threshold; in BW mode every non-white level draws, matching the
+  // body font's weight. Grayscale passes always clear the bit (draw false), exactly like the body
+  // per-pixel path — only the BW pass honors the caller's pixelState.
+  const uint8_t drawMask = drawMaskFor2BitMode(renderMode, renderer.getTextDarkness());
+  if (drawMask == 0) return;  // Maximum darkness suppresses grayscale passes entirely
+  const bool isBW = (drawMask == 0x0E);
+
+  // Area integration in fixed point. Overlap extents are 16.16 and bounded by
+  // invScaleFP <= FP_ONE (scale >= 1); the raw x h x w product needs 64 bits, which
+  // RV32IM handles with a few integer multiplies — still an order of magnitude cheaper
+  // than one soft-float op. Verified pixel-equivalent to the historical float path
+  // (differences only at mathematically exact quantization ties, ~0.2% of AA edge
+  // pixels, where the float result was itself rounding-dependent).
+  const int64_t dstPixelAreaFP = static_cast<int64_t>(invScaleFP) * invScaleFP;
+  int32_t srcY0FP = 0;
+  for (int dstY = 0; dstY < dstH; dstY++, srcY0FP += invScaleFP) {
+    const int32_t srcY1FP = srcY0FP + invScaleFP;
+    const int sy0 = srcY0FP >> FP_SHIFT;
+    const int sy1 = std::min(static_cast<int>((srcY1FP - 1) >> FP_SHIFT), srcH - 1);
+    int32_t srcX0FP = 0;
+    for (int dstX = 0; dstX < dstW; dstX++, srcX0FP += invScaleFP) {
+      const int32_t srcX1FP = srcX0FP + invScaleFP;
+      const int sx0 = srcX0FP >> FP_SHIFT;
+      const int sx1 = std::min(static_cast<int>((srcX1FP - 1) >> FP_SHIFT), srcW - 1);
+
+      int64_t covered = 0;
+      for (int sy = sy0; sy <= sy1; sy++) {
+        const int32_t hOverlapFP = std::min(srcY1FP, static_cast<int32_t>(sy + 1) << FP_SHIFT) -
+                                   std::max(srcY0FP, static_cast<int32_t>(sy) << FP_SHIFT);
+        if (hOverlapFP <= 0) continue;
+        for (int sx = sx0; sx <= sx1; sx++) {
+          const uint8_t raw = srcRaw(sx, sy);
+          if (raw == 0) continue;
+          const int32_t wOverlapFP = std::min(srcX1FP, static_cast<int32_t>(sx + 1) << FP_SHIFT) -
+                                     std::max(srcX0FP, static_cast<int32_t>(sx) << FP_SHIFT);
+          if (wOverlapFP <= 0) continue;
+          covered += static_cast<int64_t>(raw) * hOverlapFP * wOverlapFP;
+        }
+      }
+      // covered / dstPixelArea is 3x the ink fraction (raw already carries the x3 of the
+      // source encoding); round to the nearest level 0..3. Mirrors the source font's raw
+      // encoding so the drawMask logic is identical to the body-text per-pixel path.
+      const uint8_t raw = static_cast<uint8_t>(std::min<int64_t>(3, (covered + dstPixelAreaFP / 2) / dstPixelAreaFP));
+      if ((drawMask >> raw) & 0x01) {
+        renderer.drawPixel(baseX + dstX, baseY + dstY, isBW ? pixelState : false);
+      }
+    }
+  }
+}
+
 // IMPORTANT: This function is in critical rendering path and is called for every pixel. Please keep it as simple and
 // efficient as possible.
 void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
   int phyX = 0;
   int phyY = 0;
+  const int displayWidth = getDisplayWidth();
+  const int displayHeight = getDisplayHeight();
 
   // Note: this call should be inlined for better performance
-  rotateCoordinates(orientation, x, y, &phyX, &phyY, panelWidth, panelHeight);
+  rotateCoordinates(getOrientation(), x, y, &phyX, &phyY, displayWidth, displayHeight);
 
   // Bounds checking against runtime panel dimensions
-  if (phyX < 0 || phyX >= panelWidth || phyY < 0 || phyY >= panelHeight) {
+  if (phyX < 0 || phyX >= displayWidth || phyY < 0 || phyY >= displayHeight) {
     LOG_ERR("GFX", "!! Outside range (%d, %d) -> (%d, %d)", x, y, phyX, phyY);
     return;
   }
 
+  uint8_t* target = frameBuffer;
+  const uint32_t rowY = static_cast<uint32_t>(phyY);
+
   // Calculate byte position and bit position
-  const uint32_t byteIndex = static_cast<uint32_t>(phyY) * panelWidthBytes + (phyX / 8);
+  const uint32_t byteIndex = rowY * getDisplayWidthBytes() + (phyX / 8);
   const uint8_t bitPosition = 7 - (phyX % 8);  // MSB first
 
   if (state) {
-    frameBuffer[byteIndex] &= ~(1 << bitPosition);  // Clear bit
+    target[byteIndex] &= ~(1 << bitPosition);  // Clear bit
   } else {
-    frameBuffer[byteIndex] |= 1 << bitPosition;  // Set bit
+    target[byteIndex] |= 1 << bitPosition;  // Set bit
+  }
+}
+
+void GfxRenderer::writePhysicalPortraitPackedRow(const int physicalY, const uint8_t* packedRow, const int pixelWidth,
+                                                 const bool invertBits) const {
+  if (!frameBuffer || !packedRow || pixelWidth <= 0 || physicalY < 0 || physicalY >= static_cast<int>(panelWidth)) {
+    return;
+  }
+
+  const int visiblePixels = std::min(pixelWidth, static_cast<int>(panelHeight));
+  const int controllerX = physicalY;
+  const int byteCol = controllerX >> 3;
+  const uint8_t dstMask = static_cast<uint8_t>(0x80u >> (controllerX & 7));
+
+  for (int physicalX = 0; physicalX < visiblePixels; physicalX++) {
+    uint8_t bit = static_cast<uint8_t>((packedRow[physicalX >> 3] >> (7 - (physicalX & 7))) & 1);
+    if (invertBits) bit ^= 1;
+    const int controllerY = static_cast<int>(panelHeight) - 1 - physicalX;
+    uint8_t* const dst = frameBuffer + static_cast<uint32_t>(controllerY) * panelWidthBytes + byteCol;
+    if (bit) {
+      *dst |= dstMask;
+    } else {
+      *dst &= static_cast<uint8_t>(~dstMask);
+    }
   }
 }
 
@@ -320,6 +1105,11 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
   const auto fontIt = fontMap.find(fontId);
   if (fontIt == fontMap.end()) {
     LOG_ERR("GFX", "Font %d not found", fontId);
+    return 0;
+  }
+
+  if (fontCacheManager_ && fontCacheManager_->isScanning()) {
+    fontCacheManager_->recordText(text, fontId, style);
     return 0;
   }
 
@@ -337,10 +1127,13 @@ void GfxRenderer::drawCenteredText(const int fontId, const int y, const char* te
 void GfxRenderer::drawText(const int fontId, const int x, const int y, const char* text, const bool black,
                            const EpdFontFamily::Style style) const {
   const int yPos = y + getFontAscenderSize(fontId);
+  const int screenWidth = getScreenWidth();
+  const int screenHeight = getScreenHeight();
   int lastBaseX = x;
   int lastBaseLeft = 0;
   int lastBaseWidth = 0;
   int lastBaseTop = 0;
+  int lastBaseAdvanceFP = 0;  // 12.4 fixed-point
   int32_t prevAdvanceFP = 0;  // 12.4 fixed-point: prev glyph's advance + next kern for snap
 
   // cannot draw a NULL / empty string
@@ -359,6 +1152,7 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
     return;
   }
   const auto& font = fontIt->second;
+  const auto renderModeSnapshot = getRenderMode();
 
   uint32_t cp;
   uint32_t prevCp = 0;
@@ -369,47 +1163,184 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
       const int raiseBy = combiningMark::raiseAboveBase(combiningGlyph->top, combiningGlyph->height, lastBaseTop);
       const int combiningX = combiningMark::centerOver(lastBaseX, lastBaseLeft, lastBaseWidth, combiningGlyph->left,
                                                        combiningGlyph->width);
-      renderCharImpl<TextRotation::None>(*this, renderMode, font, cp, combiningX, yPos - raiseBy, black, style);
+      renderCharImpl<TextRotation::None>(*this, renderModeSnapshot, font, cp, combiningX, yPos - raiseBy, black, style);
       continue;
     }
 
     cp = font.applyLigatures(cp, text, style);
 
+    // Small-caps: fold lowercase to its uppercase glyph and draw it scaled.  Decided
+    // per glyph so already-uppercase letters, digits and punctuation stay full-size.
+    const bool smallCapsStyle = (style & EpdFontFamily::SMALL_CAPS) != 0;
+    const bool folded = smallCapsStyle && smallCaps::fold(cp);
+
     // Differential rounding: snap (previous advance + current kern) as one unit so
     // identical character pairs always produce the same pixel step regardless of
     // where they fall on the line.
     if (prevCp != 0) {
-      const auto kernFP = font.getKerning(prevCp, cp, style);  // 4.4 fixed-point kern
-      lastBaseX += fp4::toPixel(prevAdvanceFP + kernFP);       // snap 12.4 fixed-point to nearest pixel
+      auto kernFP = static_cast<int32_t>(font.getKerning(prevCp, cp, style));  // 4.4 fixed-point kern
+      if (folded) kernFP = static_cast<int32_t>(kernFP * smallCaps::SCALE + 0.5f);
+      lastBaseX += fp4::toPixel(prevAdvanceFP + kernFP);  // snap 12.4 fixed-point to nearest pixel
     }
 
     const EpdGlyph* glyph = font.getGlyph(cp, style);
+    if (!glyph) {
+      lastBaseX += fp4::toPixel(prevAdvanceFP);
+      prevCp = 0;
+      prevAdvanceFP = 0;
+      lastBaseLeft = 0;
+      lastBaseWidth = 0;
+      lastBaseTop = 0;
+      lastBaseAdvanceFP = 0;
+      continue;
+    }
 
-    lastBaseLeft = glyph ? glyph->left : 0;
-    lastBaseWidth = glyph ? glyph->width : 0;
-    lastBaseTop = glyph ? glyph->top : 0;
-    prevAdvanceFP = glyph ? glyph->advanceX : 0;  // 12.4 fixed-point
+    // Folded glyphs render at smallCaps::SCALE, so layout metrics scale to match.
+    const int effLeft = folded ? static_cast<int>(glyph->left * smallCaps::SCALE) : glyph->left;
+    const int effWidth = folded ? static_cast<int>(glyph->width * smallCaps::SCALE + 0.5f) : glyph->width;
+    const int effHeight = folded ? static_cast<int>(glyph->height * smallCaps::SCALE + 0.5f) : glyph->height;
+    const int effTop = folded ? static_cast<int>(glyph->top * smallCaps::SCALE) : glyph->top;
 
-    renderCharImpl<TextRotation::None>(*this, renderMode, font, cp, lastBaseX, yPos, black, style);
+    lastBaseLeft = effLeft;
+    lastBaseWidth = effWidth;
+    lastBaseTop = effTop;
+    lastBaseAdvanceFP = glyph->advanceX;
+
+    // SUP/SUB glyph scaling is no longer applied here: superscript/subscript words carry
+    // an explicit per-word size percentage (ChapterHtmlSlimParser), so they arrive via
+    // drawTextScaled. The SUP/SUB style bits only shift the baseline in TextBlock::render.
+    if (folded) {
+      lastBaseAdvanceFP = static_cast<int>(lastBaseAdvanceFP * smallCaps::SCALE + 0.5f);
+    }
+    prevAdvanceFP = lastBaseAdvanceFP;
+
+    // Skip rasterization for glyphs fully outside the logical viewport.
+    // This avoids expensive per-pixel bounds checks and noisy OOB logs when
+    // long lines overflow past the right edge.
+    const int glyphX = lastBaseX + effLeft;
+    const int glyphY = yPos - effTop;
+    const bool glyphOffscreen = (effWidth <= 0 || effHeight <= 0 || glyphX >= screenWidth || glyphY >= screenHeight ||
+                                 glyphX + effWidth <= 0 || glyphY + effHeight <= 0);
+    if (glyphOffscreen) {
+      prevCp = cp;
+      continue;
+    }
+
+    if (folded) {
+      renderCharAtScale(*this, renderModeSnapshot, font, cp, lastBaseX, yPos, black, style, smallCaps::SCALE,
+                        /*minRaw2Bit=*/2);
+    } else {
+      renderCharImpl<TextRotation::None>(*this, renderModeSnapshot, font, cp, lastBaseX, yPos, black, style);
+    }
     prevCp = cp;
   }
 }
 
+void GfxRenderer::drawTextScaled(const int fontId, const int x, const int y, const char* text, const bool black,
+                                 const EpdFontFamily::Style style, const float scale) const {
+  if (scale <= 0.0f || (scale > 0.99f && scale < 1.01f)) {
+    drawText(fontId, x, y, text, black, style);
+    return;
+  }
+
+  if (text == nullptr || *text == '\0') return;
+
+  if (fontCacheManager_ && fontCacheManager_->isScanning()) {
+    fontCacheManager_->recordText(text, fontId, style);
+    return;
+  }
+
+  const auto fontIt = fontMap.find(fontId);
+  if (fontIt == fontMap.end()) return;
+  const auto& font = fontIt->second;
+  const auto renderModeSnapshot = getRenderMode();
+
+  const int yPos = y + static_cast<int>(getFontAscenderSize(fontId) * scale + 0.5f);
+  int32_t cursorFP = x << 4;  // 12.4 fixed-point
+
+  const bool smallCapsStyle = (style & EpdFontFamily::SMALL_CAPS) != 0;
+  // Sup/sub glyphs keep the crisp dark-shade threshold the dedicated 50% sampler used:
+  // dropping the light-gray AA level stops small raised/lowered digits going muddy.
+  const bool isSupSub = (style & (EpdFontFamily::SUP | EpdFontFamily::SUB)) != 0;
+  uint32_t cp;
+  uint32_t prevCp = 0;
+  const char* p = text;
+  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&p)))) {
+    // Small-caps composes with the heading scale: folded glyphs render at scale*SCALE.
+    const bool folded = smallCapsStyle && smallCaps::fold(cp);
+    const float effScale = folded ? scale * smallCaps::SCALE : scale;
+
+    const EpdGlyph* glyph = font.getGlyph(cp, style);
+    if (!glyph) {
+      prevCp = cp;
+      continue;
+    }
+
+    // Apply kerning scaled
+    if (prevCp) {
+      int kern = font.getKerning(prevCp, cp, style);
+      cursorFP += static_cast<int>(kern * effScale + 0.5f);
+    }
+
+    const int cursorX = (cursorFP + 8) >> 4;
+    renderCharAtScale(*this, renderModeSnapshot, font, cp, cursorX, yPos, black, style, effScale,
+                      /*minRaw2Bit=*/(folded || isSupSub) ? 2 : 1);
+
+    const int scaledAdvanceFP = static_cast<int>(glyph->advanceX * effScale + 0.5f);
+    cursorFP += scaledAdvanceFP;
+    prevCp = cp;
+  }
+}
+
+int GfxRenderer::getTextWidthScaled(const int fontId, const char* text, const EpdFontFamily::Style style,
+                                    const float scale) const {
+  return static_cast<int>(getTextWidth(fontId, text, style) * scale + 0.5f);
+}
+
+int GfxRenderer::getLineHeightScaled(const int fontId, const float scale) const {
+  return static_cast<int>(getLineHeight(fontId) * scale + 0.5f);
+}
+
+int GfxRenderer::getFontAscenderSizeScaled(const int fontId, const float scale) const {
+  return static_cast<int>(getFontAscenderSize(fontId) * scale + 0.5f);
+}
+
 void GfxRenderer::drawLine(int x1, int y1, int x2, int y2, const bool state) const {
   if (fontCacheManager_ && fontCacheManager_->isScanning()) return;
+  const int displayWidth = getDisplayWidth();
+  const int displayHeight = getDisplayHeight();
+
   if (x1 == x2) {
     if (y2 < y1) {
       std::swap(y1, y2);
     }
-    for (int y = y1; y <= y2; y++) {
-      drawPixel(x1, y, state);
+    // In Portrait/PortraitInverted a logical vertical line maps to a physical horizontal span.
+    switch (getOrientation()) {
+      case Portrait:
+        fillPhysicalHSpan(displayHeight - 1 - x1, y1, y2, state);
+        return;
+      case PortraitInverted:
+        fillPhysicalHSpan(x1, displayWidth - 1 - y2, displayWidth - 1 - y1, state);
+        return;
+      default:
+        for (int y = y1; y <= y2; y++) drawPixel(x1, y, state);
+        return;
     }
   } else if (y1 == y2) {
     if (x2 < x1) {
       std::swap(x1, x2);
     }
-    for (int x = x1; x <= x2; x++) {
-      drawPixel(x, y1, state);
+    // In Landscape a logical horizontal line maps to a physical horizontal span.
+    switch (getOrientation()) {
+      case LandscapeCounterClockwise:
+        fillPhysicalHSpan(y1, x1, x2, state);
+        return;
+      case LandscapeClockwise:
+        fillPhysicalHSpan(displayHeight - 1 - y1, displayWidth - 1 - x2, displayWidth - 1 - x1, state);
+        return;
+      default:
+        for (int x = x1; x <= x2; x++) drawPixel(x, y1, state);
+        return;
     }
   } else {
     // Bresenham's line algorithm — integer arithmetic only
@@ -561,73 +1492,89 @@ void GfxRenderer::drawRoundedRect(const int x, const int y, const int width, con
   }
 }
 
-void GfxRenderer::fillRect(const int x, const int y, const int width, const int height, const bool state) const {
-  for (int fillY = y; fillY < y + height; fillY++) {
-    drawLine(x, fillY, x + width - 1, fillY, state);
-  }
-}
+// Write a patterned horizontal span directly into the physical framebuffer with byte-level operations.
+// patternByte is repeated across the full span; partial edge bytes are blended with existing content.
+// Bit layout: MSB-first (bit 7 = phyX=0, bit 0 = phyX=7); 0 bits = dark pixel, 1 bits = white pixel.
+void GfxRenderer::fillPhysicalHSpanByte(const int phyY, const int phyX_start, const int phyX_end,
+                                        const uint8_t patternByte) const {
+  const int cX0 = std::max(phyX_start, 0);
+  const int cX1 = std::min(phyX_end, (int)getDisplayWidth() - 1);
+  if (cX0 > cX1 || phyY < 0 || phyY >= (int)getDisplayHeight()) return;
 
-// Bit layout reminder (matches drawPixel at top of file): for a physical
-// panel pixel at column phyX in a byte, bitPosition = 7 - (phyX % 8), MSB
-// first. State=true in drawPixel CLEARS the bit (renders black). White
-// pixels therefore have bit=1. To "clear" a region to white, we set all
-// the affected bits to 1 (OR the appropriate masks into the panel bytes).
-void GfxRenderer::clearRect(const int x, const int y, const int width, const int height) const {
-  if (width <= 0 || height <= 0) return;
+  uint8_t* target = frameBuffer;
+  const int rowY = phyY;
 
-  // Rotate two opposite corners of the screen rect into panel coordinates
-  // and take their axis-aligned bounding box — same approach used by
-  // screenRectToAlignedMemRect above, but we don't need to snap to
-  // byte boundaries because we mask the leading/trailing bits below.
-  int px1, py1, px2, py2;
-  rotateCoordinates(orientation, x, y, &px1, &py1, panelWidth, panelHeight);
-  rotateCoordinates(orientation, x + width - 1, y + height - 1, &px2, &py2, panelWidth, panelHeight);
+  uint8_t* const row = target + rowY * getDisplayWidthBytes();
+  const int startByte = cX0 >> 3;
+  const int endByte = cX1 >> 3;
+  const int leftBits = cX0 & 7;   // first bit index within startByte
+  const int rightBits = cX1 & 7;  // last bit index within endByte
 
-  int pMinX = std::min(px1, px2);
-  int pMaxX = std::max(px1, px2);
-  int pMinY = std::min(py1, py2);
-  int pMaxY = std::max(py1, py2);
-
-  // Clamp to panel bounds. Silently drop a fully out-of-bounds rect; that
-  // matches the policy of drawPixel (which logs and returns) but without
-  // the log spam if the caller intentionally passes margin-overlapping
-  // rects.
-  if (pMaxX < 0 || pMinX >= panelWidth || pMaxY < 0 || pMinY >= panelHeight) return;
-  if (pMinX < 0) pMinX = 0;
-  if (pMaxX >= panelWidth) pMaxX = panelWidth - 1;
-  if (pMinY < 0) pMinY = 0;
-  if (pMaxY >= panelHeight) pMaxY = panelHeight - 1;
-
-  const int firstByte = pMinX / 8;
-  const int lastByte = pMaxX / 8;
-  const int leftBit = pMinX & 7;
-  const int rightBit = pMaxX & 7;
-
-  if (firstByte == lastByte) {
-    // Strip fits inside one byte per panel row. Build a single mask
-    // covering bits (7 - leftBit) .. (7 - rightBit) inclusive.
-    const uint8_t mask = static_cast<uint8_t>(static_cast<uint8_t>(0xFFu >> leftBit) &
-                                              static_cast<uint8_t>((0xFFu << (7 - rightBit)) & 0xFFu));
-    for (int py = pMinY; py <= pMaxY; py++) {
-      frameBuffer[static_cast<uint32_t>(py) * panelWidthBytes + firstByte] |= mask;
-    }
+  if (startByte == endByte) {
+    // Both endpoints in the same byte
+    const uint8_t fillMask = (0xFF >> leftBits) & ~(0xFF >> (rightBits + 1));
+    row[startByte] = (row[startByte] & ~fillMask) | (patternByte & fillMask);
     return;
   }
 
-  // Multi-byte case: leading partial byte (OR), middle full bytes (memset
-  // 0xFF), trailing partial byte (OR).
-  const uint8_t leadingMask = static_cast<uint8_t>(0xFFu >> leftBit);
-  const uint8_t trailingMask = static_cast<uint8_t>((0xFFu << (7 - rightBit)) & 0xFFu);
-  const int middleStart = firstByte + 1;
-  const int middleCount = lastByte - middleStart;  // 0 when lastByte == firstByte + 1
+  // Left partial byte
+  if (leftBits != 0) {
+    const uint8_t fillMask = 0xFF >> leftBits;
+    row[startByte] = (row[startByte] & ~fillMask) | (patternByte & fillMask);
+  }
 
-  for (int py = pMinY; py <= pMaxY; py++) {
-    const uint32_t rowStart = static_cast<uint32_t>(py) * panelWidthBytes;
-    frameBuffer[rowStart + firstByte] |= leadingMask;
-    if (middleCount > 0) {
-      memset(&frameBuffer[rowStart + middleStart], 0xFF, static_cast<size_t>(middleCount));
-    }
-    frameBuffer[rowStart + lastByte] |= trailingMask;
+  // Full bytes in the middle
+  const int fullStart = (leftBits == 0) ? startByte : startByte + 1;
+  const int fullEnd = (rightBits == 7) ? endByte : endByte - 1;
+  if (fullStart <= fullEnd) {
+    memset(row + fullStart, patternByte, fullEnd - fullStart + 1);
+  }
+
+  // Right partial byte
+  if (rightBits != 7) {
+    const uint8_t fillMask = ~(0xFF >> (rightBits + 1));
+    row[endByte] = (row[endByte] & ~fillMask) | (patternByte & fillMask);
+  }
+}
+
+// Thin wrapper: state=true → 0x00 (all dark), false → 0xFF (all white).
+void GfxRenderer::fillPhysicalHSpan(const int phyY, const int phyX_start, const int phyX_end, const bool state) const {
+  fillPhysicalHSpanByte(phyY, phyX_start, phyX_end, state ? 0x00 : 0xFF);
+}
+
+void GfxRenderer::fillRect(const int x, const int y, const int width, const int height, const bool state) const {
+  if (width <= 0 || height <= 0) return;
+
+  const int displayWidth = getDisplayWidth();
+  const int displayHeight = getDisplayHeight();
+
+  // For each orientation, one logical dimension maps to a constant physical row, allowing the
+  // perpendicular dimension to be written as a byte-level span — eliminating per-pixel overhead.
+  switch (getOrientation()) {
+    case Portrait:
+      // Logical column x → physical row (displayHeight-1-x); logical y range → physical x span
+      for (int lx = x; lx < x + width; lx++) {
+        fillPhysicalHSpan(displayHeight - 1 - lx, y, y + height - 1, state);
+      }
+      return;
+    case PortraitInverted:
+      // Logical column x → physical row x; logical y range → physical x span (mirrored)
+      for (int lx = x; lx < x + width; lx++) {
+        fillPhysicalHSpan(lx, displayWidth - 1 - (y + height - 1), displayWidth - 1 - y, state);
+      }
+      return;
+    case LandscapeCounterClockwise:
+      // Logical row y → physical row y; logical x range → physical x span
+      for (int ly = y; ly < y + height; ly++) {
+        fillPhysicalHSpan(ly, x, x + width - 1, state);
+      }
+      return;
+    case LandscapeClockwise:
+      // Logical row y → physical row (displayHeight-1-y); logical x range → physical x span (mirrored)
+      for (int ly = y; ly < y + height; ly++) {
+        fillPhysicalHSpan(displayHeight - 1 - ly, displayWidth - 1 - (x + width - 1), displayWidth - 1 - x, state);
+      }
+      return;
   }
 }
 
@@ -664,52 +1611,77 @@ void GfxRenderer::fillRectDither(const int x, const int y, const int width, cons
     fillRect(x, y, width, height, true);
   } else if (color == Color::White) {
     fillRect(x, y, width, height, false);
-  } else if (color == Color::LightGray) {
-    for (int fillY = y; fillY < y + height; fillY++) {
-      for (int fillX = x; fillX < x + width; fillX++) {
-        drawPixelDither<Color::LightGray>(fillX, fillY);
-      }
-    }
   } else if (color == Color::DarkGray) {
-    for (int fillY = y; fillY < y + height; fillY++) {
-      for (int fillX = x; fillX < x + width; fillX++) {
-        drawPixelDither<Color::DarkGray>(fillX, fillY);
-      }
-    }
-  }
-}
-
-void GfxRenderer::maskRoundedRectOutsideCorners(const int x, const int y, const int width, const int height,
-                                                const int radius, const Color color) const {
-  if (radius <= 0 || color == Color::Clear) {
-    return;
-  }
-
-  const int rr = radius - 1;
-  const int rr2 = rr * rr;
-  for (int dy = 0; dy < radius; dy++) {
-    for (int dx = 0; dx < radius; dx++) {
-      const int tx = rr - dx;
-      const int ty = rr - dy;
-      if (tx * tx + ty * ty > rr2) {
-        if (color == Color::White || color == Color::Black) {
-          bool state = color == Color::Black;
-          drawPixel(x + dx, y + dy, state);                           // top-left
-          drawPixel(x + width - 1 - dx, y + dy, state);               // top-right
-          drawPixel(x + dx, y + height - 1 - dy, state);              // bottom-left
-          drawPixel(x + width - 1 - dx, y + height - 1 - dy, state);  // bottom-right
-        } else if (color == Color::LightGray) {
-          drawPixelDither<Color::LightGray>(x + dx, y + dy);                           // top-left
-          drawPixelDither<Color::LightGray>(x + width - 1 - dx, y + dy);               // top-right
-          drawPixelDither<Color::LightGray>(x + dx, y + height - 1 - dy);              // bottom-left
-          drawPixelDither<Color::LightGray>(x + width - 1 - dx, y + height - 1 - dy);  // bottom-right
-        } else if (color == Color::DarkGray) {
-          drawPixelDither<Color::DarkGray>(x + dx, y + dy);                           // top-left
-          drawPixelDither<Color::DarkGray>(x + width - 1 - dx, y + dy);               // top-right
-          drawPixelDither<Color::DarkGray>(x + dx, y + height - 1 - dy);              // bottom-left
-          drawPixelDither<Color::DarkGray>(x + width - 1 - dx, y + height - 1 - dy);  // bottom-right
+    // Pattern: dark where (phyX + phyY) % 2 == 0 (alternating checkerboard).
+    // Byte patterns (phyY even / phyY odd):
+    //   Portrait / PortraitInverted: 0xAA / 0x55
+    //   LandscapeCW / LandscapeCCW: 0x55 / 0xAA
+    switch (getOrientation()) {
+      case Portrait:
+        for (int lx = x; lx < x + width; lx++) {
+          const int phyY = getDisplayHeight() - 1 - lx;
+          const uint8_t pb = (phyY % 2 == 0) ? 0xAA : 0x55;
+          fillPhysicalHSpanByte(phyY, y, y + height - 1, pb);
         }
-      }
+        return;
+      case PortraitInverted:
+        for (int lx = x; lx < x + width; lx++) {
+          const int phyY = lx;
+          const uint8_t pb = (phyY % 2 == 0) ? 0xAA : 0x55;
+          fillPhysicalHSpanByte(phyY, getDisplayWidth() - 1 - (y + height - 1), getDisplayWidth() - 1 - y, pb);
+        }
+        return;
+      case LandscapeCounterClockwise:
+        for (int ly = y; ly < y + height; ly++) {
+          const int phyY = ly;
+          const uint8_t pb = (phyY % 2 == 0) ? 0x55 : 0xAA;
+          fillPhysicalHSpanByte(phyY, x, x + width - 1, pb);
+        }
+        return;
+      case LandscapeClockwise:
+        for (int ly = y; ly < y + height; ly++) {
+          const int phyY = getDisplayHeight() - 1 - ly;
+          const uint8_t pb = (phyY % 2 == 0) ? 0x55 : 0xAA;
+          fillPhysicalHSpanByte(phyY, getDisplayWidth() - 1 - (x + width - 1), getDisplayWidth() - 1 - x, pb);
+        }
+        return;
+    }
+  } else if (color == Color::LightGray) {
+    // Pattern: dark where phyX % 2 == 0 && phyY % 2 == 0 (1-in-4 pixels dark).
+    // Byte patterns (phyY even / phyY odd) — 0xFF rows write no dark pixels and are skipped:
+    //   Portrait:         0xFF (skip) / 0x55
+    //   PortraitInverted: 0xAA        / 0xFF (skip)
+    //   LandscapeCCW:     0x55        / 0xFF (skip)
+    //   LandscapeCW:      0xFF (skip) / 0xAA
+    switch (getOrientation()) {
+      case Portrait:
+        for (int lx = x; lx < x + width; lx++) {
+          const int phyY = getDisplayHeight() - 1 - lx;
+          if (phyY % 2 == 0) continue;  // all-white row — no dark pixels to write
+          fillPhysicalHSpanByte(phyY, y, y + height - 1, 0x55);
+        }
+        return;
+      case PortraitInverted:
+        for (int lx = x; lx < x + width; lx++) {
+          const int phyY = lx;
+          if (phyY % 2 != 0) continue;  // all-white row
+          fillPhysicalHSpanByte(phyY, getDisplayWidth() - 1 - (y + height - 1), getDisplayWidth() - 1 - y, 0xAA);
+        }
+        return;
+      case LandscapeCounterClockwise:
+        for (int ly = y; ly < y + height; ly++) {
+          const int phyY = ly;
+          if (phyY % 2 != 0) continue;  // all-white row
+          fillPhysicalHSpanByte(phyY, x, x + width - 1, 0x55);
+        }
+        return;
+      case LandscapeClockwise:
+        for (int ly = y; ly < y + height; ly++) {
+          const int phyY = getDisplayHeight() - 1 - ly;
+          if (phyY % 2 == 0) continue;  // all-white row
+          fillPhysicalHSpanByte(phyY, getDisplayWidth() - 1 - (x + width - 1), getDisplayWidth() - 1 - x, 0xAA);
+        }
+        return;
     }
   }
 }
@@ -827,11 +1799,12 @@ void GfxRenderer::fillRoundedRect(const int x, const int y, const int width, con
 }
 
 void GfxRenderer::drawImage(const uint8_t bitmap[], const int x, const int y, const int width, const int height) const {
+  const auto currentOrientation = getOrientation();
   int rotatedX = 0;
   int rotatedY = 0;
-  rotateCoordinates(orientation, x, y, &rotatedX, &rotatedY, panelWidth, panelHeight);
+  rotateCoordinates(currentOrientation, x, y, &rotatedX, &rotatedY, getDisplayWidth(), getDisplayHeight());
   // Rotate origin corner
-  switch (orientation) {
+  switch (currentOrientation) {
     case Portrait:
       rotatedY = rotatedY - height;
       break;
@@ -853,6 +1826,215 @@ void GfxRenderer::drawIcon(const uint8_t bitmap[], const int x, const int y, con
   display.drawImageTransparent(bitmap, y, getScreenWidth() - width - x, height, width);
 }
 
+void GfxRenderer::drawIconInverted(const uint8_t bitmap[], const int x, const int y, const int width,
+                                   const int height) const {
+  // Portrait-mode coordinate transform (x↔y swap), matching drawIcon.
+  // OR with ~srcByte sets framebuffer bits to 1 (white) wherever the icon
+  // bitmap is 0 (black) — produces a white icon on a black background.
+  const int physX = y;
+  const int physY = getScreenWidth() - width - x;
+  const int imgW = height;  // dimensions swapped by portrait transform
+  const int imgH = width;
+  const int srcStride = (imgW + 7) / 8;
+
+  if (physX + imgW <= 0 || physX >= static_cast<int>(panelWidthBytes) * 8) return;
+  if (physY + imgH <= 0 || physY >= static_cast<int>(panelHeight)) return;
+
+  const int baseByte = (physX >= 0) ? (physX >> 3) : -(((-physX) + 7) >> 3);
+  const int bitShift = ((physX % 8) + 8) % 8;
+
+  const int trail = srcStride * 8 - imgW;
+  const uint8_t trailMask = static_cast<uint8_t>(0xFF << trail);
+  const int lastCol = srcStride - 1;
+
+  for (int row = 0; row < imgH; ++row) {
+    const int destY = physY + row;
+    if (destY < 0 || destY >= static_cast<int>(panelHeight)) continue;
+    const int rowBase = destY * static_cast<int>(panelWidthBytes);
+    const int srcOffset = row * srcStride;
+
+    if (bitShift == 0) {
+      for (int col = 0; col < srcStride; ++col) {
+        const int dst = baseByte + col;
+        if (dst < 0) continue;
+        if (dst >= static_cast<int>(panelWidthBytes)) break;
+        uint8_t inv = ~bitmap[srcOffset + col];
+        if (col == lastCol && trail > 0) inv &= trailMask;
+        frameBuffer[rowBase + dst] |= inv;
+      }
+    } else {
+      const int rsh = bitShift;
+      const int lsh = 8 - bitShift;
+      for (int col = 0; col < srcStride; ++col) {
+        uint8_t inv = ~bitmap[srcOffset + col];
+        if (col == lastCol && trail > 0) inv &= trailMask;
+        const int dstHi = baseByte + col;
+        const int dstLo = dstHi + 1;
+        if (dstHi >= 0 && dstHi < static_cast<int>(panelWidthBytes)) {
+          frameBuffer[rowBase + dstHi] |= static_cast<uint8_t>(inv >> rsh);
+        }
+        if (dstLo >= 0 && dstLo < static_cast<int>(panelWidthBytes)) {
+          frameBuffer[rowBase + dstLo] |= static_cast<uint8_t>(inv << lsh);
+        }
+      }
+    }
+  }
+}
+
+// =============================================================================
+// Fast-path bitmap rendering helpers
+// =============================================================================
+//
+// These mirror the glyph fast-path strategy (renderGlyphFastBW / renderGlyphFast2Bit*):
+// instead of calling drawPixel() once per pixel (rotate + bounds-check + 1-bit RMW),
+// we write up to 8 pixels at a time directly to the framebuffer using writeRowBits.
+//
+// Source data: readNextRow always produces a 2-bit packed row (4px/byte, MSB-first,
+// raw values 0=white 1=light-gray 2=dark-gray 3=black).  The same
+// build2BitRowMaskFromTwoBytes / build2BitRowMask / build2BitColMask helpers used
+// for 2-bit glyphs apply here with no changes.
+//
+// Fast path is taken only when !isScaled.  Scaled images fall through to the
+// per-pixel drawPixel loop unchanged.
+//
+// LANDSCAPE orientations
+//   phyY = f(screenY)  — constant per bitmap row
+//   phyX = g(screenX)  — linear in bmpX
+// → each bitmap row maps to a contiguous slice of one physical framebuffer row.
+//   Outer loop: bmpY (one row ptr per iteration).
+//   Inner loop: 8-pixel chunks via build2BitRowMaskFromTwoBytes (aligned) or
+//               build2BitRowMask (partial edges) → writeRowBits.
+//
+// PORTRAIT orientations
+//   phyX = f(screenY)  — constant per bitmap row
+//   phyY = g(screenX)  — linear in bmpX
+// → each bitmap row maps to a single physical column (one phyX bit across multiple rows).
+//   Outer loop: bmpY (computes phyX and the framebuffer bit-mask once).
+//   Inner loop: bmpX — reads one 2-bit pixel, writes one bit to the correct physical row.
+//   This eliminates rotateCoordinates(), the bounds-check log, and redundant byte/bit
+//   recomputation from drawPixel(), giving ~2× on the inner loop.
+//   (The 8×8 transpose used for glyphs would give ~8× but requires all rows in RAM
+//   simultaneously; bitmap rows are read sequentially from the BMP file, so they
+//   cannot be buffered for transposition without a separate heap allocation.
+//   The column loop is the practical optimum for the streaming-read model.)
+//
+// =============================================================================
+
+// Dispatch helper: write one row's worth of 2-bit pixels from 'outputRow' into the
+// framebuffer row at physical Y 'phyY'.  'pixelStartX' is the logical source X offset
+// (non-zero when cropPixX > 0).  'count' is the number of pixels to write.
+// 'screenXOrigin' is the physical X of source pixel pixelStartX.
+// For LandscapeCounterClockwise: physical X increases with bmpX.
+// For LandscapeClockwise:        physical X decreases with bmpX (reversed).
+template <uint8_t drawMask>
+static void bitmapWriteLandscapeRow(uint8_t* const frameBuffer, const uint8_t* const outputRow, const int pixelStartX,
+                                    const int count, const int phyY, const int screenXOrigin, const bool reverseX,
+                                    const bool pixelState, const int displayWidth, const int displayHeight,
+                                    const int widthBytes) {
+  if (phyY < 0 || phyY >= displayHeight) return;
+  uint8_t* const row = frameBuffer + phyY * widthBytes;
+  // Walk in 8-pixel chunks.  For reverseX (LandscapeClockwise) we iterate
+  // right-to-left through source pixels, mirroring renderGlyphFastBW.
+  if (!reverseX) {
+    for (int dx = 0; dx < count; dx += 8) {
+      const int chunkCount = std::min(8, count - dx);
+      const int srcPixel = pixelStartX + dx;  // index into the 2-bit packed row
+      uint8_t mask;
+      // Fast path: aligned 8-pixel chunk uses the two-byte SIMD helper
+      if (chunkCount == 8 && (srcPixel & 3) == 0) {
+        mask = build2BitRowMaskFromTwoBytes<drawMask>(outputRow[srcPixel >> 2], outputRow[(srcPixel >> 2) + 1]);
+      } else {
+        mask = build2BitRowMask<drawMask>(outputRow, 0, srcPixel, chunkCount, false);
+      }
+      if (mask == 0) continue;
+      const int phyBitPos = screenXOrigin + dx;
+      if (phyBitPos + chunkCount <= 0 || phyBitPos >= displayWidth) continue;
+      writeRowBits(row, phyBitPos, mask, pixelState, widthBytes);
+    }
+  } else {
+    // LandscapeClockwise: source pixel 0 maps to the rightmost physical X.
+    // Iterate source chunks right-to-left, reverse bits, write to correct phyBitPos.
+    for (int chunkEnd = count - 1; chunkEnd >= 0; chunkEnd -= 8) {
+      const int chunkStart = std::max(0, chunkEnd - 7);
+      const int chunkCount = chunkEnd - chunkStart + 1;
+      const int srcPixel = pixelStartX + chunkStart;
+      uint8_t mask_fwd;
+      if (chunkCount == 8 && (srcPixel & 3) == 0) {
+        mask_fwd = build2BitRowMaskFromTwoBytes<drawMask>(outputRow[srcPixel >> 2], outputRow[(srcPixel >> 2) + 1]);
+      } else {
+        mask_fwd = build2BitRowMask<drawMask>(outputRow, 0, srcPixel, chunkCount, false);
+      }
+      if (mask_fwd == 0) continue;
+      const uint8_t mask = reverseBits8(mask_fwd >> (8 - chunkCount));
+      // screenXOrigin is the physical X of source pixel (count-1); chunkEnd counts from that end
+      const int phyBitPos = screenXOrigin - chunkEnd;
+      if (phyBitPos + chunkCount <= 0 || phyBitPos >= displayWidth) continue;
+      writeRowBits(row, phyBitPos, mask, pixelState, widthBytes);
+    }
+  }
+}
+
+// Portrait fast path: one bitmap row (bmpY) maps to one physical column (phyX = const).
+// Writes one bit per bmpX pixel into its physical row.  Saves rotateCoordinates() and
+// bounds-check log overhead compared to drawPixel(), with no extra heap allocation.
+template <uint8_t drawMask>
+static void bitmapWritePortraitColumn(uint8_t* const frameBuffer, const uint8_t* const outputRow, const int pixelStartX,
+                                      const int count, const int phyX, const int phyYOrigin, const int phyYStride,
+                                      const bool pixelState, const int displayHeight, const int widthBytes) {
+  if (phyX < 0 || phyX >= widthBytes * 8) return;
+  const int byteCol = phyX >> 3;
+  const uint8_t bitMask = static_cast<uint8_t>(0x80u >> (phyX & 7));
+  for (int dx = 0; dx < count; dx++) {
+    const int srcPixel = pixelStartX + dx;
+    const uint8_t raw = (outputRow[srcPixel >> 2] >> ((3 - (srcPixel & 3)) * 2)) & 0x3;
+    if (!((drawMask >> raw) & 0x01)) continue;
+    const int phyY = phyYOrigin + dx * phyYStride;
+    if (phyY < 0 || phyY >= displayHeight) continue;
+    uint8_t* const bytePtr = frameBuffer + phyY * widthBytes + byteCol;
+    if (pixelState) {
+      *bytePtr &= ~bitMask;  // black
+    } else {
+      *bytePtr |= bitMask;  // white
+    }
+  }
+}
+
+// Core bitmap fast-path dispatcher: called once per bitmap row.
+// orientation, drawMask and pixelState are resolved before the row loop.
+template <uint8_t drawMask>
+static void bitmapFastRow(uint8_t* const frameBuffer, const uint8_t* const outputRow, const int cropPixX,
+                          const int renderWidth, const int screenX, const int screenY,
+                          const GfxRenderer::Orientation orientation, const bool pixelState, const int displayWidth,
+                          const int displayHeight, const int widthBytes) {
+  switch (orientation) {
+    case GfxRenderer::LandscapeCounterClockwise:
+      // phyX = screenX + (bmpX - cropPixX),  phyY = screenY
+      bitmapWriteLandscapeRow<drawMask>(frameBuffer, outputRow, cropPixX, renderWidth, screenY, screenX, false,
+                                        pixelState, displayWidth, displayHeight, widthBytes);
+      break;
+
+    case GfxRenderer::LandscapeClockwise:
+      // phyX = displayWidth-1 - screenX - (bmpX-cropPixX),  phyY = displayHeight-1-screenY
+      // screenXOrigin for reversed walk = physical X of source pixel (renderWidth-1)
+      bitmapWriteLandscapeRow<drawMask>(frameBuffer, outputRow, cropPixX, renderWidth, displayHeight - 1 - screenY,
+                                        displayWidth - 1 - screenX, true, pixelState, displayWidth, displayHeight,
+                                        widthBytes);
+      break;
+
+    case GfxRenderer::Portrait:
+      // phyX = screenY,  phyY = displayHeight-1 - screenX - (bmpX-cropPixX),  phyYStride = -1
+      bitmapWritePortraitColumn<drawMask>(frameBuffer, outputRow, cropPixX, renderWidth, screenY,
+                                          displayHeight - 1 - screenX, -1, pixelState, displayHeight, widthBytes);
+      break;
+
+    case GfxRenderer::PortraitInverted:
+      // phyX = displayWidth-1-screenY,  phyY = screenX + (bmpX-cropPixX),  phyYStride = +1
+      bitmapWritePortraitColumn<drawMask>(frameBuffer, outputRow, cropPixX, renderWidth, displayWidth - 1 - screenY,
+                                          screenX, 1, pixelState, displayHeight, widthBytes);
+      break;
+  }
+}
+
 void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, const int maxWidth, const int maxHeight,
                              const float cropX, const float cropY) const {
   if (fontCacheManager_ && fontCacheManager_->isScanning()) return;
@@ -866,8 +2048,6 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
   bool isScaled = false;
   int cropPixX = std::floor(bitmap.getWidth() * cropX / 2.0f);
   int cropPixY = std::floor(bitmap.getHeight() * cropY / 2.0f);
-  LOG_DBG("GFX", "Cropping %dx%d by %dx%d pix, is %s", bitmap.getWidth(), bitmap.getHeight(), cropPixX, cropPixY,
-          bitmap.isTopDown() ? "top-down" : "bottom-up");
 
   const float croppedWidth = (1.0f - cropX) * static_cast<float>(bitmap.getWidth());
   const float croppedHeight = (1.0f - cropY) * static_cast<float>(bitmap.getHeight());
@@ -889,7 +2069,6 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
     scale = fitScale;
     isScaled = true;
   }
-  LOG_DBG("GFX", "Scaling by %f - %s", scale, isScaled ? "scaled" : "not scaled");
 
   // Calculate output row size (2 bits per pixel, packed into bytes)
   // IMPORTANT: Use int, not uint8_t, to avoid overflow for images > 1020 pixels wide
@@ -902,6 +2081,35 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
     free(outputRow);
     free(rowBytes);
     return;
+  }
+
+  const auto renderModeSnapshot = getRenderMode();
+  const auto orientation = getOrientation();
+  const int displayWidth = getDisplayWidth();
+  const int displayHeight = getDisplayHeight();
+  const int widthBytes = getDisplayWidthBytes();
+  // Width of the rendered (post-crop) region in source pixels
+  const int renderWidth = bitmap.getWidth() - 2 * cropPixX;
+
+  // Pixel write state for each render mode:
+  //   BW: black pixels (state=true clears the bit)
+  //   GRAYSCALE_*: white=false sets the bit in the AA plane
+  const bool pixelState = (renderModeSnapshot == BW);
+
+  // Image raw values: 0=black, 1=dark-gray, 2=light-gray, 3=white  (opposite of glyph convention).
+  // BW draws raw {0,1,2} = mask 0x07.
+  // Grayscale: image raws 1 and 2 are swapped vs glyphs, so the LSB mask must draw raw 1
+  // (image dark-gray) not raw 2 (image light-gray).  MSB draws both grays in both conventions.
+  //   GRAYSCALE_MSB: draw raw {1,2} → 0x06
+  //   GRAYSCALE_LSB: draw raw {1}   → 0x02  (dark-gray sets LSB → panel dark gray)
+  // This matches the slow path (val==1||val==2 for MSB; val==1 for LSB).
+  uint8_t drawMask;
+  if (renderModeSnapshot == BW) {
+    drawMask = 0x07;
+  } else if (renderModeSnapshot == GRAYSCALE_MSB) {
+    drawMask = 0x06;
+  } else {
+    drawMask = 0x02;  // GRAYSCALE_LSB: image raw 1 = dark-gray
   }
 
   for (int bmpY = 0; bmpY < (bitmap.getHeight() - cropPixY); bmpY++) {
@@ -932,6 +2140,33 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
       continue;
     }
 
+    if (!isScaled && drawMask != 0x00) {
+      // Fast path: write up to 8 pixels per call directly to the framebuffer.
+      switch (drawMask) {
+        case 0x07:
+          bitmapFastRow<0x07>(frameBuffer, outputRow, cropPixX, renderWidth, x, screenY, orientation, pixelState,
+                              displayWidth, displayHeight, widthBytes);
+          break;
+        case 0x06:
+          bitmapFastRow<0x06>(frameBuffer, outputRow, cropPixX, renderWidth, x, screenY, orientation, pixelState,
+                              displayWidth, displayHeight, widthBytes);
+          break;
+        case 0x04:
+          bitmapFastRow<0x04>(frameBuffer, outputRow, cropPixX, renderWidth, x, screenY, orientation, pixelState,
+                              displayWidth, displayHeight, widthBytes);
+          break;
+        case 0x02:
+          bitmapFastRow<0x02>(frameBuffer, outputRow, cropPixX, renderWidth, x, screenY, orientation, pixelState,
+                              displayWidth, displayHeight, widthBytes);
+          break;
+        default:
+          bitmapFastRow<0x07>(frameBuffer, outputRow, cropPixX, renderWidth, x, screenY, orientation, pixelState,
+                              displayWidth, displayHeight, widthBytes);
+          break;
+      }
+      continue;
+    }
+
     for (int bmpX = cropPixX; bmpX < bitmap.getWidth() - cropPixX; bmpX++) {
       int screenX = bmpX - cropPixX;
       if (isScaled) {
@@ -947,11 +2182,11 @@ void GfxRenderer::drawBitmap(const Bitmap& bitmap, const int x, const int y, con
 
       const uint8_t val = outputRow[bmpX / 4] >> (6 - ((bmpX * 2) % 8)) & 0x3;
 
-      if (renderMode == BW && val < 3) {
+      if (renderModeSnapshot == BW && val < 3) {
         drawPixel(screenX, screenY);
-      } else if (renderMode == GRAYSCALE_MSB && (val == 1 || val == 2)) {
+      } else if (renderModeSnapshot == GRAYSCALE_MSB && (val == 1 || val == 2)) {
         drawPixel(screenX, screenY, false);
-      } else if (renderMode == GRAYSCALE_LSB && val == 1) {
+      } else if (renderModeSnapshot == GRAYSCALE_LSB && val == 1) {
         drawPixel(screenX, screenY, false);
       }
     }
@@ -965,13 +2200,19 @@ void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y,
                                  const int maxHeight) const {
   float scale = 1.0f;
   bool isScaled = false;
-  if (maxWidth > 0 && bitmap.getWidth() > maxWidth) {
-    scale = static_cast<float>(maxWidth) / static_cast<float>(bitmap.getWidth());
-    isScaled = true;
+  if (maxWidth > 0) {
+    const float s = static_cast<float>(maxWidth) / static_cast<float>(bitmap.getWidth());
+    if (s != 1.0f) {
+      scale = s;
+      isScaled = true;
+    }
   }
-  if (maxHeight > 0 && bitmap.getHeight() > maxHeight) {
-    scale = std::min(scale, static_cast<float>(maxHeight) / static_cast<float>(bitmap.getHeight()));
-    isScaled = true;
+  if (maxHeight > 0) {
+    const float s = static_cast<float>(maxHeight) / static_cast<float>(bitmap.getHeight());
+    if (s < scale || (scale == 1.0f && s != 1.0f)) {
+      scale = s;
+      isScaled = (scale != 1.0f);
+    }
   }
 
   // For 1-bit BMP, output is still 2-bit packed (for consistency with readNextRow)
@@ -986,46 +2227,95 @@ void GfxRenderer::drawBitmap1Bit(const Bitmap& bitmap, const int x, const int y,
     return;
   }
 
-  for (int bmpY = 0; bmpY < bitmap.getHeight(); bmpY++) {
-    // Read rows sequentially using readNextRow
-    if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
-      LOG_ERR("GFX", "Failed to read row %d from 1-bit bitmap", bmpY);
-      free(outputRow);
-      free(rowBytes);
-      return;
-    }
+  const auto orientation = getOrientation();
+  const int displayWidth = getDisplayWidth();
+  const int displayHeight = getDisplayHeight();
+  const int widthBytes = getDisplayWidthBytes();
 
-    // Calculate screen Y based on whether BMP is top-down or bottom-up
-    const int bmpYOffset = bitmap.isTopDown() ? bmpY : bitmap.getHeight() - 1 - bmpY;
-    int screenY = y + (isScaled ? static_cast<int>(std::floor(bmpYOffset * scale)) : bmpYOffset);
-    if (screenY >= getScreenHeight()) {
-      continue;  // Continue reading to keep row counter in sync
-    }
-    if (screenY < 0) {
-      continue;
-    }
-
-    for (int bmpX = 0; bmpX < bitmap.getWidth(); bmpX++) {
-      int screenX = x + (isScaled ? static_cast<int>(std::floor(bmpX * scale)) : bmpX);
-      if (screenX >= getScreenWidth()) {
-        break;
+  // ── Unscaled fast path (scale == 1.0): draw each source row 1:1. ──────────────
+  if (!isScaled) {
+    for (int bmpY = 0; bmpY < bitmap.getHeight(); bmpY++) {
+      if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
+        LOG_ERR("GFX", "Failed to read row %d from 1-bit bitmap", bmpY);
+        free(outputRow);
+        free(rowBytes);
+        return;
       }
-      if (screenX < 0) {
-        continue;
-      }
-
-      // Get 2-bit value (result of readNextRow quantization)
-      const uint8_t val = outputRow[bmpX / 4] >> (6 - ((bmpX * 2) % 8)) & 0x3;
-
-      // For 1-bit source: 0 or 1 -> map to black (0,1,2) or white (3)
-      // val < 3 means black pixel (draw it)
-      if (val < 3) {
-        drawPixel(screenX, screenY, true);
-      }
-      // White pixels (val == 3) are not drawn (leave background)
+      const int bmpYOffset = bitmap.isTopDown() ? bmpY : bitmap.getHeight() - 1 - bmpY;
+      const int screenY = y + bmpYOffset;
+      if (screenY < 0 || screenY >= getScreenHeight()) continue;
+      // BW only (1-bit images are never rendered in grayscale passes)
+      bitmapFastRow<0x07>(frameBuffer, outputRow, 0, bitmap.getWidth(), x, screenY, orientation, true, displayWidth,
+                          displayHeight, widthBytes);
     }
+    free(outputRow);
+    free(rowBytes);
+    return;
   }
 
+  // ── Downscale path: AREA-MAJORITY sampling. ──────────────────────────────────
+  // The previous implementation drew a destination pixel black if ANY source pixel
+  // mapping to it was black ("OR-to-black"). For a dithered 1-bit cover that scatters
+  // black dots through gray regions, downscaling then made almost every destination
+  // pixel catch a dot, collapsing the whole image toward black. Instead, for each
+  // destination pixel count how many of the covered source pixels are black and draw
+  // black only when they are the majority — i.e. resample by coverage, not by presence.
+  const int srcW = bitmap.getWidth();
+  const int srcH = bitmap.getHeight();
+  const int dstW = std::max(1, static_cast<int>(std::floor(srcW * scale)));
+
+  // Per-destination-column accumulators for the destination row currently being built.
+  auto* blackCount = static_cast<uint16_t*>(calloc(dstW, sizeof(uint16_t)));
+  auto* totalCount = static_cast<uint16_t*>(calloc(dstW, sizeof(uint16_t)));
+  if (!blackCount || !totalCount) {
+    LOG_ERR("GFX", "!! Failed to allocate 1-bit downscale accumulators");
+    free(blackCount);
+    free(totalCount);
+    free(outputRow);
+    free(rowBytes);
+    return;
+  }
+
+  // Flushes the accumulated destination row to the framebuffer, then clears it.
+  auto flushDstRow = [&](int dstScreenY) {
+    if (dstScreenY >= 0 && dstScreenY < getScreenHeight()) {
+      for (int dx = 0; dx < dstW; dx++) {
+        // Majority vote: black wins ties (>= half) so thin dark strokes survive.
+        if (totalCount[dx] > 0 && blackCount[dx] * 2 >= totalCount[dx]) {
+          const int screenX = x + dx;
+          if (screenX >= 0 && screenX < getScreenWidth()) drawPixel(screenX, dstScreenY, true);
+        }
+      }
+    }
+    memset(blackCount, 0, dstW * sizeof(uint16_t));
+    memset(totalCount, 0, dstW * sizeof(uint16_t));
+  };
+
+  int curDstY = -1;  // destination row currently accumulating (in screen coords)
+  for (int bmpY = 0; bmpY < srcH; bmpY++) {
+    if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
+      LOG_ERR("GFX", "Failed to read row %d from 1-bit bitmap", bmpY);
+      break;
+    }
+    const int bmpYOffset = bitmap.isTopDown() ? bmpY : srcH - 1 - bmpY;
+    const int dstScreenY = y + static_cast<int>(std::floor(bmpYOffset * scale));
+    if (dstScreenY != curDstY) {
+      if (curDstY != -1) flushDstRow(curDstY);
+      curDstY = dstScreenY;
+    }
+    // Accumulate this source row's pixels into their destination columns.
+    for (int bmpX = 0; bmpX < srcW; bmpX++) {
+      int dx = static_cast<int>(std::floor(bmpX * scale));
+      if (dx >= dstW) dx = dstW - 1;  // guard fp rounding at the right edge
+      const uint8_t val = outputRow[bmpX / 4] >> (6 - ((bmpX * 2) % 8)) & 0x3;
+      totalCount[dx]++;
+      if (val < 3) blackCount[dx]++;  // 0,1,2 = black; 3 = white
+    }
+  }
+  if (curDstY != -1) flushDstRow(curDstY);  // final row
+
+  free(blackCount);
+  free(totalCount);
   free(outputRow);
   free(rowBytes);
 }
@@ -1092,56 +2382,141 @@ void GfxRenderer::fillPolygon(const int* xPoints, const int* yPoints, int numPoi
 
 // For performance measurement (using static to allow "const" methods)
 static unsigned long start_ms = 0;
+static bool start_ms_valid = false;
 
 void GfxRenderer::clearScreen(const uint8_t color) const {
   start_ms = millis();
+  start_ms_valid = true;
   display.clearScreen(color);
 }
 
 void GfxRenderer::invertScreen() const {
-  for (uint32_t i = 0; i < frameBufferSize; i++) {
-    frameBuffer[i] = ~frameBuffer[i];
+  auto* p = reinterpret_cast<uint32_t*>(frameBuffer);
+  const uint32_t words = frameBufferSize / 4;
+  for (uint32_t i = 0; i < words; i++) p[i] = ~p[i];
+  for (uint32_t i = words * 4; i < frameBufferSize; i++) frameBuffer[i] = ~frameBuffer[i];
+}
+
+void GfxRenderer::displayWindow(int logX, int logY, int logW, int logH, bool turnOffScreen) const {
+  // Translate logical rectangle to physical panel coordinates using the same
+  // rotation rules as rotateCoordinates(). Physical (x=source, y=gate row).
+  uint16_t physX, physY, physW, physH;
+  switch (getOrientation()) {
+    case Portrait:
+      // phyX = logY, phyY = panelHeight-1-logX (top-left corner)
+      physX = static_cast<uint16_t>(logY);
+      physY = static_cast<uint16_t>(panelHeight - logX - logW);
+      physW = static_cast<uint16_t>(logH);
+      physH = static_cast<uint16_t>(logW);
+      break;
+    case PortraitInverted:
+      // phyX = panelWidth-1-logY, phyY = logX (top-left corner, x goes right→left)
+      physX = static_cast<uint16_t>(panelWidth - logY - logH);
+      physY = static_cast<uint16_t>(logX);
+      physW = static_cast<uint16_t>(logH);
+      physH = static_cast<uint16_t>(logW);
+      break;
+    case LandscapeClockwise:
+      // phyX = panelWidth-1-logX, phyY = panelHeight-1-logY (180° rotation)
+      physX = static_cast<uint16_t>(panelWidth - logX - logW);
+      physY = static_cast<uint16_t>(panelHeight - logY - logH);
+      physW = static_cast<uint16_t>(logW);
+      physH = static_cast<uint16_t>(logH);
+      break;
+    case LandscapeCounterClockwise:
+    default:
+      // Native panel orientation — no transform needed
+      physX = static_cast<uint16_t>(logX);
+      physY = static_cast<uint16_t>(logY);
+      physW = static_cast<uint16_t>(logW);
+      physH = static_cast<uint16_t>(logH);
+      break;
   }
+  LOG_DBG("WIN", "displayWindow logical(%d,%d,%d,%d) orient=%d → physical(%d,%d,%d,%d)", logX, logY, logW, logH,
+          (int)getOrientation(), physX, physY, physW, physH);
+  display.displayWindow(physX, physY, physW, physH, turnOffScreen);
+}
+
+static constexpr unsigned int encodeRefreshMode(const HalDisplay::RefreshMode mode) {
+  return static_cast<unsigned int>(mode) + 1u;
+}
+
+static constexpr HalDisplay::RefreshMode decodeRefreshMode(const unsigned int value) {
+  return static_cast<HalDisplay::RefreshMode>(value - 1u);
+}
+
+void GfxRenderer::setNextDisplayRefreshMode(const HalDisplay::RefreshMode refreshMode) const {
+  refreshOverride.store(encodeRefreshMode(refreshMode), std::memory_order_release);
+}
+
+HalDisplay::RefreshMode GfxRenderer::consumeRefreshOverride(const HalDisplay::RefreshMode requested) const {
+  unsigned int overrideValue = refreshOverride.load(std::memory_order_acquire);
+  if (overrideValue == REFRESH_OVERRIDE_NONE) {
+    return requested;
+  }
+  unsigned int expected = overrideValue;
+  if (refreshOverride.compare_exchange_strong(expected, REFRESH_OVERRIDE_NONE, std::memory_order_acq_rel,
+                                              std::memory_order_acquire)) {
+    return decodeRefreshMode(overrideValue);
+  }
+  if (expected != REFRESH_OVERRIDE_NONE) {
+    refreshOverride.store(REFRESH_OVERRIDE_NONE, std::memory_order_release);
+    return decodeRefreshMode(expected);
+  }
+  return requested;
+}
+
+void GfxRenderer::triggerDisplay(const HalDisplay::RefreshMode mode, const bool turnOffScreen) const {
+  const HalDisplay::RefreshMode effectiveMode = consumeRefreshOverride(mode);
+  const bool effectiveTurnOff = turnOffScreen || fadingFix.load(std::memory_order_relaxed);
+  display.triggerDisplay(effectiveMode, effectiveTurnOff);
+  // triggerDisplay swaps display buffers; keep renderer's cached pointer in
+  // sync so subsequent draws/grayscale passes target the active write buffer.
+  frameBuffer = display.getFrameBuffer();
+}
+
+void GfxRenderer::triggerDisplayAsync(const HalDisplay::RefreshMode mode, const bool turnOffScreen) const {
+  const HalDisplay::RefreshMode effectiveMode = consumeRefreshOverride(mode);
+  const bool effectiveTurnOff = turnOffScreen || fadingFix.load(std::memory_order_relaxed);
+  display.triggerDisplayAsync(effectiveMode, effectiveTurnOff);
+  // The buffer swap happened before the waveform started; resync the cached
+  // pointer now so plane renders during the waveform hit the write buffer.
+  frameBuffer = display.getFrameBuffer();
 }
 
 void GfxRenderer::displayBuffer(const HalDisplay::RefreshMode refreshMode) const {
-  auto elapsed = millis() - start_ms;
-  LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBuffer", elapsed);
-  display.displayBuffer(refreshMode, fadingFix);
-}
-
-size_t GfxRenderer::readFramebufferRegion(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t* dst,
-                                          size_t dstCapacity) const {
-  if (dst == nullptr || w == 0 || h == 0) return 0;
-
-  const AlignedMemRect mem = screenRectToAlignedMemRect(orientation, x, y, w, h, panelWidth, panelHeight);
-  if (!mem.valid) return 0;
-
-  const size_t rowBytes = mem.w / 8;  // exact: mem.w is a multiple of 8
-  const size_t needed = rowBytes * mem.h;
-  if (needed > dstCapacity) return 0;
-
-  for (uint16_t row = 0; row < mem.h; ++row) {
-    const uint8_t* srcRow = frameBuffer + (static_cast<uint32_t>(mem.y + row) * panelWidthBytes) + (mem.x / 8);
-    uint8_t* dstRow = dst + (static_cast<size_t>(row) * rowBytes);
-    memcpy(dstRow, srcRow, rowBytes);
+  // The web server session releases both framebuffers (releaseFrameBuffers());
+  // a flush would stream the null buffer over SPI and fault (field crash: a
+  // global force-refresh button pressed during a transfer). The second check
+  // covers releaseFrameBuffersWithScratch, where the renderer points at a
+  // scratch buffer but the display's own buffers are gone.
+  if (frameBuffer == nullptr || display.getFrameBuffer() == nullptr) {
+    LOG_ERR("GFX", "displayBuffer with released framebuffer ignored");
+    return;
   }
-  return needed;
-}
+  const auto effectiveMode = consumeRefreshOverride(refreshMode);
 
-void GfxRenderer::writeFramebufferRegion(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint8_t* src) {
-  if (src == nullptr || w == 0 || h == 0) return;
-
-  const AlignedMemRect mem = screenRectToAlignedMemRect(orientation, x, y, w, h, panelWidth, panelHeight);
-  if (!mem.valid) return;
-
-  const size_t rowBytes = mem.w / 8;  // exact: mem.w is a multiple of 8
-
-  for (uint16_t row = 0; row < mem.h; ++row) {
-    const uint8_t* srcRow = src + (static_cast<size_t>(row) * rowBytes);
-    uint8_t* dstRow = frameBuffer + (static_cast<uint32_t>(mem.y + row) * panelWidthBytes) + (mem.x / 8);
-    memcpy(dstRow, srcRow, rowBytes);
+  if (start_ms_valid) {
+    auto elapsed = millis() - start_ms;
+    LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBuffer", elapsed);
+  } else {
+    LOG_DBG("GFX", "Time = n/a from clearScreen to displayBuffer (no clearScreen marker)");
   }
+  start_ms_valid = false;
+  display.displayBuffer(effectiveMode, fadingFix.load(std::memory_order_relaxed));
+  // swapBuffers() ran inside displayBuffer(). Resync our cached frameBuffer pointer
+  // from the HAL so subsequent renders (clearScreen + glyph writes) go to the correct
+  // slot. Without this, GfxRenderer::frameBuffer stays stale and every other render
+  // writes into the wrong buffer — cleared by display.clearScreen() but then written
+  // to the old slot by glyph rendering, producing a blank page.
+  frameBuffer = display.getFrameBuffer();
+  // Do NOT seed RED RAM here per page. The display driver already keeps the RED
+  // (previous-frame) plane current on every refresh — it writes RED from `prev` on
+  // each dual-buffer fast refresh, and reseeds RED from the framebuffer after each
+  // single-buffer refresh. A per-page syncRedRamFromFrameBuffer() would be a second,
+  // redundant full-plane RED write. The one place the baseline genuinely needs an
+  // explicit seed is the dual->single transition (before releaseSecondaryBuffer for
+  // fast-diff): the release sites call syncRedRamFromFrameBuffer() there directly.
 }
 
 std::string GfxRenderer::truncatedText(const int fontId, const char* text, const int maxWidth,
@@ -1230,7 +2605,7 @@ std::vector<std::string> GfxRenderer::wrappedText(const int fontId, const char* 
 
 // Note: Internal driver treats screen in command orientation; this library exposes a logical orientation
 int GfxRenderer::getScreenWidth() const {
-  switch (orientation) {
+  switch (getOrientation()) {
     case Portrait:
     case PortraitInverted:
       // 480px wide in portrait logical coordinates
@@ -1244,7 +2619,7 @@ int GfxRenderer::getScreenWidth() const {
 }
 
 int GfxRenderer::getScreenHeight() const {
-  switch (orientation) {
+  switch (getOrientation()) {
     case Portrait:
     case PortraitInverted:
       // 800px tall in portrait logical coordinates
@@ -1257,21 +2632,14 @@ int GfxRenderer::getScreenHeight() const {
   return panelWidth;
 }
 
-// Translate a logical rect through rotateCoordinates and take the bounding
-// box of its four corners on the physical panel. Output coords are inclusive
-// and clamped. Returns false if the rect ends up fully off-panel.
 static bool logicalRectToPhysicalBounds(GfxRenderer::Orientation orientation, int lx, int ly, int lw, int lh,
                                         uint16_t panelWidth, uint16_t panelHeight, int* outX0, int* outY0, int* outX1,
                                         int* outY1) {
   if (lw <= 0 || lh <= 0) return false;
-  int minX = INT32_MAX;
-  int minY = INT32_MAX;
-  int maxX = INT32_MIN;
-  int maxY = INT32_MIN;
+  int minX = INT32_MAX, minY = INT32_MAX, maxX = INT32_MIN, maxY = INT32_MIN;
   const int corners[4][2] = {{lx, ly}, {lx + lw - 1, ly}, {lx, ly + lh - 1}, {lx + lw - 1, ly + lh - 1}};
   for (auto& c : corners) {
-    int phyX;
-    int phyY;
+    int phyX, phyY;
     rotateCoordinates(orientation, c[0], c[1], &phyX, &phyY, panelWidth, panelHeight);
     if (phyX < minX) minX = phyX;
     if (phyY < minY) minY = phyY;
@@ -1292,62 +2660,42 @@ static bool logicalRectToPhysicalBounds(GfxRenderer::Orientation orientation, in
 
 size_t GfxRenderer::getRegionByteSize(int lx, int ly, int lw, int lh) const {
   int x0, y0, x1, y1;
-  if (!logicalRectToPhysicalBounds(orientation, lx, ly, lw, lh, panelWidth, panelHeight, &x0, &y0, &x1, &y1)) {
+  if (!logicalRectToPhysicalBounds(getOrientation(), lx, ly, lw, lh, panelWidth, panelHeight, &x0, &y0, &x1, &y1))
     return 0;
-  }
-  // x bounds are in pixels; widen to byte boundaries on either side so per-row
-  // memcpy stays byte-aligned even when the logical rect doesn't.
   const int byteX0 = x0 / 8;
   const int byteX1 = x1 / 8;
-  const int bytesPerRow = byteX1 - byteX0 + 1;
-  const int rowCount = y1 - y0 + 1;
-  return static_cast<size_t>(bytesPerRow) * static_cast<size_t>(rowCount);
+  return static_cast<size_t>(byteX1 - byteX0 + 1) * static_cast<size_t>(y1 - y0 + 1);
 }
 
 bool GfxRenderer::copyRegionToBuffer(int lx, int ly, int lw, int lh, uint8_t* buf, size_t bufSize) const {
   int x0, y0, x1, y1;
-  if (!logicalRectToPhysicalBounds(orientation, lx, ly, lw, lh, panelWidth, panelHeight, &x0, &y0, &x1, &y1)) {
+  if (!logicalRectToPhysicalBounds(getOrientation(), lx, ly, lw, lh, panelWidth, panelHeight, &x0, &y0, &x1, &y1))
     return false;
-  }
   const int byteX0 = x0 / 8;
-  const int byteX1 = x1 / 8;
-  const int bytesPerRow = byteX1 - byteX0 + 1;
+  const int bytesPerRow = x1 / 8 - byteX0 + 1;
   const int rowCount = y1 - y0 + 1;
   const size_t needed = static_cast<size_t>(bytesPerRow) * static_cast<size_t>(rowCount);
   if (bufSize < needed || !frameBuffer || !buf) return false;
-  for (int row = 0; row < rowCount; row++) {
-    const uint8_t* src = frameBuffer + (y0 + row) * panelWidthBytes + byteX0;
-    memcpy(buf + row * bytesPerRow, src, bytesPerRow);
-  }
+  for (int row = 0; row < rowCount; row++)
+    memcpy(buf + row * bytesPerRow, frameBuffer + (y0 + row) * panelWidthBytes + byteX0, bytesPerRow);
   return true;
 }
 
 bool GfxRenderer::copyBufferToRegion(int lx, int ly, int lw, int lh, const uint8_t* buf, size_t bufSize) const {
   int x0, y0, x1, y1;
-  if (!logicalRectToPhysicalBounds(orientation, lx, ly, lw, lh, panelWidth, panelHeight, &x0, &y0, &x1, &y1)) {
+  if (!logicalRectToPhysicalBounds(getOrientation(), lx, ly, lw, lh, panelWidth, panelHeight, &x0, &y0, &x1, &y1))
     return false;
-  }
   const int byteX0 = x0 / 8;
-  const int byteX1 = x1 / 8;
-  const int bytesPerRow = byteX1 - byteX0 + 1;
+  const int bytesPerRow = x1 / 8 - byteX0 + 1;
   const int rowCount = y1 - y0 + 1;
   const size_t needed = static_cast<size_t>(bytesPerRow) * static_cast<size_t>(rowCount);
   if (bufSize < needed || !frameBuffer || !buf) return false;
-  for (int row = 0; row < rowCount; row++) {
-    uint8_t* dst = frameBuffer + (y0 + row) * panelWidthBytes + byteX0;
-    memcpy(dst, buf + row * bytesPerRow, bytesPerRow);
-  }
+  for (int row = 0; row < rowCount; row++)
+    memcpy(frameBuffer + (y0 + row) * panelWidthBytes + byteX0, buf + row * bytesPerRow, bytesPerRow);
   return true;
 }
 
 int GfxRenderer::getSpaceWidth(const int fontId, const EpdFontFamily::Style style) const {
-  // Advance table fast-path for SD card fonts during layout
-  auto sdIt = sdCardFonts_.find(fontId);
-  if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
-    const uint8_t resolvedStyle = resolveSdCardStyle(*sdIt->second, style);
-    return fp4::toPixel(sdIt->second->getAdvance(' ', resolvedStyle));
-  }
-
   const auto fontIt = fontMap.find(fontId);
   if (fontIt == fontMap.end()) {
     LOG_ERR("GFX", "Font %d not found", fontId);
@@ -1360,15 +2708,6 @@ int GfxRenderer::getSpaceWidth(const int fontId, const EpdFontFamily::Style styl
 
 int GfxRenderer::getSpaceAdvance(const int fontId, const uint32_t leftCp, const uint32_t rightCp,
                                  const EpdFontFamily::Style style) const {
-  // Advance table fast-path for SD card fonts during layout.
-  // Kern data is not loaded during layout (consistent with previous metadataOnly behavior),
-  // so we return just the space advance without kerning.
-  auto sdIt = sdCardFonts_.find(fontId);
-  if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
-    const uint8_t resolvedStyle = resolveSdCardStyle(*sdIt->second, style);
-    return fp4::toPixel(sdIt->second->getAdvance(' ', resolvedStyle));
-  }
-
   const auto fontIt = fontMap.find(fontId);
   if (fontIt == fontMap.end()) return 0;
   const auto& font = fontIt->second;
@@ -1390,22 +2729,14 @@ int GfxRenderer::getKerning(const int fontId, const uint32_t leftCp, const uint3
 }
 
 int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFamily::Style style) const {
-  // Advance table fast-path for SD card fonts during layout.
-  // No kerning/ligature lookup — consistent with previous metadataOnly behavior
-  // where kern/lig data was not loaded.
-  auto sdIt = sdCardFonts_.find(fontId);
-  if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
-    int32_t widthFP = 0;
-    const uint8_t styleIdx = resolveSdCardStyle(*sdIt->second, style);
-    while (uint32_t cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text))) {
-      widthFP += sdIt->second->getAdvance(cp, styleIdx);
-    }
-    return fp4::toPixel(widthFP);
-  }
-
   const auto fontIt = fontMap.find(fontId);
   if (fontIt == fontMap.end()) {
     LOG_ERR("GFX", "Font %d not found", fontId);
+    return 0;
+  }
+
+  if (fontCacheManager_ && fontCacheManager_->isScanning()) {
+    fontCacheManager_->recordText(text, fontId, style);
     return 0;
   }
 
@@ -1420,15 +2751,30 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
     }
     cp = font.applyLigatures(cp, text, style);
 
+    // Small-caps fold — mirror drawText so measurement and rendering agree exactly.
+    const bool folded = (style & EpdFontFamily::SMALL_CAPS) != 0 && smallCaps::fold(cp);
+
     // Differential rounding: snap (previous advance + current kern) together,
     // matching drawText so measurement and rendering agree exactly.
     if (prevCp != 0) {
-      const auto kernFP = font.getKerning(prevCp, cp, style);  // 4.4 fixed-point kern
-      widthPx += fp4::toPixel(prevAdvanceFP + kernFP);         // snap 12.4 fixed-point to nearest pixel
+      auto kernFP = static_cast<int32_t>(font.getKerning(prevCp, cp, style));  // 4.4 fixed-point kern
+      if (folded) kernFP = static_cast<int32_t>(kernFP * smallCaps::SCALE + 0.5f);
+      widthPx += fp4::toPixel(prevAdvanceFP + kernFP);  // snap 12.4 fixed-point to nearest pixel
     }
 
     const EpdGlyph* glyph = font.getGlyph(cp, style);
-    prevAdvanceFP = glyph ? glyph->advanceX : 0;
+    if (!glyph) {
+      widthPx += fp4::toPixel(prevAdvanceFP);
+      prevCp = 0;
+      prevAdvanceFP = 0;
+      continue;
+    }
+    prevAdvanceFP = glyph->advanceX;
+    // SUP/SUB no longer halve here — superscript/subscript words are measured at their
+    // explicit per-word scale by the layout code, matching drawTextScaled exactly.
+    if (folded) {
+      prevAdvanceFP = static_cast<int>(prevAdvanceFP * smallCaps::SCALE + 0.5f);
+    }
     prevCp = cp;
   }
   widthPx += fp4::toPixel(prevAdvanceFP);  // final glyph's advance
@@ -1477,12 +2823,18 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
     return;
   }
 
+  if (fontCacheManager_ && fontCacheManager_->isScanning()) {
+    fontCacheManager_->recordText(text, fontId, style);
+    return;
+  }
+
   const auto& font = fontIt->second;
 
   int lastBaseY = y;
   int lastBaseLeft = 0;
   int lastBaseWidth = 0;
   int lastBaseTop = 0;
+  int lastBaseAdvanceFP = 0;  // 12.4 fixed-point
   int32_t prevAdvanceFP = 0;  // 12.4 fixed-point: prev glyph's advance + next kern for snap
 
   uint32_t cp;
@@ -1495,7 +2847,7 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
       const int combiningX = x - raiseBy;
       const int combiningY = combiningMark::centerOverRotated90CW(lastBaseY, lastBaseLeft, lastBaseWidth,
                                                                   combiningGlyph->left, combiningGlyph->width);
-      renderCharImpl<TextRotation::Rotated90CW>(*this, renderMode, font, cp, combiningX, combiningY, black, style);
+      renderCharImpl<TextRotation::Rotated90CW>(*this, getRenderMode(), font, cp, combiningX, combiningY, black, style);
       continue;
     }
 
@@ -1509,13 +2861,24 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
     }
 
     const EpdGlyph* glyph = font.getGlyph(cp, style);
+    if (!glyph) {
+      lastBaseY -= fp4::toPixel(prevAdvanceFP);
+      prevCp = 0;
+      prevAdvanceFP = 0;
+      lastBaseLeft = 0;
+      lastBaseWidth = 0;
+      lastBaseTop = 0;
+      lastBaseAdvanceFP = 0;
+      continue;
+    }
 
-    lastBaseLeft = glyph ? glyph->left : 0;
-    lastBaseWidth = glyph ? glyph->width : 0;
-    lastBaseTop = glyph ? glyph->top : 0;
-    prevAdvanceFP = glyph ? glyph->advanceX : 0;  // 12.4 fixed-point
+    lastBaseLeft = glyph->left;
+    lastBaseWidth = glyph->width;
+    lastBaseTop = glyph->top;
+    lastBaseAdvanceFP = glyph->advanceX;
+    prevAdvanceFP = lastBaseAdvanceFP;
 
-    renderCharImpl<TextRotation::Rotated90CW>(*this, renderMode, font, cp, x, lastBaseY, black, style);
+    renderCharImpl<TextRotation::Rotated90CW>(*this, getRenderMode(), font, cp, x, lastBaseY, black, style);
     prevCp = cp;
   }
 }
@@ -1548,32 +2911,149 @@ void GfxRenderer::freeBwBufferChunks() {
  * Uses chunked allocation to avoid needing 48KB of contiguous memory.
  * Returns true if buffer was stored successfully, false if allocation failed.
  */
-bool GfxRenderer::storeBwBuffer() {
-  // Allocate and copy each chunk
-  for (size_t i = 0; i < bwBufferChunks.size(); i++) {
-    // Check if any chunks are already allocated
-    if (bwBufferChunks[i]) {
-      LOG_ERR("GFX", "!! BW buffer chunk %zu already stored - this is likely a bug, freeing chunk", i);
-      free(bwBufferChunks[i]);
-      bwBufferChunks[i] = nullptr;
-    }
+bool GfxRenderer::storeBwBuffer() { return storeBwBufferRect(0, 0, getScreenWidth(), getScreenHeight()); }
 
-    const size_t offset = i * BW_BUFFER_CHUNK_SIZE;
-    const size_t chunkSize = std::min(BW_BUFFER_CHUNK_SIZE, static_cast<size_t>(frameBufferSize - offset));
-    bwBufferChunks[i] = static_cast<uint8_t*>(malloc(chunkSize));
-
-    if (!bwBufferChunks[i]) {
-      LOG_ERR("GFX", "!! Failed to allocate BW buffer chunk %zu (%zu bytes)", i, chunkSize);
-      // Free previously allocated chunks
-      freeBwBufferChunks();
-      return false;
-    }
-
-    memcpy(bwBufferChunks[i], frameBuffer + offset, chunkSize);
+bool GfxRenderer::storeBwBufferRect(const int x, const int y, const int width, const int height) {
+  if (width <= 0 || height <= 0) {
+    freeBwBufferChunks();
+    bwSnapshotRowStart = 0;
+    bwSnapshotRowEnd = 0;
+    bwSnapshotSizeBytes = 0;
+    LOG_ERR("GFX", "!! BW buffer store rect invalid: x=%d y=%d w=%d h=%d", x, y, width, height);
+    return false;
   }
 
-  LOG_DBG("GFX", "Stored BW buffer in %zu chunks (%zu bytes each)", bwBufferChunks.size(), BW_BUFFER_CHUNK_SIZE);
-  return true;
+  const int screenWidth = getScreenWidth();
+  const int screenHeight = getScreenHeight();
+  if (screenWidth <= 0 || screenHeight <= 0 || panelWidthBytes == 0 || panelHeight == 0 || !frameBuffer) {
+    freeBwBufferChunks();
+    bwSnapshotRowStart = 0;
+    bwSnapshotRowEnd = 0;
+    bwSnapshotSizeBytes = 0;
+    LOG_ERR("GFX", "!! BW buffer store unavailable (screen=%dx%d panelHeight=%u rowBytes=%u fb=%p)", screenWidth,
+            screenHeight, panelHeight, panelWidthBytes, frameBuffer);
+    return false;
+  }
+
+  const int clampedX0 = std::max(0, x);
+  const int clampedY0 = std::max(0, y);
+  const int clampedX1 = std::min(screenWidth - 1, x + width - 1);
+  const int clampedY1 = std::min(screenHeight - 1, y + height - 1);
+  if (clampedX0 > clampedX1 || clampedY0 > clampedY1) {
+    freeBwBufferChunks();
+    bwSnapshotRowStart = 0;
+    bwSnapshotRowEnd = 0;
+    bwSnapshotSizeBytes = 0;
+    LOG_ERR("GFX", "!! BW buffer store rect outside screen: x=%d y=%d w=%d h=%d", x, y, width, height);
+    return false;
+  }
+
+  int rowStart = 0;
+  int rowEnd = 0;
+  switch (getOrientation()) {
+    case LandscapeCounterClockwise:
+      rowStart = clampedY0;
+      rowEnd = clampedY1;
+      break;
+    case LandscapeClockwise:
+      rowStart = static_cast<int>(panelHeight) - 1 - clampedY1;
+      rowEnd = static_cast<int>(panelHeight) - 1 - clampedY0;
+      break;
+    case Portrait:
+      rowStart = static_cast<int>(panelHeight) - 1 - clampedX1;
+      rowEnd = static_cast<int>(panelHeight) - 1 - clampedX0;
+      break;
+    case PortraitInverted:
+      rowStart = clampedX0;
+      rowEnd = clampedX1;
+      break;
+  }
+
+  rowStart = std::max(0, rowStart);
+  rowEnd = std::min(static_cast<int>(panelHeight) - 1, rowEnd);
+  if (rowStart > rowEnd) {
+    freeBwBufferChunks();
+    bwSnapshotRowStart = 0;
+    bwSnapshotRowEnd = 0;
+    bwSnapshotSizeBytes = 0;
+    LOG_ERR("GFX", "!! BW buffer store row-band invalid after orientation mapping: rows=%d..%d", rowStart, rowEnd);
+    return false;
+  }
+
+  const size_t rows = static_cast<size_t>(rowEnd - rowStart + 1);
+  const size_t snapshotSizeBytes = rows * panelWidthBytes;
+  const size_t snapshotBaseOffset = static_cast<size_t>(rowStart) * panelWidthBytes;
+  if (snapshotSizeBytes == 0 || snapshotBaseOffset + snapshotSizeBytes > frameBufferSize) {
+    LOG_ERR("GFX", "!! BW buffer store row-band out of bounds: base=%zu size=%zu frame=%u", snapshotBaseOffset,
+            snapshotSizeBytes, frameBufferSize);
+    return false;
+  }
+
+  freeBwBufferChunks();
+  bwSnapshotRowStart = static_cast<uint16_t>(rowStart);
+  bwSnapshotRowEnd = static_cast<uint16_t>(rowEnd);
+  bwSnapshotSizeBytes = snapshotSizeBytes;
+
+  auto attemptStore = [&](size_t chunkSize) {
+    bwBufferChunks.assign((bwSnapshotSizeBytes + chunkSize - 1) / chunkSize, nullptr);
+    for (size_t i = 0; i < bwBufferChunks.size(); i++) {
+      if (bwBufferChunks[i]) {
+        LOG_ERR("GFX", "!! BW buffer chunk %zu already stored - this is likely a bug, freeing chunk", i);
+        free(bwBufferChunks[i]);
+        bwBufferChunks[i] = nullptr;
+      }
+
+      const size_t offset = i * chunkSize;
+      const size_t allocSize = std::min(chunkSize, bwSnapshotSizeBytes - offset);
+      bwBufferChunks[i] = static_cast<uint8_t*>(malloc(allocSize));
+
+      if (!bwBufferChunks[i]) {
+        const uint32_t freeHeap = esp_get_free_heap_size();
+        const uint32_t contigHeap = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT);
+        LOG_ERR("GFX", "!! Failed to allocate BW buffer chunk %zu (%zu bytes): free=%u contig=%u", i, allocSize,
+                freeHeap, contigHeap);
+        freeBwBufferChunks();
+        return false;
+      }
+
+      memcpy(bwBufferChunks[i], frameBuffer + snapshotBaseOffset + offset, allocSize);
+    }
+    bwBufferChunkSize = chunkSize;
+    LOG_DBG("GFX", "Stored BW buffer rows [%u..%u] (%zu bytes) in %zu chunks (%zu bytes each)", bwSnapshotRowStart,
+            bwSnapshotRowEnd, bwSnapshotSizeBytes, bwBufferChunks.size(), chunkSize);
+    return true;
+  };
+
+  if (attemptStore(bwBufferChunkSize)) {
+    return true;
+  }
+
+  if (bwBufferChunkSize > 4096) {
+    LOG_INF("GFX", "BW buffer allocation failed with chunk size %zu, retrying with 4096", bwBufferChunkSize);
+    if (attemptStore(4096)) {
+      return true;
+    }
+  }
+
+  if (bwBufferChunkSize > 2048) {
+    LOG_INF("GFX", "BW buffer allocation still failed, retrying with 2048");
+    if (attemptStore(2048)) {
+      return true;
+    }
+  }
+
+  if (bwBufferChunkSize > 1024) {
+    LOG_INF("GFX", "BW buffer allocation still failed, retrying with 1024");
+    if (attemptStore(1024)) {
+      return true;
+    }
+  }
+
+  LOG_ERR("GFX", "!! BW buffer storage failed after retrying smaller chunk sizes");
+  bwSnapshotSizeBytes = 0;
+  bwSnapshotRowStart = 0;
+  bwSnapshotRowEnd = 0;
+  return false;
 }
 
 /**
@@ -1582,6 +3062,13 @@ bool GfxRenderer::storeBwBuffer() {
  * Uses chunked restoration to match chunked storage.
  */
 void GfxRenderer::restoreBwBuffer() {
+  if (bwSnapshotSizeBytes == 0) {
+    display.cleanupGrayscaleBuffers(frameBuffer);
+    freeBwBufferChunks();
+    LOG_ERR("GFX", "BW restore skipped: no stored snapshot metadata; cleaned grayscale buffers only");
+    return;
+  }
+
   // Check if all chunks are allocated
   bool missingChunks = false;
   for (const auto& bwBufferChunk : bwBufferChunks) {
@@ -1592,33 +3079,44 @@ void GfxRenderer::restoreBwBuffer() {
   }
 
   if (missingChunks) {
-    // BW buffer was lost (likely storeBwBuffer() failed under heap pressure and
-    // the caller didn't check). The HAL still expects a cleanup pass to rebase
-    // RAM from a known buffer; skipping it leaves _x3RedRamSynced=false, which
-    // forces every subsequent displayBuffer() into a full sync until reboot.
-    // Use the current framebuffer as the baseline — it's the best we have.
-    LOG_ERR("GFX", "BW buffer chunks missing on restore; recovering HAL state from framebuffer");
+    // Store failed part-way (or was skipped), so we cannot restore BW bytes safely.
+    // Still cleanup grayscale staging buffers to avoid retaining large temporary
+    // allocations that can later starve TLS handshakes.
     display.cleanupGrayscaleBuffers(frameBuffer);
     freeBwBufferChunks();
+    bwSnapshotSizeBytes = 0;
+    bwSnapshotRowStart = 0;
+    bwSnapshotRowEnd = 0;
+    LOG_ERR("GFX", "BW restore skipped due to missing chunks; cleaned grayscale buffers only");
     return;
   }
 
+  const size_t snapshotBaseOffset = static_cast<size_t>(bwSnapshotRowStart) * panelWidthBytes;
   for (size_t i = 0; i < bwBufferChunks.size(); i++) {
-    const size_t offset = i * BW_BUFFER_CHUNK_SIZE;
-    const size_t chunkSize = std::min(BW_BUFFER_CHUNK_SIZE, static_cast<size_t>(frameBufferSize - offset));
-    memcpy(frameBuffer + offset, bwBufferChunks[i], chunkSize);
+    const size_t offset = i * bwBufferChunkSize;
+    const size_t chunkSize = std::min(bwBufferChunkSize, bwSnapshotSizeBytes - offset);
+    memcpy(frameBuffer + snapshotBaseOffset + offset, bwBufferChunks[i], chunkSize);
   }
 
   display.cleanupGrayscaleBuffers(frameBuffer);
 
   freeBwBufferChunks();
-  LOG_DBG("GFX", "Restored and freed BW buffer chunks");
+  LOG_DBG("GFX", "Restored BW buffer rows [%u..%u] (%zu bytes) and freed BW chunks", bwSnapshotRowStart,
+          bwSnapshotRowEnd, bwSnapshotSizeBytes);
+  bwSnapshotSizeBytes = 0;
+  bwSnapshotRowStart = 0;
+  bwSnapshotRowEnd = 0;
 }
 
-/**
- * Cleanup grayscale buffers using the current frame buffer.
- * Use this when BW buffer was re-rendered instead of stored/restored.
- */
+// Cleanup grayscale buffers using the current frame buffer.
+// Use this when BW buffer was re-rendered instead of stored/restored.
+// On X3 the display call transiently Y-flips frameBuffer in place and flips
+// it back before returning; the logical contents are unchanged but callers
+// must not race a framebuffer reader against this call. See the header.
+void GfxRenderer::cleanupGrayscaleWithPreviousBuffer() const { display.cleanupGrayscaleWithPreviousBuffer(); }
+
+void GfxRenderer::syncRedRamFromFrameBuffer() const { display.syncRedRamFromFrameBuffer(); }
+
 void GfxRenderer::cleanupGrayscaleWithFrameBuffer() const {
   if (frameBuffer) {
     display.cleanupGrayscaleBuffers(frameBuffer);
@@ -1626,7 +3124,7 @@ void GfxRenderer::cleanupGrayscaleWithFrameBuffer() const {
 }
 
 void GfxRenderer::getOrientedViewableTRBL(int* outTop, int* outRight, int* outBottom, int* outLeft) const {
-  switch (orientation) {
+  switch (getOrientation()) {
     case Portrait:
       *outTop = VIEWABLE_MARGIN_TOP;
       *outRight = VIEWABLE_MARGIN_RIGHT;

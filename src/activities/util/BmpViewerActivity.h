@@ -1,10 +1,13 @@
 #pragma once
 
+#include <Epub/converters/ImageToFramebufferDecoder.h>
+#include <I18nKeys.h>
+
 #include <functional>
 #include <string>
 
+#include "../Activity.h"
 #include "MappedInputManager.h"
-#include "activities/Activity.h"
 
 class BmpViewerActivity final : public Activity {
  public:
@@ -15,10 +18,32 @@ class BmpViewerActivity final : public Activity {
   void loop() override;
 
  private:
-  void loadSiblingImages();
-  void doSetSleepCover();
-
   std::string filePath;
-  std::vector<std::string> siblingImages;
-  int currentImageIndex = -1;
+#ifdef ENABLE_IMAGE_DITHERING_EXTENSION
+  uint8_t imageDitherMode;
+  uint8_t initialImageDitherMode;
+  bool imageDitherSettingsDirty;
+#endif
+  // Per-session toggle: monochrome (1-bit Atkinson, single decode) vs grayscale (4-level dither, multipass).
+  // Not persisted — defaults to grayscale every time the viewer opens.
+  bool grayscaleDisplay = true;
+  // True after a successful BMP render iff the bitmap actually carries greyscale data.
+  // Used to gate the BW/Gray toggle in loop() — pure 1-bit BMPs cannot be toggled.
+  bool bmpHasGreyscale = false;
+  bool renderCurrentImage(bool showControls = true);
+  bool renderBmpImage(bool showControls = true);
+  bool renderDecodedImage(bool showControls = true);
+  void toggleDisplayMode();
+#ifdef ENABLE_IMAGE_DITHERING_EXTENSION
+  void cycleDitherMode();
+  StrId getCurrentDitherModeLabel() const;
+  void saveDitherSettingsIfNeeded();
+#endif
+  void renderError(const char* message);
+  void setAsSleepScreen();
+
+ public:
+  // Sets a BMP file as the sleep screen without needing an open viewer instance.
+  // Returns true on success.  Only works for .bmp files; for JPG/PNG open BmpViewerActivity.
+  static bool setBmpFileAsSleepScreen(const std::string& filePath);
 };

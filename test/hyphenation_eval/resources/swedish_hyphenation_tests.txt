@@ -1,4 +1,4 @@
-# Hyphenation Test Data
+﻿# Hyphenation Test Data
 # Source: Uppdrag Hail Mary - Andy Weir.epub
 # Language: sv_SE
 # Min prefix: 2
@@ -5010,3 +5010,4 @@ apokalyptisk|apo=ka=lyp=tisk|1
 Apollorymdskeppet|Apol=lorymd=skep=pet|1
 Apparaten|Ap=pa=ra=ten|1
 apparaturen|ap=pa=ra=tu=ren|1
+

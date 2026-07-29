@@ -280,8 +280,62 @@ def find_used_string_keys(
                 text = f.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            for m in pattern.finditer(text):
-                used.add(m.group(0))
+            in_block_comment = False
+            for line in text.splitlines():
+                quote_char = None
+                escaped = False
+                processed_line = []
+                idx = 0
+                while idx < len(line):
+                    ch = line[idx]
+                    if escaped:
+                        escaped = False
+                        if not in_block_comment:
+                            processed_line.append(ch)
+                        idx += 1
+                        continue
+
+                    if quote_char is None:
+                        if in_block_comment:
+                            if (
+                                ch == "*"
+                                and idx + 1 < len(line)
+                                and line[idx + 1] == "/"
+                            ):
+                                in_block_comment = False
+                                idx += 2
+                                continue
+                            idx += 1
+                            continue
+                        if ch in ['"', "'"]:
+                            quote_char = ch
+                            processed_line.append(ch)
+                            idx += 1
+                            continue
+                        if ch == "/" and idx + 1 < len(line):
+                            if line[idx + 1] == "/":
+                                break
+                            if line[idx + 1] == "*":
+                                in_block_comment = True
+                                idx += 2
+                                continue
+                        processed_line.append(ch)
+                        idx += 1
+                        continue
+
+                    if ch == "\\":
+                        escaped = True
+                        processed_line.append(ch)
+                        idx += 1
+                        continue
+                    if ch == quote_char:
+                        quote_char = None
+                    processed_line.append(ch)
+                    idx += 1
+
+                line = "".join(processed_line)
+                for m in pattern.finditer(line):
+                    used.add(m.group(0))
 
     return used
 
@@ -850,6 +904,16 @@ def main(
         print(f"Error: Output directory not found: {output_dir}")
         sys.exit(1)
 
+    out = Path(output_dir)
+    targets = [out / "I18nKeys.h", out / "I18nStrings.h", out / "I18nStrings.cpp"]
+    sources = list(Path(translations_dir).glob("*.yaml"))
+    if all(t.exists() for t in targets):
+        oldest_target = min(t.stat().st_mtime for t in targets)
+        newest_source = max(s.stat().st_mtime for s in sources)
+        if oldest_target >= newest_source:
+            print("Unchanged: all I18n outputs are up to date.")
+            return
+
     if verbose:
         print(f"Reading translations from: {translations_dir}")
         print(f"Output directory: {output_dir}")
@@ -921,7 +985,6 @@ def main(
             inherited_sets = [s - unused_set for s in inherited_sets]
             print(f"  Stripping {len(unused_set)} unused string(s) from output.")
 
-        out = Path(output_dir)
         generate_keys_header(
             languages, language_names, string_keys, str(out / "I18nKeys.h"), verbose
         )

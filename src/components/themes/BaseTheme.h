@@ -4,9 +4,13 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 class GfxRenderer;
+class Epub;
+class Txt;
+class Xtc;
 struct RecentBook;
 
 struct Rect {
@@ -48,8 +52,8 @@ struct ThemeMetrics {
   int homeCoverHeight;
   int homeCoverTileHeight;
   int homeRecentBooksCount;
-  bool homeContinueReadingInMenu;
-  int homeMenuTopOffset;
+  bool homeContinueReadingInMenu = false;
+  int homeMenuTopOffset = 0;
 
   int buttonHintsHeight;
   int sideButtonHintsWidth;
@@ -69,32 +73,7 @@ struct ThemeMetrics {
   int keyboardVerticalOffset;
   int keyboardTextFieldWidthPercent;
   int keyboardWidthPercent;
-  int keyboardKeyCornerRadius;
-  bool keyboardFillUnselected;
-  bool keyboardOutlineAllUnselected;
-  bool keyboardDrawSpecialOutlineWhenUnselected;
-  int keyboardSecondaryLabelRightPadding;
-  int keyboardSecondaryLabelTopPadding;
-  int keyboardMinArrowHeadSize;
-
-  float popupTopOffsetRatio;
-  int popupMarginX;
-  int popupMarginY;
-  int popupFrameThickness;
-  int popupCornerRadius;
-  bool popupTextBold;
-  bool popupTextInverted;
-  int popupTextBaselineOffsetY;
-  int popupProgressBarHeight;
-  bool popupProgressDrawOutline;
-  bool popupProgressClampPercent;
-  bool popupProgressFillInverted;
-  bool popupProgressOutlineInverted;
-
-  int textFieldHorizontalPadding;
-  int textFieldNormalThickness;
-  int textFieldCursorThickness;
-  int textFieldLineEndOffset;
+  int keyboardKeyCornerRadius = 0;
 };
 
 enum UIIcon {
@@ -109,11 +88,13 @@ enum UIIcon {
   Library,
   Wifi,
   Hotspot,
-  Instapaper,
+  Weather,
   ReadItLater
 };
 
-enum class KeyboardKeyType { Normal, Shift, Mode, Space, Del, Ok, Disabled };
+enum class KeyboardKeyType { Normal, Shift, Mode, Reveal, Space, Del, Ok, Disabled };
+
+enum class HomeNavigation { Linear, Carousel };
 
 // Default theme implementation (Classic Theme)
 // Additional themes can inherit from this and override methods as needed
@@ -127,7 +108,7 @@ constexpr ThemeMetrics values = {.batteryWidth = 15,
                                  .verticalSpacing = 10,
                                  .contentSidePadding = 20,
                                  .listRowHeight = 30,
-                                 .listWithSubtitleRowHeight = 50,
+                                 .listWithSubtitleRowHeight = 65,
                                  .menuRowHeight = 45,
                                  .menuSpacing = 8,
                                  .tabSpacing = 10,
@@ -138,8 +119,6 @@ constexpr ThemeMetrics values = {.batteryWidth = 15,
                                  .homeCoverHeight = 400,
                                  .homeCoverTileHeight = 400,
                                  .homeRecentBooksCount = 1,
-                                 .homeContinueReadingInMenu = false,
-                                 .homeMenuTopOffset = 10,
                                  .buttonHintsHeight = 40,
                                  .sideButtonHintsWidth = 30,
                                  .progressBarHeight = 16,
@@ -155,31 +134,7 @@ constexpr ThemeMetrics values = {.batteryWidth = 15,
                                  .keyboardCenteredText = false,
                                  .keyboardVerticalOffset = -13,
                                  .keyboardTextFieldWidthPercent = 85,
-                                 .keyboardWidthPercent = 90,
-                                 .keyboardKeyCornerRadius = 0,
-                                 .keyboardFillUnselected = false,
-                                 .keyboardOutlineAllUnselected = false,
-                                 .keyboardDrawSpecialOutlineWhenUnselected = true,
-                                 .keyboardSecondaryLabelRightPadding = 1,
-                                 .keyboardSecondaryLabelTopPadding = 0,
-                                 .keyboardMinArrowHeadSize = 0,
-                                 .popupTopOffsetRatio = 0.075f,
-                                 .popupMarginX = 15,
-                                 .popupMarginY = 15,
-                                 .popupFrameThickness = 2,
-                                 .popupCornerRadius = 0,
-                                 .popupTextBold = true,
-                                 .popupTextInverted = true,
-                                 .popupTextBaselineOffsetY = -2,
-                                 .popupProgressBarHeight = 4,
-                                 .popupProgressDrawOutline = false,
-                                 .popupProgressClampPercent = false,
-                                 .popupProgressFillInverted = true,
-                                 .popupProgressOutlineInverted = true,
-                                 .textFieldHorizontalPadding = 6,
-                                 .textFieldNormalThickness = 1,
-                                 .textFieldCursorThickness = 3,
-                                 .textFieldLineEndOffset = 0};
+                                 .keyboardWidthPercent = 90};
 }
 
 class BaseTheme {
@@ -187,12 +142,11 @@ class BaseTheme {
   virtual ~BaseTheme() = default;
 
   // Component drawing methods
-  void drawProgressBar(const GfxRenderer& renderer, Rect rect, size_t current, size_t total) const;
-  void drawBatteryLeft(const GfxRenderer& renderer, Rect rect,
-                       bool showPercentage = true) const;  // Left aligned (reader mode)
-  void drawBatteryRight(const GfxRenderer& renderer, Rect rect,
-                        bool showPercentage = true) const;  // Right aligned (UI headers)
-  virtual void fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage) const;
+  virtual void drawProgressBar(const GfxRenderer& renderer, Rect rect, size_t current, size_t total) const;
+  virtual void drawBatteryLeft(const GfxRenderer& renderer, Rect rect,
+                               bool showPercentage = true) const;  // Left aligned (reader mode)
+  virtual void drawBatteryRight(const GfxRenderer& renderer, Rect rect,
+                                bool showPercentage = true) const;  // Right aligned (UI headers)
   virtual void drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
                                const char* btn4) const;
   virtual void drawSideButtonHints(const GfxRenderer& renderer, const char* topBtn, const char* bottomBtn) const;
@@ -200,8 +154,10 @@ class BaseTheme {
                         const std::function<std::string(int index)>& rowTitle,
                         const std::function<std::string(int index)>& rowSubtitle = nullptr,
                         const std::function<UIIcon(int index)>& rowIcon = nullptr,
-                        const std::function<std::string(int index)>& rowValue = nullptr, bool highlightValue = false,
-                        const std::function<bool(int index)>& rowDimmed = nullptr) const;
+                        const std::function<std::string(int index)>& rowValue = nullptr,
+                        bool highlightValue = false) const;
+  virtual void drawListSeparator(const GfxRenderer& renderer, Rect rowRect, int textX, int textWidth,
+                                 const std::string& title) const;
   virtual void drawHeader(const GfxRenderer& renderer, Rect rect, const char* title,
                           const char* subtitle = nullptr) const;
   virtual void drawSubHeader(const GfxRenderer& renderer, Rect rect, const char* label,
@@ -214,11 +170,19 @@ class BaseTheme {
   virtual void drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
                               const std::function<std::string(int index)>& buttonLabel,
                               const std::function<UIIcon(int index)>& rowIcon) const;
-  virtual Rect drawPopup(const GfxRenderer& renderer, const char* message) const;
+  // Draws a centered message box and ships it. By default the box is overlaid on the frame that is
+  // currently on screen: displayBuffer() ends in a buffer swap, so the write buffer holds the frame
+  // from two refreshes ago, and a bare overlay would diff stale content around the box (ghosting).
+  // Syncing the write buffer from the displayed frame first fixes that. Callers that have already
+  // composed a full fresh frame into the write buffer (clearScreen + render, then popup in the same
+  // displayBuffer) must pass overlayDisplayedFrame=false so their render is not discarded.
+  virtual Rect drawPopup(const GfxRenderer& renderer, const char* message, bool overlayDisplayedFrame = true) const;
   virtual void fillPopupProgress(const GfxRenderer& renderer, const Rect& layout, const int progress) const;
-  void drawStatusBar(GfxRenderer& renderer, const float bookProgress, const int currentPage, const int pageCount,
-                     std::string title, const int paddingBottom = 0, const int textYOffset = 0) const;
-  void drawHelpText(const GfxRenderer& renderer, Rect rect, const char* label) const;
+  virtual void drawStatusBar(GfxRenderer& renderer, const float bookProgress, const int currentPage,
+                             const int pageCount, std::string title, const int paddingBottom = 0,
+                             const bool isStarred = false, const std::string& printedPageLabel = std::string(),
+                             const bool fillMargin = true, const bool pageCountApproximate = false) const;
+  virtual void drawHelpText(const GfxRenderer& renderer, Rect rect, const char* label) const;
   virtual void drawTextField(const GfxRenderer& renderer, Rect rect, const int textWidth, bool cursorMode = false,
                              int contentStartX = 0, int contentWidth = 0) const;
   virtual void drawKeyboardKey(const GfxRenderer& renderer, Rect rect, const char* label, const bool isSelected,
@@ -226,7 +190,41 @@ class BaseTheme {
                                bool inactiveSelection = false) const;
   virtual bool showsFileIcons() const { return false; }
 
-  // Shared constants and helpers for battery drawing (used by all themes)
+  // ---- Home screen navigation / rendering contract ----
+
+  // Return Carousel to opt in to left/right book navigation and tryFastHomeRender().
+  virtual HomeNavigation getHomeNavigation() const { return HomeNavigation::Linear; }
+
+  // Return the cover thumbnail sizes this theme needs for its home screen.
+  // HomeActivity calls generateThumbBmp() for each pair. Empty = use height-only path.
+  virtual std::vector<std::pair<int, int>> getCoverThumbSizes(int coverHeight) const { return {}; }
+
+  // Attempt a full home-screen render from pre-cached state.
+  // Return true if the theme handled the render (HomeActivity must not draw anything else).
+  // Return false to fall through to the standard slow-path render in HomeActivity.
+  virtual bool tryFastHomeRender(GfxRenderer& renderer, const std::vector<RecentBook>& recentBooks, int selectorIndex,
+                                 int menuCount, const std::function<std::string(int)>& menuLabel,
+                                 const std::function<UIIcon(int)>& menuIcon, const char* hintBtn1, const char* hintBtn2,
+                                 const char* hintBtn3, const char* hintBtn4) const {
+    return false;
+  }
+
+  // Called by readers just before releasing the book object. Themes that cache
+  // cover thumbnails can generate them here while the book is still loaded.
+  // Only one of epub/xtc/txt will be non-null depending on the reader.
+  virtual void onBookWillClose(const std::string& path, Epub* epub, Xtc* xtc, Txt* txt) {}
+
+  // Called when HomeActivity exits. Themes that hold heap-allocated render caches
+  // should free them here so the memory is available to child activities.
+  virtual void invalidateFrameCache() {}
+
+  // Mark the frame cache stale without freeing it. tryFastHomeRender will
+  // rebuild on the next render pass. Multiple dirty marks coalesce into one
+  // rebuild — use this instead of invalidateFrameCache() when a cover BMP was
+  // just written so back-to-back cover arrivals don't each trigger an SD re-read.
+  virtual void markFrameCacheDirty() {}
+
+  // ---- Shared constants and helpers for battery drawing (used by all themes) ----
   static constexpr int batteryPercentSpacing = 4;
   static void drawBatteryOutline(const GfxRenderer& renderer, int x, int y, int battWidth, int rectHeight);
   static void drawBatteryLightningBolt(const GfxRenderer& renderer, int boltX, int boltY);

@@ -20,7 +20,9 @@ class OtaUpdateActivity : public Activity {
 
   State state = WIFI_SELECTION;
   unsigned int lastUpdaterPercentage = UNINITIALIZED_PERCENTAGE;
+  uint32_t lastOtaDrawMs = 0;  // throttles progress redraws during the streaming install
   OtaUpdater updater;
+  OtaUpdater::OtaUpdaterError failureReason = OtaUpdater::OK;
 
   void onWifiSelectionComplete(bool success);
 

@@ -2,60 +2,52 @@
 
 #include "CrossPointSettings.h"
 
-namespace {
-using ButtonIndex = uint8_t;
-
-struct SideLayoutMap {
-  ButtonIndex pageBack;
-  ButtonIndex pageForward;
-};
-
-// Order matches CrossPointSettings::SIDE_BUTTON_LAYOUT.
-constexpr SideLayoutMap kSideLayouts[] = {
-    {HalGPIO::BTN_UP, HalGPIO::BTN_DOWN},
-    {HalGPIO::BTN_DOWN, HalGPIO::BTN_UP},
-};
-}  // namespace
-
 bool MappedInputManager::mapButton(const Button button, bool (HalGPIO::*fn)(uint8_t) const) const {
-  const auto sideLayout = static_cast<CrossPointSettings::SIDE_BUTTON_LAYOUT>(SETTINGS.sideButtonLayout);
-  const auto& side = kSideLayouts[sideLayout];
-
   switch (button) {
     case Button::Back:
-      // Logical Back maps to user-configured front button.
       return (gpio.*fn)(SETTINGS.frontButtonBack);
     case Button::Confirm:
-      // Logical Confirm maps to user-configured front button.
       return (gpio.*fn)(SETTINGS.frontButtonConfirm);
     case Button::Left:
-      // Logical Left maps to user-configured front button.
       return (gpio.*fn)(SETTINGS.frontButtonLeft);
     case Button::Right:
-      // Logical Right maps to user-configured front button.
       return (gpio.*fn)(SETTINGS.frontButtonRight);
     case Button::Up:
-      // Side buttons remain fixed for Up/Down.
       return (gpio.*fn)(HalGPIO::BTN_UP);
     case Button::Down:
-      // Side buttons remain fixed for Up/Down.
       return (gpio.*fn)(HalGPIO::BTN_DOWN);
     case Button::Power:
-      // Power button bypasses remapping.
       return (gpio.*fn)(HalGPIO::BTN_POWER);
     case Button::PageBack:
-      // Reader page navigation uses side buttons and can be swapped via settings.
-      if (sideLayout == CrossPointSettings::BOTH_FORWARD) return false;
-      return (gpio.*fn)(side.pageBack);
+      return (gpio.*fn)(HalGPIO::BTN_UP);
     case Button::PageForward:
-      // Reader page navigation uses side buttons and can be swapped via settings.
-      if (sideLayout == CrossPointSettings::BOTH_FORWARD) {
-        return (gpio.*fn)(HalGPIO::BTN_UP) || (gpio.*fn)(HalGPIO::BTN_DOWN);
-      }
-      return (gpio.*fn)(side.pageForward);
+      return (gpio.*fn)(HalGPIO::BTN_DOWN);
   }
-
   return false;
+}
+
+uint8_t MappedInputManager::rawIndex(const Button button) const {
+  switch (button) {
+    case Button::Back:
+      return SETTINGS.frontButtonBack;
+    case Button::Confirm:
+      return SETTINGS.frontButtonConfirm;
+    case Button::Left:
+      return SETTINGS.frontButtonLeft;
+    case Button::Right:
+      return SETTINGS.frontButtonRight;
+    case Button::Up:
+      return HalGPIO::BTN_UP;
+    case Button::Down:
+      return HalGPIO::BTN_DOWN;
+    case Button::Power:
+      return HalGPIO::BTN_POWER;
+    case Button::PageBack:
+      return HalGPIO::BTN_UP;
+    case Button::PageForward:
+      return HalGPIO::BTN_DOWN;
+  }
+  return 0xFF;
 }
 
 bool MappedInputManager::wasPressed(const Button button) const { return mapButton(button, &HalGPIO::wasPressed); }
@@ -72,13 +64,6 @@ unsigned long MappedInputManager::getHeldTime() const { return gpio.getHeldTime(
 
 MappedInputManager::Labels MappedInputManager::mapLabels(const char* back, const char* confirm, const char* previous,
                                                          const char* next) const {
-  // Swap previous/next labels to match the page turn direction swap in INVERTED and LANDSCAPE_CCW.
-  const bool swapLabels =
-      SETTINGS.frontButtonFollowOrientation && (SETTINGS.orientation == CrossPointSettings::INVERTED ||
-                                                SETTINGS.orientation == CrossPointSettings::LANDSCAPE_CCW);
-  const char* leftLabel = swapLabels ? next : previous;
-  const char* rightLabel = swapLabels ? previous : next;
-
   // Build the label order based on the configured hardware mapping.
   auto labelForHardware = [&](uint8_t hw) -> const char* {
     // Compare against configured logical roles and return the matching label.
@@ -89,10 +74,10 @@ MappedInputManager::Labels MappedInputManager::mapLabels(const char* back, const
       return confirm;
     }
     if (hw == SETTINGS.frontButtonLeft) {
-      return leftLabel;
+      return previous;
     }
     if (hw == SETTINGS.frontButtonRight) {
-      return rightLabel;
+      return next;
     }
     return "";
   };

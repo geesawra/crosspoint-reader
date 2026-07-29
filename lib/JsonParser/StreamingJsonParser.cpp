@@ -147,8 +147,7 @@ void StreamingJsonParser::handleStringChar(char c) {
         appendToken('\t');
         break;
       case 'u':
-        // Pass \uXXXX through as literal characters -- we don't decode
-        // Unicode escapes since our use case only needs ASCII field matching.
+        // Pass \uXXXX through as literal chars. Field matching here is ASCII-only.
         appendToken('\\');
         appendToken('u');
         break;

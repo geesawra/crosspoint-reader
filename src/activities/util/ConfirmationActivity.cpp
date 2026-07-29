@@ -2,8 +2,8 @@
 
 #include <I18n.h>
 
+#include "../../components/UITheme.h"
 #include "HalDisplay.h"
-#include "components/UITheme.h"
 
 ConfirmationActivity::ConfirmationActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                            const std::string& heading, const std::string& body)
@@ -11,9 +11,11 @@ ConfirmationActivity::ConfirmationActivity(GfxRenderer& renderer, MappedInputMan
 
 void ConfirmationActivity::onEnter() {
   Activity::onEnter();
+  inputArmed = false;
 
   lineHeight = renderer.getLineHeight(fontId);
-  const int maxWidth = renderer.getScreenWidth() - (margin * 2);
+  const Rect contentRect = UITheme::getContentRect(renderer, true, false);
+  const int maxWidth = contentRect.width - (margin * 2);
 
   if (!heading.empty()) {
     safeHeading = renderer.truncatedText(fontId, heading.c_str(), maxWidth, EpdFontFamily::BOLD);
@@ -27,7 +29,7 @@ void ConfirmationActivity::onEnter() {
   if (!safeBody.empty()) totalHeight += lineHeight;
   if (!safeHeading.empty() && !safeBody.empty()) totalHeight += spacing;
 
-  startY = (renderer.getScreenHeight() - totalHeight) / 2;
+  startY = contentRect.y + (contentRect.height - totalHeight) / 2;
 
   requestUpdate(true);
 }
@@ -49,13 +51,26 @@ void ConfirmationActivity::render(RenderLock&& lock) {
   }
 
   // Draw UI Elements
-  const auto labels = mappedInput.mapLabels(I18N.get(StrId::STR_CANCEL), "", "", I18N.get(StrId::STR_CONFIRM));
+  const auto labels = mappedInput.mapLabels("", "", I18N.get(StrId::STR_CANCEL), I18N.get(StrId::STR_CONFIRM));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   renderer.displayBuffer(HalDisplay::RefreshMode::FAST_REFRESH);
 }
 
 void ConfirmationActivity::loop() {
+  if (!inputArmed) {
+    const bool anyFrontPressed = mappedInput.isPressed(MappedInputManager::Button::Back) ||
+                                 mappedInput.isPressed(MappedInputManager::Button::Confirm) ||
+                                 mappedInput.isPressed(MappedInputManager::Button::Left) ||
+                                 mappedInput.isPressed(MappedInputManager::Button::Right);
+
+    // Ignore inherited press/release events from the parent activity.
+    if (!anyFrontPressed && !mappedInput.wasAnyPressed() && !mappedInput.wasAnyReleased()) {
+      inputArmed = true;
+    }
+    return;
+  }
+
   if (mappedInput.wasReleased(MappedInputManager::Button::Right)) {
     ActivityResult res;
     res.isCancelled = false;
@@ -64,7 +79,7 @@ void ConfirmationActivity::loop() {
     return;
   }
 
-  if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+  if (mappedInput.wasReleased(MappedInputManager::Button::Left)) {
     ActivityResult res;
     res.isCancelled = true;
     setResult(std::move(res));

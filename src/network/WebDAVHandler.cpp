@@ -1,14 +1,18 @@
 #include "WebDAVHandler.h"
 
+#include <Epub.h>
 #include <FsHelpers.h>
 #include <HalStorage.h>
 #include <Logging.h>
+#include <Txt.h>
+#include <Xtc.h>
 #include <esp_task_wdt.h>
 
-#include "util/FileDeletionUtil.h"
+#include "HttpFileStreamer.h"
 
 namespace {
-constexpr const char* HIDDEN_ITEMS[] = {"System Volume Information", "XTCache"};
+const char* HIDDEN_ITEMS[] = {"System Volume Information", "XTCache"};
+constexpr size_t HIDDEN_ITEMS_COUNT = sizeof(HIDDEN_ITEMS) / sizeof(HIDDEN_ITEMS[0]);
 
 // RFC 1123 date format helper: "Sun, 06 Nov 1994 08:49:37 GMT"
 // ESP32 doesn't have real-time clock set by default, so we use a fixed epoch date
@@ -230,8 +234,8 @@ void WebDAVHandler::handlePropfind(WebServer& s) {
       // Skip hidden/protected items
       bool shouldHide = fileName.startsWith(".");
       if (!shouldHide) {
-        for (const auto* item : HIDDEN_ITEMS) {
-          if (fileName.equals(item)) {
+        for (size_t i = 0; i < HIDDEN_ITEMS_COUNT; i++) {
+          if (fileName.equals(HIDDEN_ITEMS[i])) {
             shouldHide = true;
             break;
           }
@@ -328,8 +332,12 @@ void WebDAVHandler::handleGet(WebServer& s) {
   s.send(200, contentType.c_str(), "");
 
   NetworkClient client = s.client();
-  client.write(file);
-  file.close();
+  bool downloadOk = HttpFileStreamer::streamFileToClient(file, client);
+  client.clear();
+
+  if (!downloadOk) {
+    LOG_DBG("DAV", "GET interrupted while streaming: %s", path.c_str());
+  }
 }
 
 // ── HEAD ─────────────────────────────────────────────────────────────────────
@@ -385,7 +393,7 @@ void WebDAVHandler::handlePut(WebServer& s) {
     return;
   }
 
-  FileDeletionUtil::clearEpubCacheIfNeeded(path.c_str());
+  clearEpubCacheIfNeeded(path);
   s.send(_putExisted ? 204 : 201);
   LOG_DBG("DAV", "PUT complete: %s", path.c_str());
 }
@@ -411,10 +419,35 @@ void WebDAVHandler::handleDelete(WebServer& s) {
     return;
   }
 
-  if (FileDeletionUtil::deletePath(path.c_str())) {
-    s.send(204);
+  FsFile file = Storage.open(path.c_str());
+  if (!file) {
+    s.send(500, "text/plain", "Failed to open");
+    return;
+  }
+
+  if (file.isDirectory()) {
+    // Check if directory is empty
+    FsFile entry = file.openNextFile();
+    if (entry) {
+      entry.close();
+      file.close();
+      s.send(409, "text/plain", "Directory not empty");
+      return;
+    }
+    file.close();
+    if (Storage.rmdir(path.c_str())) {
+      s.send(204);
+    } else {
+      s.send(500, "text/plain", "Failed to remove directory");
+    }
   } else {
-    s.send(500, "text/plain", "Failed to delete");
+    file.close();
+    clearEpubCacheIfNeeded(path);
+    if (Storage.remove(path.c_str())) {
+      s.send(204);
+    } else {
+      s.send(500, "text/plain", "Failed to delete file");
+    }
   }
 }
 
@@ -518,7 +551,7 @@ void WebDAVHandler::handleMove(WebServer& s) {
     return;
   }
 
-  FileDeletionUtil::clearEpubCacheIfNeeded(srcPath.c_str());
+  clearEpubCacheIfNeeded(srcPath);
   bool success = file.rename(dstPath.c_str());
   file.close();
 
@@ -749,8 +782,8 @@ bool WebDAVHandler::isProtectedPath(const String& path) const {
 
     if (segment.startsWith(".")) return true;
 
-    for (const auto* item : HIDDEN_ITEMS) {
-      if (segment.equals(item)) return true;
+    for (size_t i = 0; i < HIDDEN_ITEMS_COUNT; i++) {
+      if (segment.equals(HIDDEN_ITEMS[i])) return true;
     }
 
     start = end + 1;
@@ -771,6 +804,23 @@ bool WebDAVHandler::getOverwrite(WebServer& s) const {
   String ow = s.header("Overwrite");
   if (ow == "F" || ow == "f") return false;
   return true;  // Default is T
+}
+
+void WebDAVHandler::clearEpubCacheIfNeeded(const String& path) const {
+  if (FsHelpers::hasEpubExtension(path)) {
+    Epub(path.c_str(), "/.crosspoint").clearCache();
+    LOG_DBG("DAV", "Cleared epub cache for: %s", path.c_str());
+  } else if (FsHelpers::hasXtcExtension(path)) {
+    Xtc(path.c_str(), "/.crosspoint").clearCache();
+    LOG_DBG("DAV", "Cleared xtc cache for: %s", path.c_str());
+  } else if (FsHelpers::hasTxtExtension(path) || FsHelpers::hasMarkdownExtension(path)) {
+    const Txt txt(path.c_str(), "/.crosspoint");
+    const String cachePath = txt.getCachePath().c_str();
+    if (Storage.exists(cachePath.c_str())) {
+      Storage.removeDir(cachePath.c_str());
+      LOG_DBG("DAV", "Cleared txt cache for: %s", path.c_str());
+    }
+  }
 }
 
 String WebDAVHandler::getMimeType(const String& path) const {

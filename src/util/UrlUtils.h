@@ -4,11 +4,6 @@
 namespace UrlUtils {
 
 /**
- * Check if URL uses HTTPS protocol
- */
-bool isHttpsUrl(const std::string& url);
-
-/**
  * Prepend http:// if no protocol specified (server will redirect to https if needed)
  */
 std::string ensureProtocol(const std::string& url);
@@ -17,6 +12,13 @@ std::string ensureProtocol(const std::string& url);
  * Extract host with protocol from URL (e.g., "http://example.com" from "http://example.com/path")
  */
 std::string extractHost(const std::string& url);
+
+/**
+ * Extract hostname only from a URL (e.g., "example.com" from
+ * "http://example.com:8080/path"). Returns an empty string if no hostname can
+ * be determined.
+ */
+std::string extractHostname(const std::string& url);
 
 /**
  * Build full URL from server URL and path.

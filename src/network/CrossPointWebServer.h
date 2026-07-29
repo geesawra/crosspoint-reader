@@ -27,6 +27,11 @@ class CrossPointWebServer {
     std::string lastCompleteName;
     size_t lastCompleteSize = 0;
     unsigned long lastCompleteAt = 0;
+    // Last successful /delete request (HTTP, not WebSocket): name of the last
+    // item removed, how many items that request removed, and when.
+    std::string lastDeleteName;
+    size_t lastDeleteCount = 0;
+    unsigned long lastDeleteAt = 0;
   };
 
   // Used by POST upload handler
@@ -45,7 +50,7 @@ class CrossPointWebServer {
     std::vector<uint8_t> buffer;
     size_t bufferPos = 0;
 
-    UploadState() { buffer.resize(UPLOAD_BUFFER_SIZE); }
+    UploadState() = default;
   } upload;
 
   CrossPointWebServer();
@@ -85,14 +90,16 @@ class CrossPointWebServer {
 
   // File scanning
   void scanFiles(const char* path, const std::function<void(FileInfo)>& callback) const;
-  String formatFileSize(size_t bytes) const;
   bool isEpubFile(const String& filename) const;
 
   // Request handlers
   void handleRoot() const;
+  void handleWelcomePage() const;
+  void handleSystemInfoPage() const;
   void handleJszip() const;
   void handleNotFound() const;
   void handleStatus() const;
+  void handleStatusFast() const;
   void handleFileList() const;
   void handleFileListData() const;
   void handleDownload() const;
@@ -110,24 +117,27 @@ class CrossPointWebServer {
 
   // Font management handlers
   void handleFontsPage() const;
-  void handleFontList() const;
+  void handleFontList();
+  void handleFontManifest();
+  void handleFontDownload();
   void handleFontUpload();
   void handleFontUploadData();
   void handleFontDelete();
 
-  // Font upload state
   struct FontUploadState {
     FsFile file;
     std::string familyName;
     std::string filePath;
     bool valid = false;
     bool magicChecked = false;
+    uint8_t header[8] = {0};
+    size_t headerBytesReceived = 0;
     size_t bytesWritten = 0;
     static constexpr size_t BUFFER_SIZE = 4096;
     std::vector<uint8_t> buffer;
     size_t bufferPos = 0;
 
-    FontUploadState() { buffer.resize(BUFFER_SIZE); }
+    FontUploadState() = default;
   } fontUpload;
 
   // OPDS server handlers
@@ -139,4 +149,9 @@ class CrossPointWebServer {
   void handleGetWifiNetworks() const;
   void handlePostWifiNetwork();
   void handleDeleteWifiNetwork();
+
+  // Reading-stats handlers
+  void handleStatsPage() const;
+  void handleStatsApi() const;
+  void handleStatsExport() const;
 };

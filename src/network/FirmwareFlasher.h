@@ -43,8 +43,7 @@ using ProgressCb = void (*)(size_t written, size_t total, void* ctx);
 // `alreadyValidated` lets callers that have just run `validateImageFile()`
 // themselves (e.g. SdFirmwareUpdateActivity, which validates before showing
 // the user the confirmation prompt) skip the redundant second pass. Defaults
-// to false so callers without prior validation (any future entry point) keep
-// the defense-in-depth check.
+// to false so callers without prior validation keep the defense-in-depth check.
 Result flashFromSdPath(const char* sdPath, ProgressCb onProgress, void* ctx, bool alreadyValidated = false);
 
 // Full-image integrity check that mirrors the bootloader's verification:
@@ -53,9 +52,7 @@ Result flashFromSdPath(const char* sdPath, ProgressCb onProgress, void* ctx, boo
 // truncated/corrupted .bin never reaches otadata.
 //
 // `partitionSize` is the size of the destination OTA partition; pass 0 to
-// skip the size-fits-partition check (e.g. when validating ahead of partition
-// lookup). Streams the file in CHUNK-sized reads; the file is rewound on
-// success so the caller can immediately reread it for flashing.
+// skip the size-fits-partition check. Streams the file in CHUNK-sized reads.
 Result validateImageFile(const char* sdPath, size_t partitionSize);
 
 const char* resultName(Result r);

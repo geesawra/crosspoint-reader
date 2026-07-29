@@ -1,7 +1,8 @@
 #pragma once
 #include <Print.h>
-#include <expat.h>
+#include <SaxParser/SaxParser.h>
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -13,6 +14,13 @@ enum class OpdsEntryType {
   BOOK         // Downloadable book
 };
 
+struct OpdsAcquisitionLink {
+  std::string href;
+  std::string mimeType;
+  std::string formatKey;
+  std::string fileExtension;
+};
+
 /**
  * Represents an entry from an OPDS feed (either a navigation link or a book).
  */
@@ -22,6 +30,9 @@ struct OpdsEntry {
   std::string author;  // Only for books
   std::string href;    // Navigation URL or epub download URL
   std::string id;
+  std::string summary;  // Short description from <summary> or <content>, books only
+  std::vector<OpdsAcquisitionLink> acquisitionLinks;
+  std::string imageHref;  // Cover image URL (rel="http://opds-spec.org/image"), books only
 };
 
 // Legacy alias for backward compatibility
@@ -29,18 +40,21 @@ using OpdsBook = OpdsEntry;
 
 /**
  * Parser for OPDS (Open Publication Distribution System) Atom feeds.
- * Uses the Expat XML parser to parse OPDS catalog entries.
+ * Uses the SaxParser (yxml backend) to parse OPDS catalog entries.
  *
  * Usage:
  *   OpdsParser parser;
- *   if (parser.parse(xmlData, xmlLength)) {
- *     for (const auto& entry : parser.getEntries()) {
- *       if (entry.type == OpdsEntryType::BOOK) {
- *         // Downloadable book
- *       } else {
- *         // Navigation link to another catalog
- *       }
+ *   parser.onEntryParsed = [](OpdsEntry entry) {
+ *     if (entry.type == OpdsEntryType::BOOK) {
+ *       // Process downloadable book
+ *     } else {
+ *       // Process navigation link
  *     }
+ *   };
+ *
+ *   // Entries are emitted immediately as they are parsed from the stream.
+ *   if (parser.parse(xmlData, xmlLength)) {
+ *     // Parsing completed successfully
  *   }
  */
 class OpdsParser final : public Print {
@@ -50,6 +64,7 @@ class OpdsParser final : public Print {
 
   // Disable copy
   const std::string& getSearchTemplate() const { return searchTemplate; }
+  const std::string& getOsdUrl() const { return osdUrl; }
   const std::string& getNextPageUrl() const { return nextPageUrl; }
   const std::string& getPrevPageUrl() const { return prevPageUrl; }
   OpdsParser(const OpdsParser&) = delete;
@@ -64,38 +79,30 @@ class OpdsParser final : public Print {
 
   operator bool() { return !error(); }
 
-  /**
-   * Get the parsed entries (both navigation and book entries).
-   * @return Vector of OpdsEntry entries
-   */
-  const std::vector<OpdsEntry>& getEntries() const& { return entries; }
-  std::vector<OpdsEntry> getEntries() && { return std::move(entries); }
-
-  /**
-   * Get only book entries (legacy compatibility).
-   * @return Vector of book entries
-   */
-  std::vector<OpdsEntry> getBooks() const;
+  // Bitmask of SaxParser::TruncationFlag values hit while parsing — non-zero
+  // means a field (e.g. a long acquisition href) exceeded the parser's fixed
+  // buffers and was silently truncated. Callers should log a non-zero result.
+  uint32_t truncationFlags() const { return saxParser_.truncationFlags(); }
 
   /**
    * Clear all parsed entries.
    */
   void clear();
 
+  std::function<void(OpdsEntry)> onEntryParsed;
+
  private:
-  // Expat callbacks
-  static void XMLCALL startElement(void* userData, const XML_Char* name, const XML_Char** atts);
-  static void XMLCALL endElement(void* userData, const XML_Char* name);
-  static void XMLCALL characterData(void* userData, const XML_Char* s, int len);
+  static void startElement(void* userData, const char* name, const char** atts);
+  static void endElement(void* userData, const char* name);
+  static void characterData(void* userData, const char* s, int len);
 
   std::string searchTemplate;
+  std::string osdUrl;
   std::string nextPageUrl;
   std::string prevPageUrl;
-  // Helper to find attribute value
-  static const char* findAttribute(const XML_Char** atts, const char* name);
+  static const char* findAttribute(const char** atts, const char* name);
 
-  XML_Parser parser = nullptr;
-  std::vector<OpdsEntry> entries;
+  SaxParser saxParser_;
   OpdsEntry currentEntry;
   std::string currentText;
 
@@ -105,6 +112,8 @@ class OpdsParser final : public Print {
   bool inAuthor = false;
   bool inAuthorName = false;
   bool inId = false;
+  bool inSummary = false;
+  bool inContent = false;
 
   bool errorOccured = false;
 };

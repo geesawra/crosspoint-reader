@@ -472,28 +472,61 @@ static int tinf_inflate_block_data(TINF_DATA *d, TINF_TREE *lt, TINF_TREE *dt)
         }
     }
 
-    /* copy next byte from dict substring */
+    /* copy next byte(s) from dict substring */
     if (d->dict_ring) {
-        TINF_PUT(d, d->dict_ring[d->lzOff]);
-        if ((unsigned)++d->lzOff == d->dict_size) {
-            d->lzOff = 0;
+        /* Copy the whole run that fits in the current dest window in one go,
+           instead of re-entering uzlib_uncompress()'s per-byte dispatch loop
+           (block-type switch + curlen test) for every output byte. The bulk of
+           PNG output is back-references, so this is the hot path.
+
+           Stays byte-wise on purpose: a memcpy() would be wrong here because
+           (a) source and dest overlap when lzOff trails dict_idx by less than
+           curlen (RLE-style fills, e.g. distance 1), and (b) lzOff and dict_idx
+           wrap around the ring independently. Bounding by dest_limit preserves
+           the original cross-read() streaming behaviour (curlen carries over). */
+        unsigned int run = d->curlen;
+        const unsigned int dest_space = (unsigned int)(d->dest_limit - d->dest);
+        if (run > dest_space) {
+            run = dest_space;
         }
-    } else {
-        #if UZLIB_CONF_USE_MEMCPY
-        /* copy as much as possible, in one memcpy() call */
-        unsigned int to_copy = d->curlen, dest_len = d->dest_limit - d->dest;
-        if (to_copy > dest_len) {
-            to_copy = dest_len;
+        d->curlen -= run;
+        while (run--) {
+            const unsigned char c = d->dict_ring[d->lzOff];
+            *d->dest++ = c;
+            d->dict_ring[d->dict_idx++] = c;
+            if (d->dict_idx == d->dict_size) {
+                d->dict_idx = 0;
+            }
+            if ((unsigned)++d->lzOff == d->dict_size) {
+                d->lzOff = 0;
+            }
         }
-        memcpy(d->dest, d->dest + d->lzOff, to_copy);
-        d->dest += to_copy;
-        d->curlen -= to_copy;
         return TINF_OK;
-        #else
-        d->dest[0] = d->dest[d->lzOff];
-        d->dest++;
-        #endif
     }
+
+    #if UZLIB_CONF_USE_MEMCPY
+    /* copy as much as possible, in one memcpy() call */
+    unsigned int to_copy = d->curlen, dest_len = d->dest_limit - d->dest;
+    if (to_copy > dest_len) {
+        to_copy = dest_len;
+    }
+    /* memcpy() requires non-overlapping ranges, and LZ77 run-fills (e.g.
+       distance 1) rely on byte propagation that memcpy() does not provide.
+       The source sits offs == -lzOff bytes behind dest, so only the first
+       offs bytes are safe to bulk-copy; the rest of the run is finished on
+       the next call(s), by which point those bytes have been materialised. */
+    const unsigned int dist = (unsigned int)(-d->lzOff);
+    if (to_copy > dist) {
+        to_copy = dist;
+    }
+    memcpy(d->dest, d->dest + d->lzOff, to_copy);
+    d->dest += to_copy;
+    d->curlen -= to_copy;
+    return TINF_OK;
+    #else
+    d->dest[0] = d->dest[d->lzOff];
+    d->dest++;
+    #endif
     d->curlen--;
     return TINF_OK;
 }
@@ -612,7 +645,7 @@ next_blk:
 
         if (res == TINF_DONE && !d->bfinal) {
             /* the block has ended (without producing more data), but we
-               can't return without data, so start processing next block */
+               can't return without data, so start procesing next block */
             goto next_blk;
         }
 

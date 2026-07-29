@@ -1,66 +1,119 @@
 #include "QrUtils.h"
 
+#include <Memory.h>
 #include <Utf8.h>
-#include <qrcode.h>
+#include <qrcodegen.h>
 
 #include <algorithm>
 #include <memory>
 
 #include "Logging.h"
 
-void QrUtils::drawQrCode(const GfxRenderer& renderer, const Rect& bounds, const std::string& textPayload) {
-  // Dynamically calculate the QR code version based on text length
-  // Version 4 holds ~114 bytes, Version 10 ~395, Version 20 ~1066, up to 40
-  // qrcode.h max version is 40.
-  // Formula: approx version = size / 26 + 1 (very rough estimate, better to find best fit)
-  size_t len = textPayload.length();
+namespace {
 
-  // Truncate to max QR capacity at a UTF-8 safe boundary to avoid splitting multi-byte sequences
-  static constexpr size_t MAX_QR_CAPACITY = 2953;  // Version 40, ECC_LOW, byte mode
-  std::string truncated;
-  const char* payload = textPayload.c_str();
+bool hasNonAscii(const uint8_t* data, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    if (data[i] > 0x7F) return true;
+  }
+  return false;
+}
+
+// Byte-mode data capacity (bytes) at ECC LOW for QR versions 1-40
+// (ISO/IEC 18004; matches qrcodegen's internal limits). Byte mode is the
+// pessimistic bound — numeric/alphanumeric payloads fit more, never less.
+constexpr uint16_t BYTE_CAPACITY_ECC_LOW[qrcodegen_VERSION_MAX] = {
+    17,   32,   53,   78,   106,  134,  154,  192,  230,  271,  321,  367,  425,  458,
+    520,  586,  644,  718,  792,  858,  929,  1003, 1091, 1171, 1273, 1367, 1465, 1528,
+    1628, 1732, 1840, 1952, 2068, 2188, 2303, 2431, 2563, 2699, 2809, 2953};
+
+int versionForByteLen(size_t len) {
+  for (int v = qrcodegen_VERSION_MIN; v <= qrcodegen_VERSION_MAX; v++) {
+    if (BYTE_CAPACITY_ECC_LOW[v - 1] >= len) return v;
+  }
+  return qrcodegen_VERSION_MAX;
+}
+
+}  // namespace
+
+bool QrUtils::drawQrCode(const GfxRenderer& renderer, const Rect& bounds, const std::string& textPayload) {
+  bool truncated = false;
+  size_t len = textPayload.size();
+  const char* text = textPayload.c_str();
+
+  // Truncate at a UTF-8 safe boundary if needed
+  std::string truncatedStr;
   if (len > MAX_QR_CAPACITY) {
-    len = utf8SafeTruncateBuffer(textPayload.c_str(), static_cast<int>(MAX_QR_CAPACITY));
-    truncated = textPayload.substr(0, len);
-    payload = truncated.c_str();
+    len = utf8SafeTruncateBuffer(text, static_cast<int>(MAX_QR_CAPACITY));
+    truncatedStr = textPayload.substr(0, len);
+    text = truncatedStr.c_str();
+    truncated = true;
+    LOG_DBG("QR", "Truncated payload from %u to %u bytes", textPayload.size(), len);
   }
 
-  int version = 4;
-  if (len > 114) version = 10;
-  if (len > 395) version = 20;
-  if (len > 1066) version = 30;
-  if (len > 2110) version = 40;
+  const auto* rawData = reinterpret_cast<const uint8_t*>(text);
+  const bool nonAscii = hasNonAscii(rawData, len);
 
-  // Make sure we have a large enough buffer on the heap to avoid blowing the stack
-  uint32_t bufferSize = qrcode_getBufferSize(version);
-  auto qrcodeBytes = std::make_unique<uint8_t[]>(bufferSize);
+  // ASCII payloads size both work buffers for the smallest version that fits
+  // (a ~40-byte URL needs ~2x200 bytes instead of 2x3918), so short QR paints
+  // survive low-heap phases. The ECI path keeps VERSION_MAX buffers because
+  // qrcodegen_encodeSegmentsAdvanced documents its buffer requirement against
+  // qrcodegen_VERSION_MAX, not the maxVersion argument.
+  const int maxVersion = nonAscii ? qrcodegen_VERSION_MAX : versionForByteLen(len);
+  const size_t bufLen = qrcodegen_BUFFER_LEN_FOR_VERSION(maxVersion);
+  auto qrcode = makeUniqueNoThrow<uint8_t[]>(bufLen);
+  auto tempBuf = makeUniqueNoThrow<uint8_t[]>(bufLen);
+  if (!qrcode || !tempBuf) {
+    LOG_ERR("QR", "OOM allocating 2x%u byte QR buffers, skipping QR", bufLen);
+    return truncated;
+  }
 
-  QRCode qrcode;
-  // Initialize the QR code. We use ECC_LOW for max capacity.
-  int8_t res = qrcode_initText(&qrcode, qrcodeBytes.get(), version, ECC_LOW, payload);
+  bool ok = false;
 
-  if (res == 0) {
-    // Determine the optimal pixel size.
+  if (nonAscii) {
+    // Non-ASCII content: use ECI mode 26 (UTF-8) + byte segment via the low-level API
+    // so scanners know the encoding rather than assuming ISO 8859-1.
+    uint8_t eciBuf[4] = {};
+    struct qrcodegen_Segment eciSeg = qrcodegen_makeEci(26, eciBuf);
+
+    // Build byte segment — the segment data buffer can overlap with tempBuf
+    const size_t segBufSize = qrcodegen_calcSegmentBufferSize(qrcodegen_Mode_BYTE, len);
+    auto segBuf = makeUniqueNoThrow<uint8_t[]>(segBufSize);
+    if (!segBuf) {
+      LOG_ERR("QR", "OOM allocating %u byte QR segment buffer, skipping QR", segBufSize);
+      return truncated;
+    }
+    struct qrcodegen_Segment byteSeg = qrcodegen_makeBytes(rawData, len, segBuf.get());
+
+    struct qrcodegen_Segment segs[2] = {eciSeg, byteSeg};
+    ok = qrcodegen_encodeSegmentsAdvanced(segs, 2, qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
+                                          qrcodegen_Mask_AUTO, false, tempBuf.get(), qrcode.get());
+  } else {
+    // ASCII-only: let the library auto-select the optimal mode (numeric/alphanumeric/byte)
+    ok = qrcodegen_encodeText(text, tempBuf.get(), qrcode.get(), qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN, maxVersion,
+                              qrcodegen_Mask_AUTO, false);
+  }
+
+  if (ok) {
+    const int size = qrcodegen_getSize(qrcode.get());
     const int maxDim = std::min(bounds.width, bounds.height);
 
-    int px = maxDim / qrcode.size;
+    int px = maxDim / size;
     if (px < 1) px = 1;
 
-    // Calculate centering X and Y
-    const int qrDisplaySize = qrcode.size * px;
+    const int qrDisplaySize = size * px;
     const int xOff = bounds.x + (bounds.width - qrDisplaySize) / 2;
     const int yOff = bounds.y + (bounds.height - qrDisplaySize) / 2;
 
-    // Draw the QR Code
-    for (uint8_t cy = 0; cy < qrcode.size; cy++) {
-      for (uint8_t cx = 0; cx < qrcode.size; cx++) {
-        if (qrcode_getModule(&qrcode, cx, cy)) {
+    for (int cy = 0; cy < size; cy++) {
+      for (int cx = 0; cx < size; cx++) {
+        if (qrcodegen_getModule(qrcode.get(), cx, cy)) {
           renderer.fillRect(xOff + px * cx, yOff + px * cy, px, px, true);
         }
       }
     }
   } else {
-    // If it fails (e.g. text too large), log an error
-    LOG_ERR("QR", "Text too large for QR Code version %d", version);
+    LOG_ERR("QR", "Failed to encode QR code (%u bytes)", len);
   }
+
+  return truncated;
 }

@@ -1,29 +1,16 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
+#include "../Activity.h"
 #include "FontInstaller.h"
-#include "SdCardFont.h"
-#include "activities/Activity.h"
+#include "network/HttpDownloader.h"
 #include "util/ButtonNavigator.h"
 
-// JSON schema version of the fonts.json manifest. The canonical version for
-// the build tooling lives in lib/EpdFont/scripts/cpfont_version.py. This
-// firmware-side copy must be bumped manually when the firmware is updated to
-// support a new manifest schema.
-#define FONTS_MANIFEST_VERSION 1
-
 #ifndef FONT_MANIFEST_URL
-// Manifest + .cpfont assets are published by .github/workflows/release-fonts.yml
-// to the crosspoint-fonts repo under the "sd-fonts-m<META>-b<BIN>" tag. The tag
-// pattern must stay in sync with the workflow; it derives its version numbers
-// from lib/EpdFont/scripts/cpfont_version.py.
-#define FONT_MANIFEST_URL_STRINGIFY_INNER(x) #x
-#define FONT_MANIFEST_URL_STRINGIFY(x) FONT_MANIFEST_URL_STRINGIFY_INNER(x)
-#define FONT_MANIFEST_URL                                                                                           \
-  "https://github.com/crosspoint-reader/crosspoint-fonts/releases/download/sd-fonts-m" FONT_MANIFEST_URL_STRINGIFY( \
-      FONTS_MANIFEST_VERSION) "-b" FONT_MANIFEST_URL_STRINGIFY(CPFONT_VERSION) "/fonts.json"
+#define FONT_MANIFEST_URL "https://raw.githubusercontent.com/jpirnay/witchhunt-reader/master/assets/sd-fonts/fonts.json"
 #endif
 
 class FontDownloadActivity : public Activity {
@@ -34,13 +21,7 @@ class FontDownloadActivity : public Activity {
   void onExit() override;
   void loop() override;
   void render(RenderLock&&) override;
-  bool preventAutoSleep() override {
-    return state_ == LOADING_MANIFEST || state_ == DOWNLOADING ||
-           // This is added because HTTPClient is a synchronous/blocking function,
-           // and blocks the main loop until the download is complete.
-           // So `activityManager.preventAutoSleep()` is never called during downloading
-           state_ == COMPLETE || state_ == ERROR;
-  }
+  bool preventAutoSleep() override { return state_ == LOADING_MANIFEST || state_ == DOWNLOADING; }
   bool skipLoopDelay() override { return true; }
 
  private:
@@ -57,53 +38,103 @@ class FontDownloadActivity : public Activity {
     std::string name;
     size_t size = 0;
     uint32_t crc32 = 0;
+    bool hasCrc32 = false;  // false = legacy v1 manifest, fall back to size-only check
   };
 
   struct ManifestFamily {
     std::string name;
     std::string description;
-    std::vector<std::string> styles;
+    // `styles` was once parsed here but never rendered — dropped to avoid
+    // ArduinoJson string allocations that fragmented the heap before the
+    // first TLS download. Resurrect if a UI surfaces style names.
     std::vector<ManifestFile> files;
     size_t totalSize = 0;
     bool installed = false;
     bool hasUpdate = false;
+    // True iff a leftover __staging dir from a previous interrupted download
+    // exists for this not-yet-installed family — the next confirm will resume
+    // rather than restart.
+    bool hasResumableDownload = false;
   };
 
   State state_ = WIFI_SELECTION;
   FontInstaller fontInstaller_;
   ButtonNavigator buttonNavigator_;
 
-  // Manifest data
+  // HTTP/TLS session shared across all files of a single downloadFamily()
+  // call. Each family install pays the TLS handshake once (on its first
+  // file); subsequent files reuse the open keep-alive connection.
+  // NOT shared with the manifest fetch — holding the TLS context open
+  // through the JSON parse aborts on the ~36 KB contiguous allocation
+  // collision with ArduinoJson's working memory.
+  HttpDownloader::Session httpSession_;
+
   std::string baseUrl_;
   std::vector<ManifestFamily> families_;
   int selectedIndex_ = 0;
 
-  // Download progress
+  enum class PendingFontAction {
+    None,
+    Download,
+    Delete,
+  };
+
   size_t currentFileIndex_ = 0;
   size_t currentFileTotal_ = 0;
   size_t fileProgress_ = 0;
   size_t fileTotal_ = 0;
   int downloadingFamilyIndex_ = 0;
+  // Cached during downloadFamily() before families_ is stashed to SD, so the
+  // render path can show the family name and decide the Retry/Resume label
+  // without touching families_ (which is empty during the download).
+  std::string downloadingFamilyName_;
+  bool downloadingFamilyHasResumable_ = false;
+  PendingFontAction pendingErrorAction_ = PendingFontAction::None;
   std::string errorMessage_;
   bool cancelRequested_ = false;
+  int previousActionCount_ = 0;
+  int lastProgressPercent_ = -1;
+  unsigned long lastProgressUpdateMs_ = 0;
 
   void onWifiSelectionComplete(bool success);
   bool fetchAndParseManifest();
-  void downloadFamily(ManifestFamily& family);
+  // Download a single family by its index into families_. Internally stashes
+  // families_ to SD so the TLS handshake runs on a defragmented heap; the
+  // selected family's state mutations (installed/hasUpdate/hasResumableDownload)
+  // are merged back into families_ on return.
+  void downloadFamily(int familyIdx);
+  // Internal: the body of downloadFamily after the stash. Operates only on
+  // the local family copy and constants like familyIdx; never touches
+  // families_ (which is empty during this call).
+  void downloadFamilyImpl(ManifestFamily& family, int familyIdx);
   void downloadAll();
   void updateAll();
-  static bool computeFileCrc32(const char* path, uint32_t& outCrc);
-  bool showDownloadAllRow() const;
-  bool showUpdateAllRow() const;
-  int specialRowCount() const;
-  bool isDownloadAllRow(int index) const;
-  bool isUpdateAllRow(int index) const;
-  bool isSelectedFamilyDeletable() const;
-  void promptDeleteSelectedFamily();
-  void onDeleteConfirmationResult(const ActivityResult& result);
-  int familyIndexFromList(int listIndex) const { return listIndex - specialRowCount(); }
-  int listItemCount() const;
-  size_t totalDownloadSize() const;
+
+  // Persist families_ to /fonts_families.bin and clear the in-memory vector.
+  // Used to free the ~10 KB of scattered std::string allocations that fragment
+  // the heap enough to break the TLS handshake during font downloads.
+  bool stashFamiliesToSd();
+  // Read /fonts_families.bin back into families_. Returns true on success.
+  bool restoreFamiliesFromSd();
+  bool isDownloadAllSelected() const { return hasDownloadCandidates() && selectedIndex_ == 0; }
+  bool isUpdateAllSelected() const {
+    if (!hasUpdateCandidates()) return false;
+    return selectedIndex_ == (hasDownloadCandidates() ? 1 : 0);
+  }
+  bool hasDownloadCandidates() const;
+  bool hasUpdateCandidates() const;
+  int actionCount() const { return (hasDownloadCandidates() ? 1 : 0) + (hasUpdateCandidates() ? 1 : 0); }
+  int familyIndexFromList(int listIndex) const {
+    return listIndex > actionCount() - 1 ? listIndex - actionCount() : -1;
+  }
+  int listItemCount() const { return families_.empty() ? 0 : static_cast<int>(families_.size()) + actionCount(); }
+  size_t totalUninstalledSize() const;
   size_t totalUpdateSize() const;
+  void syncSelectedIndexForNewActionCount();
+
+  std::string confirmButtonLabel() const;
+  void promptDeleteFamily(int familyIndex);
+  void deleteFamilyAtIndex(int familyIndex);
+
   static std::string formatSize(size_t bytes);
 };

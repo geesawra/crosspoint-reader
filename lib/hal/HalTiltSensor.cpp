@@ -2,7 +2,7 @@
 
 #include <Logging.h>
 
-HalTiltSensor halTiltSensor;  // Singleton instance
+HalTiltSensor halTiltSensor;
 
 bool HalTiltSensor::writeReg(uint8_t reg, uint8_t val) const {
   Wire.beginTransmission(_i2cAddr);
@@ -27,7 +27,7 @@ bool HalTiltSensor::readReg(uint8_t reg, uint8_t* val) const {
 
 bool HalTiltSensor::readGyro(float& gx, float& gy, float& gz) const {
   Wire.beginTransmission(_i2cAddr);
-  Wire.write(REG_GX_L);  // Start reading at Gyro X Low
+  Wire.write(REG_GX_L);
   if (Wire.endTransmission(false) != 0) {
     return false;
   }
@@ -43,48 +43,19 @@ bool HalTiltSensor::readGyro(float& gx, float& gy, float& gz) const {
     return static_cast<int16_t>((hi << 8) | lo);
   };
 
-  // If Full Scale is ±512 dps, the scale factor is 32768 / 512 = 64 LSB/dps
-  constexpr float SCALE = 1.0f / 64.0f;
+  constexpr float SCALE = 1.0f / 64.0f;  // ±512 dps full scale: 32768 / 512 = 64 LSB/dps
   gx = readInt16() * SCALE;
   gy = readInt16() * SCALE;
   gz = readInt16() * SCALE;
   return true;
 }
 
-bool HalTiltSensor::readAccel(float& ax, float& ay, float& az) const {
-  Wire.beginTransmission(_i2cAddr);
-  Wire.write(REG_AX_L);  // Start reading at Accel X Low
-  if (Wire.endTransmission(false) != 0) {
-    return false;
-  }
-
-  Wire.requestFrom(_i2cAddr, (uint8_t)6);
-  if (Wire.available() < 6) {
-    return false;
-  }
-
-  auto readInt16 = [&]() -> int16_t {
-    const uint8_t lo = Wire.read();
-    const uint8_t hi = Wire.read();
-    return static_cast<int16_t>((hi << 8) | lo);
-  };
-
-  // If Full Scale is ±4g, the scale factor is 32768 / 4 = 8192 LSB/g
-  constexpr float SCALE = 1.0f / 8192.0f;
-  ax = readInt16() * SCALE;
-  ay = readInt16() * SCALE;
-  az = readInt16() * SCALE;
-  return true;
-}
-
 void HalTiltSensor::begin() {
   if (!gpio.deviceIsX3()) {
     _available = false;
-    LOG_INF("GYR", "Skipping QMI8658 init: device detected as X4");
     return;
   }
 
-  // Try primary address, then alternate
   uint8_t whoami = 0;
   _i2cAddr = I2C_ADDR_QMI8658;
   if (!readReg(QMI8658_WHO_AM_I_REG, &whoami) || whoami != QMI8658_WHO_AM_I_VALUE) {
@@ -98,8 +69,7 @@ void HalTiltSensor::begin() {
 
   LOG_INF("GYR", "QMI8658 IMU found at 0x%02X", _i2cAddr);
 
-  if (!writeReg(REG_CTRL7, CTRL7_DISABLE_ALL) || !writeReg(REG_CTRL2, CTRL2_FS_4G | CTRL2_ODR_28HZ) ||
-      !writeReg(REG_CTRL3, CTRL3_FS_512DPS | CTRL3_ODR_28HZ) ||
+  if (!writeReg(REG_CTRL7, CTRL7_DISABLE_ALL) || !writeReg(REG_CTRL3, CTRL3_FS_512DPS | CTRL3_ODR_28HZ) ||
       !writeReg(REG_CTRL1, CTRL1_BASE | CTRL1_SENSOR_DISABLE)) {
     LOG_ERR("GYR", "QMI8658 register configuration failed");
     _available = false;
@@ -108,6 +78,7 @@ void HalTiltSensor::begin() {
 
   _available = true;
   _initMs = millis();
+  _sleepMs = millis();
   _lastPollMs = millis();
   LOG_INF("GYR", "QMI8658 gyro initialized and put to sleep");
 }
@@ -117,12 +88,11 @@ bool HalTiltSensor::wake() {
     return false;
   }
 
-  // Wait for init to complete before waking
-  if ((millis() - _initMs) < SLEEP_STABILIZE_MS) {
+  if ((millis() - _sleepMs) < SLEEP_STABILIZE_MS) {
     return false;
   }
 
-  if (writeReg(REG_CTRL1, CTRL1_BASE) && writeReg(REG_CTRL7, CTRL7_GYRO_ENABLE | CTRL7_ACC_ENABLE)) {
+  if (writeReg(REG_CTRL1, CTRL1_BASE) && writeReg(REG_CTRL7, CTRL7_GYRO_ENABLE)) {
     _lastPollMs = millis();
     _lastTiltMs = millis();
     _wakeMs = millis();
@@ -144,9 +114,9 @@ bool HalTiltSensor::deepSleep() {
   }
 
   if (writeReg(REG_CTRL7, CTRL7_DISABLE_ALL) && writeReg(REG_CTRL1, CTRL1_BASE | CTRL1_SENSOR_DISABLE)) {
-    // Clear any residual state so it doesn't immediately trigger upon waking
     clearPendingEvents();
     _inTilt = false;
+    _sleepMs = millis();
     LOG_INF("GYR", "QMI8658 entered sleep mode");
     return true;
   } else {
@@ -155,30 +125,25 @@ bool HalTiltSensor::deepSleep() {
   }
 }
 
-void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const bool autoRotate, const bool inReader) {
+void HalTiltSensor::update(CrossPointTiltPageTurn::Value mode, CrossPointOrientation::Value orientation,
+                           bool inReader) {
   if (!_available) {
     return;
   }
 
-  const bool needsAccel = autoRotate;
-  const bool needsGyro = (mode != CrossPointTiltPageTurn::TILT_OFF) && inReader;
-  const bool needsImu = needsAccel || needsGyro;
-
-  // State machine: wake up or sleep based on the enabled flag
-  if (needsImu && !_isAwake) {
+  if ((mode != CrossPointTiltPageTurn::TILT_OFF && inReader) && !_isAwake) {
     _isAwake = wake();
     return;
-  } else if (!needsImu && _isAwake) {
+  } else if ((mode == CrossPointTiltPageTurn::TILT_OFF || !inReader) && _isAwake) {
     _isAwake = !deepSleep();
     return;
   }
 
-  if (!needsImu) {
+  if ((mode == CrossPointTiltPageTurn::TILT_OFF) || !inReader) {
     return;
   }
 
   const unsigned long now = millis();
-  // Stabilization: discard readings during gyro startup transient
   if ((now - _wakeMs) < WAKE_STABILIZE_MS) {
     return;
   }
@@ -188,95 +153,48 @@ void HalTiltSensor::update(const uint8_t mode, const uint8_t orientation, const 
   }
   _lastPollMs = now;
 
-  // --- Auto-rotate via accelerometer (works everywhere, not just in reader) ---
-  if (needsAccel) {
-    float ax, ay, az;
-    if (readAccel(ax, ay, az)) {
-      // On this X3 PCB revision the accel axes are inverted relative to the
-      // device frame. Negate to align sensor X/Y with physical top/left.
-      ax = -ax;
-      ay = -ay;
-
-      const float absX = fabsf(ax);
-      const float absY = fabsf(ay);
-      const float absZ = fabsf(az);
-
-      uint8_t newOrientation = orientation;
-      if (absZ > ACCEL_FLAT_THRESHOLD && absZ > absX && absZ > absY) {
-        // Device is roughly flat; keep current orientation
-        newOrientation = orientation;
-      } else if (absX > absY) {
-        // X dominant -> portrait family (sensor X aligns with device top-to-bottom)
-        newOrientation = (ax > 0) ? CrossPointOrientation::PORTRAIT : CrossPointOrientation::INVERTED;
-      } else {
-        // Y dominant -> landscape family (sensor Y aligns with device left-to-right)
-        newOrientation = (ay > 0) ? CrossPointOrientation::LANDSCAPE_CCW : CrossPointOrientation::LANDSCAPE_CW;
-      }
-
-      if (newOrientation != _candidateOrientation) {
-        _candidateOrientation = newOrientation;
-        _candidateStartMs = now;
-      } else if ((now - _candidateStartMs) >= ORIENTATION_DEBOUNCE_MS) {
-        if (_detectedOrientation != _candidateOrientation) {
-          _detectedOrientation = _candidateOrientation;
-          // Suppress any pending tilt events to avoid accidental page turns while rotating
-          clearPendingEvents();
-          _inTilt = false;
-          LOG_INF("GYR", "Auto-rotate detected orientation=%u", _detectedOrientation);
-        }
-      }
-    }
+  float gx, gy, gz;
+  if (!readGyro(gx, gy, gz)) {
+    return;
   }
 
-  // --- Tilt page turn via gyroscope (reader only) ---
-  if (needsGyro) {
-    float gx, gy, gz;
-    if (!readGyro(gx, gy, gz)) {
-      return;
-    }
+  float tiltAxis;
+  switch (orientation) {
+    case CrossPointOrientation::PORTRAIT:
+      tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? -gx : gx;
+      break;
+    case CrossPointOrientation::INVERTED:
+      tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? gx : -gx;
+      break;
+    case CrossPointOrientation::LANDSCAPE_CW:
+      tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? gy : -gy;
+      break;
+    case CrossPointOrientation::LANDSCAPE_CCW:
+      tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? -gy : gy;
+      break;
+    default:
+      tiltAxis = gx;
+      break;
+  }
 
-    // Map the gyro axis to left/right tilt based on reader orientation.
-    // On the X3 PCB: X axis = left/right in portrait, Y axis = left/right in landscape.
-    float tiltAxis;
-    switch (orientation) {
-      case CrossPointOrientation::PORTRAIT:
-        tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? -gx : gx;
-        break;
-      case CrossPointOrientation::INVERTED:
-        tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? gx : -gx;
-        break;
-      case CrossPointOrientation::LANDSCAPE_CW:
-        tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? gy : -gy;
-        break;
-      case CrossPointOrientation::LANDSCAPE_CCW:
-        tiltAxis = mode == CrossPointTiltPageTurn::TILT_INVERTED ? -gy : gy;
-        break;
-      default:
-        tiltAxis = gx;
-        break;
+  if (_inTilt) {
+    if (fabsf(tiltAxis) < NEUTRAL_RATE_DPS) {
+      _inTilt = false;
     }
-
-    if (_inTilt) {
-      // Wait for device to return to neutral before allowing next trigger
-      if (fabsf(tiltAxis) < NEUTRAL_RATE_DPS) {
-        _inTilt = false;
-      }
-    } else {
-      // Check for new tilt gesture (with cooldown)
-      if ((now - _lastTiltMs) >= COOLDOWN_MS) {
-        if (tiltAxis > RATE_THRESHOLD_DPS) {
-          _tiltForwardEvent = true;
-          _hadActivity = true;
-          _inTilt = true;
-          _lastTiltMs = now;
-          LOG_INF("GYR", "Forward Trigger=(%.1f) dps", tiltAxis);
-        } else if (tiltAxis < -RATE_THRESHOLD_DPS) {
-          _tiltBackEvent = true;
-          _hadActivity = true;
-          _inTilt = true;
-          _lastTiltMs = now;
-          LOG_INF("GYR", "Backward Trigger=(%.1f) dps", tiltAxis);
-        }
+  } else {
+    if ((now - _lastTiltMs) >= COOLDOWN_MS) {
+      if (tiltAxis > RATE_THRESHOLD_DPS) {
+        _tiltForwardEvent = true;
+        _hadActivity = true;
+        _inTilt = true;
+        _lastTiltMs = now;
+        LOG_INF("GYR", "Forward Trigger=(%.1f) dps", tiltAxis);
+      } else if (tiltAxis < -RATE_THRESHOLD_DPS) {
+        _tiltBackEvent = true;
+        _hadActivity = true;
+        _inTilt = true;
+        _lastTiltMs = now;
+        LOG_INF("GYR", "Backward Trigger=(%.1f) dps", tiltAxis);
       }
     }
   }
@@ -304,5 +222,4 @@ void HalTiltSensor::clearPendingEvents() {
   _tiltForwardEvent = false;
   _tiltBackEvent = false;
   _hadActivity = false;
-  // Intentionally preserve _inTilt so a held tilt doesn't retrigger on next poll
 }

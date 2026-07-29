@@ -16,23 +16,35 @@
 
 void SdFirmwareUpdateActivity::onEnter() {
   Activity::onEnter();
-  // Build-identity marker — confirms which firmware build owns the SD update flow.
   LOG_INF("FW", "SdFirmwareUpdateActivity build=%s %s recovery=%d", __DATE__, __TIME__, recoveryMode ? 1 : 0);
-  state = State::PICKING;
-  launchPicker();
+  if (!firmwarePath.empty()) {
+    // Pre-selected path: skip picker and go straight to validation.
+    {
+      RenderLock lock(*this);
+      state = State::VALIDATING;
+    }
+    requestUpdateAndWait();
+    if (!validateFirmware()) {
+      state = State::FAILED;
+      requestUpdate();
+      return;
+    }
+    promptConfirmation();
+  } else {
+    state = State::PICKING;
+    launchPicker();
+  }
 }
 
 void SdFirmwareUpdateActivity::launchPicker() {
-  // Reuse the standard file browser, restricted to .bin files only.
-  startActivityForResult(
-      std::make_unique<FileBrowserActivity>(renderer, mappedInput, "/", FileBrowserActivity::Mode::PickFirmware),
-      [this](const ActivityResult& result) { onPickerResult(result); });
+  startActivityForResult(std::make_unique<FileBrowserActivity>(renderer, mappedInput, "/", std::string{},
+                                                               FileBrowserActivity::Mode::PickFirmware),
+                         [this](const ActivityResult& result) { onPickerResult(result); });
 }
 
 void SdFirmwareUpdateActivity::onPickerResult(const ActivityResult& result) {
   if (result.isCancelled) {
     if (recoveryMode) {
-      // Recovery mode: re-launch the picker so the user cannot escape into a half-initialised UI.
       launchPicker();
       return;
     }
@@ -74,10 +86,6 @@ bool SdFirmwareUpdateActivity::validateFirmware() {
   firmwareSize = file.fileSize();
   file.close();
 
-  // Resolve the next-update partition directly via the OTA API. Previously this
-  // probed via Update.begin(firmwareSize)/Update.abort() to learn the partition
-  // size, which had the side effect of erasing partition state and was wasted
-  // work since we only need the size bound for validation here.
   const esp_partition_t* dest = esp_ota_get_next_update_partition(nullptr);
   if (!dest) {
     LOG_ERR("FW", "no next-update partition available");
@@ -92,10 +100,6 @@ bool SdFirmwareUpdateActivity::validateFirmware() {
     return false;
   }
 
-  // Run the same end-to-end integrity check (header / segment table / XOR checksum / SHA256
-  // trailer) that the shared firmware-flasher applies right before raw-writing otadata. This
-  // catches truncated or corrupted .bin files at confirmation time, before the user ever sees
-  // the "Updating…" progress bar.
   const auto vr = firmware_flash::validateImageFile(firmwarePath.c_str(), partitionLimit);
   if (vr != firmware_flash::Result::OK) {
     LOG_ERR("FW", "image validation failed: %s", firmware_flash::resultName(vr));
@@ -116,9 +120,7 @@ void SdFirmwareUpdateActivity::promptConfirmation() {
     RenderLock lock(*this);
     state = State::CONFIRMING;
   }
-  // Show "Update firmware?" with the file path as the body line.
   std::string heading = tr(STR_FIRMWARE_UPDATE_PROMPT);
-  // Use the basename only to keep the body short.
   std::string body = firmwarePath;
   const auto pos = body.find_last_of('/');
   if (pos != std::string::npos) body = body.substr(pos + 1);
@@ -130,7 +132,6 @@ void SdFirmwareUpdateActivity::promptConfirmation() {
 void SdFirmwareUpdateActivity::onConfirmationResult(const ActivityResult& result) {
   if (result.isCancelled) {
     if (recoveryMode) {
-      // Go back to the picker rather than exiting recovery.
       launchPicker();
       return;
     }
@@ -155,15 +156,9 @@ void SdFirmwareUpdateActivity::performUpdate() {
     auto* self = static_cast<SdFirmwareUpdateActivity*>(ctx);
     self->writtenBytes = written;
     self->firmwareSize = total;
-    // immediate=true: wake the render task directly. We're in a tight sync
-    // loop so the main loop won't drain the requestedUpdate flag for us.
     self->requestUpdate(true);
   };
 
-  // Re-validate at flash time (TOCTOU): SD is removable, so don't trust the
-  // pre-confirmation pass. The alreadyValidated parameter on the API stays
-  // for callers (e.g. an OTA staging path) where the same byte stream was
-  // just hashed and there's no removable-media gap.
   const auto result = firmware_flash::flashFromSdPath(firmwarePath.c_str(), progressCb, this);
   if (result != firmware_flash::Result::OK) {
     LOG_ERR("FW", "flash failed: %s", firmware_flash::resultName(result));
@@ -189,7 +184,6 @@ void SdFirmwareUpdateActivity::loop() {
     if (mappedInput.wasPressed(MappedInputManager::Button::Back) ||
         mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
       if (recoveryMode) {
-        // Go back to picker so user can try a different .bin
         state = State::PICKING;
         launchPicker();
         return;
@@ -215,7 +209,6 @@ void SdFirmwareUpdateActivity::render(RenderLock&&) {
   if (state == State::VALIDATING) {
     renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_VALIDATING_FIRMWARE));
   } else if (state == State::UPDATING) {
-    // Throttle redraws to once per percent.
     const unsigned int pct = firmwareSize > 0 ? static_cast<unsigned int>((writtenBytes * 100) / firmwareSize) : 0;
     if (pct == lastRenderedPercent) {
       return;
@@ -230,13 +223,18 @@ void SdFirmwareUpdateActivity::render(RenderLock&&) {
         Rect{metrics.contentSidePadding, y, pageWidth - metrics.contentSidePadding * 2, metrics.progressBarHeight},
         static_cast<int>(pct), 100);
     y += metrics.progressBarHeight + metrics.verticalSpacing;
-    // Percent label is drawn by BaseTheme::drawProgressBar; this slot is left intentionally empty
-    // so the do-not-power-off line below stays at the same Y as before.
+    renderer.drawCenteredText(UI_10_FONT_ID, y, (std::to_string(pct) + "%").c_str());
     y += lineHeight + metrics.verticalSpacing;
     renderer.drawCenteredText(UI_10_FONT_ID, y, tr(STR_FIRMWARE_UPDATE_DO_NOT_POWER_OFF));
   } else if (state == State::SUCCESS) {
     renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_UPDATE_COMPLETE), true, EpdFontFamily::BOLD);
-    renderer.drawCenteredText(UI_10_FONT_ID, top + lineHeight + metrics.verticalSpacing, tr(STR_RESTARTING_HINT));
+    const int hintWidth = pageWidth - 2 * metrics.contentSidePadding;
+    const auto hintLines = renderer.wrappedText(UI_10_FONT_ID, tr(STR_RESTARTING_HINT), hintWidth, 4);
+    int hintY = top + lineHeight + metrics.verticalSpacing;
+    for (const auto& line : hintLines) {
+      renderer.drawCenteredText(UI_10_FONT_ID, hintY, line.c_str());
+      hintY += lineHeight;
+    }
   } else if (state == State::FAILED) {
     renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_UPDATE_FAILED), true, EpdFontFamily::BOLD);
     if (!errorMessage.empty()) {
@@ -247,7 +245,13 @@ void SdFirmwareUpdateActivity::render(RenderLock&&) {
   } else {
     // PICKING / CONFIRMING: a sub-activity is on top, nothing to draw.
     if (recoveryMode) {
-      renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_RECOVERY_MODE_HINT));
+      const int hintWidth = pageWidth - 2 * metrics.contentSidePadding;
+      const auto hintLines = renderer.wrappedText(UI_10_FONT_ID, tr(STR_RECOVERY_MODE_HINT), hintWidth, 4);
+      int hintY = top;
+      for (const auto& line : hintLines) {
+        renderer.drawCenteredText(UI_10_FONT_ID, hintY, line.c_str());
+        hintY += lineHeight;
+      }
     }
   }
 

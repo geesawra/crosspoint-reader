@@ -1,22 +1,13 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
-#include <string>
-#include <vector>
+#include <new>
 
 #include "EpdFont.h"
 #include "EpdFontData.h"
 
-// On-disk binary format version for .cpfont files. Defined as a preprocessor
-// macro (rather than a constexpr) so it can be stringified into the SD-fonts
-// release URL — see FONT_MANIFEST_URL in FontDownloadActivity.h. No integer
-// suffix because stringification would include it (e.g. `4U` → `"4U"`).
-//
-// The canonical version for the build tooling lives in
-// lib/EpdFont/scripts/cpfont_version.py. This firmware-side copy must be
-// bumped manually when the firmware is updated to support a new format.
-// Reader enforcement: SdCardFont::load().
-#define CPFONT_VERSION 4
+class HalFile;
 
 class SdCardFont {
  public:
@@ -24,48 +15,57 @@ class SdCardFont {
   static constexpr uint8_t MAX_STYLES = 4;
 
   SdCardFont() = default;
-  ~SdCardFont();
-  // Owns raw buffers freed in dtor — no shallow-copy semantics. Make any
-  // accidental pass-by-value or move a compile-time error.
   SdCardFont(const SdCardFont&) = delete;
   SdCardFont& operator=(const SdCardFont&) = delete;
   SdCardFont(SdCardFont&&) = delete;
   SdCardFont& operator=(SdCardFont&&) = delete;
+  ~SdCardFont();
 
   // Load .cpfont file: reads header + intervals into RAM, records file layout offsets.
   // Supports v4 (multi-style) format.
   // Returns true on success.
   bool load(const char* path);
 
+  // Load from a flash partition mmap pointer (e.g. from FlashFontPartition::mmap()).
+  // fullIntervals and kern/lig tables are read directly from the mmap region — no
+  // heap allocation for metadata.  The mmap pointer must remain valid for the
+  // lifetime of this SdCardFont.  unloadMetadata() and reloadMetadata() are no-ops
+  // for mmap-loaded fonts (metadata is always present in the flash mapping).
+  // sdPath must be the SD path of the same .cpfont — it is used by the bitmap
+  // overflow handler to load glyph bitmaps from SD at draw time.
+  // Returns true on success.
+  bool loadFromMmap(const uint8_t* base, size_t size, const char* sdPath);
+
   // Pre-read glyphs needed for the given UTF-8 text from SD card.
   // styleMask: bitmask of styles to prewarm (bit 0=regular, 1=bold, 2=italic, 3=bolditalic).
   // Default 0x0F = all present styles.
   // When metadataOnly=true, only glyph metrics are loaded (no bitmap data).
+  // If loadKernLigatureData=true, kern/ligature metadata is also loaded so layout
+  // measurement calls that use applyLigatures()/getKerning() produce correct results.
   // Returns number of glyphs that couldn't be loaded (0 on full success).
-  int prewarm(const char* utf8Text, uint8_t styleMask = 0x0F, bool metadataOnly = false);
-
-  // Build a compact advance-only table for layout measurement.
-  // Extracts ALL unique codepoints from words (no MAX_PAGE_GLYPHS cap),
-  // batch-reads advanceX from SD, stores in a sorted per-style table.
-  // Returns number of codepoints not found in font coverage.
-  int buildAdvanceTable(const char* utf8Text, uint8_t styleMask = 0x0F);
-  int buildAdvanceTable(const std::vector<std::string>& words, bool includeHyphen, uint8_t styleMask = 0x0F);
-
-  // Look up advanceX for a codepoint from the advance table.
-  // Returns the 12.4 fixed-point advance, or 0 if not found.
-  uint16_t getAdvance(uint32_t codepoint, uint8_t style) const;
-
-  // Returns true if advance table is populated for at least one style.
-  bool hasAdvanceTable() const;
+  int prewarm(const char* utf8Text, uint8_t styleMask = 0x0F, bool metadataOnly = false,
+              bool loadKernLigatureData = false);
 
   // Free mini data for all styles, restore stub EpdFontData.
-  // Also clears the temporary advance table (built per layout pass) but
-  // preserves the persistent advance cache (reused across passes).
   void clearCache();
 
-  // Drop the persistent advance cache. Call when unloading the SD font or
-  // when font/size/family/glyph-table state changes.
-  void clearPersistentCache();
+  // Soft cache reset: drop the cumulative metadata-only prewarm cache built
+  // up by repeated layout-time ensureFontReady() calls. Bitmap-mode
+  // (FULL) caches are also dropped. Call this between sections to bound the
+  // cumulative cp set growth across pagination.
+  void clearAccumulation();
+
+  // Phase lifecycle: drop all layout-phase metadata (fullIntervals + kern/lig tables)
+  // to free ~40–50 KB before createSectionFile(). File offsets are preserved so
+  // reloadMetadata() can restore everything without re-reading the file header.
+  // Mini buffers are NOT affected — those are already managed per-section.
+  // No-op if not loaded.
+  void unloadMetadata();
+
+  // Restore layout-phase metadata after createSectionFile() completes.
+  // Re-reads fullIntervals and kern/lig tables from SD using stored file offsets.
+  // Returns true on success; false leaves the font in a degraded (stub-only) state.
+  bool reloadMetadata();
 
   // Returns pointer to the managed EpdFont for a given style.
   // Returns nullptr if the style is not present.
@@ -73,13 +73,6 @@ class SdCardFont {
 
   // Returns true if the given style is present in this font file.
   bool hasStyle(uint8_t style) const;
-
-  // Resolve requested style bits to the closest present style.
-  uint8_t resolveStyle(uint8_t style) const;
-
-  // Resolve every requested style bit through fallback and return the actual
-  // styles that need cache/advance preparation.
-  uint8_t resolveStyleMask(uint8_t styleMask) const;
 
   // Number of styles present in this font file.
   uint8_t styleCount() const { return styleCount_; }
@@ -150,7 +143,8 @@ class SdCardFont {
     EpdKernClassEntry* kernLeftClasses = nullptr;
     EpdKernClassEntry* kernRightClasses = nullptr;
     EpdLigaturePair* ligaturePairs = nullptr;
-    bool kernLigLoaded = false;
+    bool ligLoaded = false;          ///< ligaturePairs resident
+    bool kernClassesLoaded = false;  ///< kernLeft/RightClasses resident (skipped during metadata-only prewarm)
 
     // Stub EpdFontData returned when not prewarmed
     EpdFontData stubData{};
@@ -162,6 +156,30 @@ class SdCardFont {
     uint8_t* miniBitmap = nullptr;
     uint32_t miniIntervalCount = 0;
     uint32_t miniGlyphCount = 0;
+
+    // Cache mode for the current mini buffers:
+    //   NONE     = empty / freshly cleared, no glyphs loaded
+    //   METADATA = miniGlyphs has glyph metrics only (no bitmap data); built
+    //              up incrementally across paragraph-level ensureFontReady
+    //              calls during pagination. Safe to merge new cps into.
+    //   FULL     = miniGlyphs + miniBitmap loaded, page-scoped (built once per
+    //              page render). Layout-only prewarm calls are no-ops in this
+    //              mode (overflow handler covers any uncovered cp at draw time).
+    enum class MiniMode : uint8_t { NONE, METADATA, FULL };
+    MiniMode miniMode = MiniMode::NONE;
+
+    // Codepoints already reported as missing during the current accumulation
+    // cycle. Cleared by clearAccumulation() / freeStyleAll(). Bounded by
+    // MAX_REPORTED_MISSES; once full, further misses go unreported (the cps
+    // still cleanly fall back to the replacement glyph in EpdFont::getGlyph).
+    static constexpr uint8_t MAX_REPORTED_MISSES = 32;
+    uint32_t reportedMisses[MAX_REPORTED_MISSES] = {};
+    uint8_t reportedMissCount = 0;
+
+    // Debug counters for on-demand glyph misses (glyphMissHandler). Used to
+    // throttle log volume while still preserving visibility into overflow churn.
+    uint32_t onDemandMissCount = 0;
+    uint16_t onDemandMissLogged = 0;
 
     // Per-page mini kern matrix (built by buildMiniKernMatrix on each full
     // prewarm). miniKernLeftClasses/miniKernRightClasses map ONLY the codepoints
@@ -202,47 +220,40 @@ class SdCardFont {
     uint8_t* bitmap = nullptr;
     uint32_t codepoint = 0;
     uint8_t styleIdx = 0;
+    bool occupied = false;
   };
   OverflowEntry overflow_[OVERFLOW_CAPACITY] = {};
   uint32_t overflowCount_ = 0;
   uint32_t overflowNext_ = 0;
 
-  // Compact advance-only table for layout measurement (per-style).
-  // Built by buildAdvanceTable(), queried by getAdvance().
-  struct AdvanceEntry {
-    uint32_t codepoint;
-    uint16_t advanceX;  // 12.4 fixed-point
-  };
-  // Per-style advance table. Sorted by codepoint for binary lookup.
-  // Bounded to ADVANCE_CACHE_LIMIT entries; persists across layout passes
-  // (across calls to clearCache()) so repeated indexing of the same font
-  // amortizes SD reads. Cleared only on font unload or clearPersistentCache().
-  static constexpr uint32_t ADVANCE_CACHE_LIMIT = 768;
-  AdvanceEntry* advanceTable_[MAX_STYLES] = {};
-  uint32_t advanceTableSize_[MAX_STYLES] = {};
-  bool advanceTableLookup(uint8_t styleIdx, uint32_t codepoint, uint16_t* outAdvance) const;
-  // Merge sortedNew (sorted by codepoint, no overlap with existing) into the
-  // advance table for styleIdx, preserving sort order; cap-truncates the tail.
-  void mergeIntoAdvanceTable(uint8_t styleIdx, const AdvanceEntry* sortedNew, uint32_t newCount);
-
   Stats stats_;
   uint32_t contentHash_ = 0;
   bool loaded_ = false;
 
+  // True when persistent metadata (fullIntervals, kernLeft/RightClasses,
+  // ligaturePairs) is heap-allocated and must be delete[]'d on free.
+  // False when loaded via loadFromMmap() — those pointers alias the flash
+  // partition mmap region and must never be freed.
+  bool metadataOwned_ = true;
+
+  // Base pointer of the mmap'd .cpfont data (the value passed to loadFromMmap).
+  // Non-null only when metadataOwned_ == false. Used to read sections (e.g. the
+  // kern matrix) directly from flash without SD I/O.
+  const uint8_t* mmapDataBase_ = nullptr;
+
   // Per-style helpers
+  static bool allCpsCovered(const PerStyle& s, const uint32_t* codepoints, uint32_t cpCount);
   void freeStyleMiniData(PerStyle& s);
   void freeStyleAll(PerStyle& s);
   void freeStyleKernLigatureData(PerStyle& s);
   void freeStyleMiniKern(PerStyle& s);
-  bool loadStyleKernLigatureData(PerStyle& s);
-  bool buildMiniKernMatrix(PerStyle& s, const uint32_t* codepoints, uint32_t cpCount);
-  void applyKernLigaturePointers(PerStyle& s, EpdFontData& data) const;
+  bool loadStyleKernLigatureData(PerStyle& s, bool ligatureOnly = false);
+  bool buildMiniKernMatrix(PerStyle& s, const uint32_t* codepoints, uint32_t cpCount, HalFile& file);
+  void applyKernLigaturePointers(const PerStyle& s, EpdFontData& data) const;
   void applyGlyphMissCallback(uint8_t styleIdx);
   int32_t findGlobalGlyphIndex(const PerStyle& s, uint32_t codepoint) const;
-  int fetchAdvancesForCodepoints(uint32_t* codepoints, uint32_t cpCount, uint8_t styleMask);
-  template <typename Iter>
-  int buildAdvanceTableRange(Iter begin, Iter end, bool includeSpace, bool includeHyphen, uint8_t styleMask);
-  int prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint32_t cpCount, bool metadataOnly);
+  int prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint32_t cpCount, bool metadataOnly,
+                   bool loadKernLigatureData);
 
   // Global helpers
   void freeAll();

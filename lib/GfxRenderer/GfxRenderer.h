@@ -6,6 +6,7 @@
 class FontCacheManager;
 class SdCardFont;
 
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <string>
@@ -31,28 +32,51 @@ class GfxRenderer {
 
  private:
   static constexpr size_t BW_BUFFER_CHUNK_SIZE = 8000;  // 8KB chunks to allow for non-contiguous memory
+  static constexpr unsigned int REFRESH_OVERRIDE_NONE = 0;
 
   HalDisplay& display;
-  RenderMode renderMode;
-  Orientation orientation;
-  bool fadingFix;
-  uint8_t* frameBuffer = nullptr;
-  uint16_t panelWidth = HalDisplay::DISPLAY_WIDTH;
-  uint16_t panelHeight = HalDisplay::DISPLAY_HEIGHT;
-  uint16_t panelWidthBytes = HalDisplay::DISPLAY_WIDTH_BYTES;
-  uint32_t frameBufferSize = HalDisplay::BUFFER_SIZE;
+  std::atomic<int> renderMode;
+  std::atomic<int> orientation;
+  std::atomic<bool> fadingFix;
+  // Text darkness for 2-bit grayscale glyph rendering.
+  std::atomic<uint8_t> textDarkness;
+  //   0 = Normal     — true 4-level AA (raw=1 → light gray, raw=2 → dark gray)
+  //   1 = Dark       — historical default; raw=2 collapses to black
+  //   2 = Extra Dark — both AA shades go black in the grayscale plane
+  //   3 = Maximum    — grayscale pass skipped entirely; only the hard BW
+  //                    pass remains, so AA pixels render as solid black
+  //                    with the FAST waveform (no gray-LUT softening)
+  // Only affects AA pixels in GRAYSCALE_MSB / GRAYSCALE_LSB rendering of 2-bit fonts.
+  // 1-bit fonts and the BW pass are unchanged. Default is 1 to preserve historical
+  // rendering. See drawMaskFor2BitMode() in GfxRenderer.cpp for the per-level
+  // pixel breakdown and a worked example glyph.
+  mutable uint8_t* frameBuffer = nullptr;
+  uint16_t panelWidth = 0;       // set in begin()
+  uint16_t panelHeight = 0;      // set in begin()
+  uint16_t panelWidthBytes = 0;  // set in begin()
+  uint32_t frameBufferSize = 0;  // set in begin()
+  uint16_t bwSnapshotRowStart = 0;
+  uint16_t bwSnapshotRowEnd = 0;
+  size_t bwSnapshotSizeBytes = 0;
+  size_t bwBufferChunkSize = BW_BUFFER_CHUNK_SIZE;
   std::vector<uint8_t*> bwBufferChunks;
   std::map<int, EpdFontFamily> fontMap;
-  // Mutable because ensureSdCardFontReady() is const (called from layout code
-  // that holds a const GfxRenderer&) but triggers SD card reads and heap
-  // allocation inside the SdCardFont objects. Same pragmatic compromise as
-  // fontCacheManager_ below.
+  // Mutable because ensureFontReady() is const (called from layout code that
+  // holds a const GfxRenderer&) but triggers SD card reads and heap allocation
+  // inside the SdCardFont objects. Same pragmatic compromise as fontCacheManager_.
   mutable std::map<int, SdCardFont*> sdCardFonts_;
 
   // Mutable because drawText() is const but needs to delegate scan-mode
   // recording to the (non-const) FontCacheManager. Same pragmatic compromise
   // as before, concentrated in a single pointer instead of four fields.
   mutable FontCacheManager* fontCacheManager_ = nullptr;
+  mutable std::atomic<unsigned int> refreshOverride = REFRESH_OVERRIDE_NONE;
+  // Atomically consume a pending setNextDisplayRefreshMode() override: if one is set, clear it
+  // and return its mode; otherwise return `requested`. Shared by displayBuffer() and
+  // triggerDisplay() so the override is honored on BOTH the blocking and non-blocking display
+  // paths (otherwise a HALF set before a triggerDisplay() render would persist and leak onto a
+  // later displayBuffer() turn).
+  HalDisplay::RefreshMode consumeRefreshOverride(HalDisplay::RefreshMode requested) const;
 
   void renderChar(const EpdFontFamily& fontFamily, uint32_t cp, int* x, int* y, bool pixelState,
                   EpdFontFamily::Style style) const;
@@ -61,10 +85,22 @@ class GfxRenderer {
   void drawPixelDither(int x, int y) const;
   template <Color color>
   void fillArc(int maxRadius, int cx, int cy, int xDir, int yDir) const;
+  // Write a patterned horizontal span directly to the physical framebuffer using byte-level operations.
+  // phyY: physical row; phyX_start/phyX_end: inclusive physical column range.
+  // patternByte is repeated across the span; partial edge bytes are blended with existing content.
+  // Bit layout: MSB-first (bit 7 = phyX=0); 0 bits = dark pixel, 1 bits = white pixel.
+  void fillPhysicalHSpanByte(int phyY, int phyX_start, int phyX_end, uint8_t patternByte) const;
+  // Write a solid horizontal span directly to the physical framebuffer using byte-level operations.
+  // Thin wrapper around fillPhysicalHSpanByte: state=true → 0x00 (dark), false → 0xFF (white).
+  void fillPhysicalHSpan(int phyY, int phyX_start, int phyX_end, bool state) const;
 
  public:
   explicit GfxRenderer(HalDisplay& halDisplay)
-      : display(halDisplay), renderMode(BW), orientation(Portrait), fadingFix(false) {}
+      : display(halDisplay),
+        renderMode(static_cast<int>(BW)),
+        orientation(static_cast<int>(Portrait)),
+        fadingFix(false),
+        textDarkness(1) {}
   ~GfxRenderer() { freeBwBufferChunks(); }
 
   static constexpr int VIEWABLE_MARGIN_TOP = 9;
@@ -75,65 +111,125 @@ class GfxRenderer {
   // Setup
   void begin();  // must be called right after display.begin()
   void insertFont(int fontId, EpdFontFamily font);
-  // Clears both the flash-font map and any SD-font registration for fontId.
-  // Coupled to avoid dangling SdCardFont* in sdCardFonts_ when callers free
-  // the underlying SdCardFont and forget the SD-side unregister.
-  void removeFont(int fontId) {
-    fontMap.erase(fontId);
-    sdCardFonts_.erase(fontId);
-  }
+  void removeFont(int fontId) { fontMap.erase(fontId); }
   void setFontCacheManager(FontCacheManager* m) { fontCacheManager_ = m; }
   FontCacheManager* getFontCacheManager() const { return fontCacheManager_; }
+  bool isFontCacheScanning() const;
   const std::map<int, EpdFontFamily>& getFontMap() const { return fontMap; }
   void registerSdCardFont(int fontId, SdCardFont* font) { sdCardFonts_[fontId] = font; }
-  void unregisterSdCardFont(int fontId) { removeFont(fontId); }
+  void unregisterSdCardFont(int fontId) { sdCardFonts_.erase(fontId); }
   void clearSdCardFonts() { sdCardFonts_.clear(); }
   const std::map<int, SdCardFont*>& getSdCardFonts() const { return sdCardFonts_; }
   bool isSdCardFont(int fontId) const { return sdCardFonts_.count(fontId) > 0; }
-  // Ensure SD card font glyph data is loaded for the given text. Called from layout code
-  // (which holds a const GfxRenderer&) before measuring word widths. Safe to call on non-SD fonts (no-op).
-  // styleMask: bitmask of styles to prepare (bit 0=regular, 1=bold, 2=italic, 3=bold-italic).
-  void ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_t styleMask = 0x0F) const;
-  void ensureSdCardFontReady(int fontId, const std::vector<std::string>& words, bool includeHyphen,
-                             uint8_t styleMask = 0x0F) const;
+
+  // Ensure glyph metrics are loaded for the given text before layout measurement.
+  // No-op for built-in fonts (map lookup finds nothing and returns immediately).
+  // For SD/flash fonts: reads glyph metrics (no bitmaps) for all codepoints in text.
+  void ensureFontReady(int fontId, const char* utf8Text) const;
+
+  // Clear the cumulative font metadata cache built up across paragraphs.
+  // No-op when no SD font is active.
+  void clearFontAccumulation() const;
+
+  // Phase lifecycle: drop layout-phase metadata to free heap before createSectionFile().
+  // No-op when no SD font is active or font is mmap'd (metadata is always accessible).
+  void dropFontMetadata() const;
+
+  // Restore layout-phase metadata after createSectionFile().
+  // Returns true if all fonts reloaded successfully (always true for mmap fonts).
+  bool restoreFontMetadata() const;
 
   // Orientation control (affects logical width/height and coordinate transforms)
-  void setOrientation(const Orientation o) { orientation = o; }
-  Orientation getOrientation() const { return orientation; }
+  void setOrientation(const Orientation o) { orientation.store(static_cast<int>(o), std::memory_order_relaxed); }
+  Orientation getOrientation() const { return static_cast<Orientation>(orientation.load(std::memory_order_relaxed)); }
 
   // Fading fix control
-  void setFadingFix(const bool enabled) { fadingFix = enabled; }
+  void setFadingFix(const bool enabled) { fadingFix.store(enabled, std::memory_order_relaxed); }
 
   // Screen ops
   int getScreenWidth() const;
   int getScreenHeight() const;
   void displayBuffer(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
-  // Read a rectangular region of the 1-bpp framebuffer into 'dst'. Inputs are
-  // SCREEN coordinates (the same coordinate system fillRect / drawText use).
-  // Internally the rectangle is rotated into panel-memory coordinates and
-  // snapped outward to byte boundaries, so the bytes actually read can cover
-  // up to one extra byte per row vs. the requested screen width. Output is
-  // packed MSB-first with (alignedMemoryWidth / 8) bytes per row.
-  // Returns the bytes written, or 0 if dstCapacity is insufficient or the
-  // rectangle is empty / fully out of bounds.
-  //
-  // Symmetric with writeFramebufferRegion: passing the SAME screen rectangle
-  // to writeFramebufferRegion will restore exactly the pixels this read.
-  size_t readFramebufferRegion(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t* dst, size_t dstCapacity) const;
+  void setNextDisplayRefreshMode(HalDisplay::RefreshMode refreshMode) const;
+  // True if a setNextDisplayRefreshMode() override is armed but not yet consumed. Peek only —
+  // does NOT consume it (unlike consumeRefreshOverride). Lets a caller that is about to issue an
+  // intermediate refresh (which would consume the override) detect that a deliberate-transition
+  // override is pending and react accordingly.
+  bool hasRefreshOverridePending() const {
+    return refreshOverride.load(std::memory_order_acquire) != REFRESH_OVERRIDE_NONE;
+  }
+  // Discard a pending setNextDisplayRefreshMode() override without applying it, so the next display
+  // uses its own requested mode. Use when the armed override should move to a later refresh — e.g.
+  // the reader keeps the indexing popup FAST but forces the following content page to HALF itself.
+  void clearRefreshOverride() const { consumeRefreshOverride(HalDisplay::FAST_REFRESH); }
+  // Make the write framebuffer match the currently displayed frame. Call before
+  // a partial repaint that patches a few regions and re-displays without
+  // re-rendering the full frame: displayBuffer() ends with swapBuffers(), so
+  // the write buffer otherwise holds the frame from two refreshes ago. No-op in
+  // single-buffer mode, where the write buffer is already the displayed frame.
+  void syncWriteBufferFromDisplayed() const { display.syncWriteBufferFromActive(); }
 
-  // Restore a rectangular region of the framebuffer previously captured by
-  // readFramebufferRegion using the SAME SCREEN rectangle. Inputs are SCREEN
-  // coordinates; src must hold exactly the bytes returned by
-  // readFramebufferRegion for the same screen rect (same row layout, same
-  // total length). No-op if the rectangle is empty or fully out of bounds.
-  void writeFramebufferRegion(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint8_t* src);
+  // Temporarily free the secondary (previous-frame) buffer (~52 KB) during
+  // operations that don't need it (e.g. chapter compilation). BW rendering
+  // continues normally. Grayscale AA and (on X4) fast differential are
+  // unavailable until reallocSecondaryBuffer() is called.
+  bool releaseSecondaryBuffer() const { return display.releaseSecondaryBuffer(); }
+  bool reallocSecondaryBuffer() const { return display.reallocSecondaryBuffer(); }
+  bool hasSecondaryBuffer() const { return display.hasSecondaryBuffer(); }
+  // Borrow/return variant of release/realloc: the block never enters the heap,
+  // so nothing can allocate inside it and the return cannot fail. See
+  // FreeInkDisplay::borrowSecondaryBuffer.
+  uint8_t* borrowSecondaryBuffer(size_t* size) const { return display.borrowSecondaryBuffer(size); }
+  bool returnSecondaryBuffer() const { return display.returnSecondaryBuffer(); }
+  // Keep fast differential alive (X4) after releaseSecondaryBuffer() by diffing
+  // against the controller's retained baseline. See HalDisplay::setSingleBufferFastDiff.
+  void setSingleBufferFastDiff(bool enabled) const { display.setSingleBufferFastDiff(enabled); }
+  bool isX3() const { return display.deviceIsX3(); }
 
+  // Non-blocking display split.
+  // triggerDisplay() sends pixels, issues the refresh command and returns
+  // immediately — the waveform runs in hardware. frameBuffer is safe to
+  // overwrite after this returns. completeDisplay() genuinely sleeps (via
+  // FreeRTOS semaphore) until BUSY deasserts, then does post-waveform work.
+  // Both must be called from the render task; no other task may call SPI
+  // display methods between triggerDisplay() and completeDisplay().
+  // Honors a pending setNextDisplayRefreshMode() override (see consumeRefreshOverride);
+  // defined out-of-line in the .cpp so it can share that logic with displayBuffer().
+  void triggerDisplay(HalDisplay::RefreshMode mode = HalDisplay::FAST_REFRESH, bool turnOffScreen = false) const;
+  // X4 async refresh split: triggerDisplayAsync() returns while the waveform
+  // runs; finishDisplayAsync() sleeps until it completes. CPU/RAM-only work is
+  // allowed between the two calls (no display/SPI), same task as the trigger.
+  // Honors the same refresh override + fading-fix policy as triggerDisplay().
+  // On X3 the trigger falls back to the synchronous path and finish is a no-op.
+  void triggerDisplayAsync(HalDisplay::RefreshMode mode = HalDisplay::FAST_REFRESH, bool turnOffScreen = false) const;
+  void finishDisplayAsync() const { display.finishDisplayAsync(); }
+  void completeDisplay() const {
+    display.completeDisplay();
+    // No per-page RED reseed here — same rationale as displayBuffer(): the
+    // display driver keeps the RED (previous-frame) plane current on every
+    // refresh (writes RED from prev on dual-buffer fast, resyncs it after
+    // single-buffer refreshes), so a syncRedRamFromFrameBuffer() here is a
+    // redundant ~48 KB SPI write per page turn. The explicit seed lives at the
+    // dual->single transition (release sites) only.
+  }
+  bool isRefreshPending() const { return display.isRefreshPending(); }
+  bool isRedRamSynced() const { return display.isRedRamSynced(); }
+  // Diagnostics: effective refresh mode of the last refresh (after any downgrade).
+  HalDisplay::RefreshMode getLastRefreshMode() const { return display.getLastRefreshMode(); }
+  // Diagnostics: last X4 displayMode byte (0x0C fast / 0x1C OTP-flash / 0xD4 half / 0x34 full).
+  uint8_t getLastDisplayModeByte() const { return display.getLastDisplayModeByte(); }
+  void displayWindow(int x, int y, int width, int height, bool turnOffScreen = false) const;
   void invertScreen() const;
   void clearScreen(uint8_t color = 0xFF) const;
   void getOrientedViewableTRBL(int* outTop, int* outRight, int* outBottom, int* outLeft) const;
 
   // Drawing
   void drawPixel(int x, int y, bool state = true) const;
+  // Copy one packed 1bpp row in the device's physical portrait coordinate
+  // space into the controller framebuffer. Source and framebuffer are MSB-first
+  // with 0 = black, 1 = white; set invertBits when the source row uses 1 = ink.
+  void writePhysicalPortraitPackedRow(int physicalY, const uint8_t* packedRow, int pixelWidth,
+                                      bool invertBits = false) const;
   void drawLine(int x1, int y1, int x2, int y2, bool state = true) const;
   void drawLine(int x1, int y1, int x2, int y2, int lineWidth, bool state) const;
   void drawArc(int maxRadius, int cx, int cy, int xDir, int yDir, int lineWidth, bool state) const;
@@ -142,25 +238,14 @@ class GfxRenderer {
   void drawRoundedRect(int x, int y, int width, int height, int lineWidth, int cornerRadius, bool state) const;
   void drawRoundedRect(int x, int y, int width, int height, int lineWidth, int cornerRadius, bool roundTopLeft,
                        bool roundTopRight, bool roundBottomLeft, bool roundBottomRight, bool state) const;
-  void maskRoundedRectOutsideCorners(int x, int y, int width, int height, int radius, Color color = Color::White) const;
   void fillRect(int x, int y, int width, int height, bool state = true) const;
-  // Fast clear-to-white over a rectangle. Equivalent in effect to
-  // fillRect(x, y, w, h, false) but uses byte-aligned memset for the
-  // middle of each panel-memory row, with bit-mask OR only at the byte
-  // edges. Roughly 10x faster than fillRect for wide regions because it
-  // avoids the per-pixel rotateCoordinates/bounds-check/bit-RMW path.
-  // Handles all four orientations via rotateCoordinates on the rect's
-  // two opposite corners. Clamps to panel bounds; out-of-bounds rects
-  // are silently dropped (unlike drawPixel, which logs each
-  // out-of-bounds pixel — callers may legitimately pass slightly
-  // margin-overlapping rects).
-  void clearRect(int x, int y, int width, int height) const;
   void fillRectDither(int x, int y, int width, int height, Color color) const;
   void fillRoundedRect(int x, int y, int width, int height, int cornerRadius, Color color) const;
   void fillRoundedRect(int x, int y, int width, int height, int cornerRadius, bool roundTopLeft, bool roundTopRight,
                        bool roundBottomLeft, bool roundBottomRight, Color color) const;
   void drawImage(const uint8_t bitmap[], int x, int y, int width, int height) const;
   void drawIcon(const uint8_t bitmap[], int x, int y, int width, int height) const;
+  void drawIconInverted(const uint8_t bitmap[], int x, int y, int width, int height) const;
   void drawBitmap(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight, float cropX = 0,
                   float cropY = 0) const;
   void drawBitmap1Bit(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight) const;
@@ -168,6 +253,11 @@ class GfxRenderer {
 
   // Text
   int getTextWidth(int fontId, const char* text, EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
+  int getTextWidthScaled(int fontId, const char* text, EpdFontFamily::Style style, float scale) const;
+  int getLineHeightScaled(int fontId, float scale) const;
+  int getFontAscenderSizeScaled(int fontId, float scale) const;
+  void drawTextScaled(int fontId, int x, int y, const char* text, bool black, EpdFontFamily::Style style,
+                      float scale) const;
   void drawCenteredText(int fontId, int y, const char* text, bool black = true,
                         EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   void drawText(int fontId, int x, int y, const char* text, bool black = true,
@@ -196,14 +286,163 @@ class GfxRenderer {
   int getTextHeight(int fontId) const;
 
   // Grayscale functions
-  void setRenderMode(const RenderMode mode) { this->renderMode = mode; }
-  RenderMode getRenderMode() const { return renderMode; }
+  void setRenderMode(const RenderMode mode) {
+    this->renderMode.store(static_cast<int>(mode), std::memory_order_relaxed);
+  }
+  RenderMode getRenderMode() const { return static_cast<RenderMode>(renderMode.load(std::memory_order_relaxed)); }
+
+  // Text darkness control:
+  //   0 = Normal, 1 = Dark, 2 = Extra Dark, 3 = Maximum.
+  // Only affects anti-aliased pixels in 2-bit (grayscale) glyph rendering;
+  // 1-bit fonts and the BW pass are unchanged. See drawMaskFor2BitMode() in
+  // GfxRenderer.cpp for the per-level pixel breakdown and a worked example.
+  void setTextDarkness(const uint8_t d) { textDarkness.store(d, std::memory_order_relaxed); }
+  uint8_t getTextDarkness() const { return static_cast<uint8_t>(textDarkness.load(std::memory_order_relaxed)); }
   void copyGrayscaleLsbBuffers() const;
   void copyGrayscaleMsbBuffers() const;
   void displayGrayBuffer() const;
-  bool storeBwBuffer();    // Returns true if buffer was stored successfully
-  void restoreBwBuffer();  // Restore and free the stored buffer
+
+  // Timing breakdown returned by renderGrayscalePlanesSequential().
+  struct GrayscaleTimings {
+    unsigned long planesMs = 0;   // LSB render+copy + MSB render+copy
+    unsigned long displayMs = 0;  // displayGrayBuffer() waveform
+    unsigned long restoreMs = 0;  // cleanupGrayscaleWithPreviousBuffer() SPI write
+  };
+
+  // Render both grayscale planes sequentially into the BW framebuffer, streaming
+  // each plane to the controller immediately after rendering it. No extra allocation
+  // needed — the BW framebuffer is the scratch pad for both passes.
+  //
+  // After displayGrayBuffer(), cleanupGrayscaleWithPreviousBuffer() reseeds the
+  // controller's RED RAM and the in-RAM active buffer from frameBufferActive —
+  // which holds the exact full BW page (including images) that displayBuffer()
+  // left there before the grayscale pass began. This is the correct differential
+  // baseline for the next fast refresh.
+  //
+  // renderFn is called twice (LSB, MSB). The RenderMode argument tells it which
+  // pass is running. The caller sets setFastGrayscaleLut() before calling.
+  //
+  // Returns wall-clock timings for each of the three phases.
+  //
+  // Signature: void renderFn(RenderMode mode)
+  template <typename RenderFn>
+  GrayscaleTimings renderGrayscalePlanesSequential(RenderFn renderFn) {
+    GrayscaleTimings t;
+    const unsigned long t0 = millis();
+
+    clearScreen(0x00);
+    setRenderMode(GRAYSCALE_LSB);
+    renderFn(GRAYSCALE_LSB);
+    copyGrayscaleLsbBuffers();
+
+    clearScreen(0x00);
+    setRenderMode(GRAYSCALE_MSB);
+    renderFn(GRAYSCALE_MSB);
+    copyGrayscaleMsbBuffers();
+
+    const unsigned long t1 = millis();
+    t.planesMs = t1 - t0;
+
+    setRenderMode(BW);
+    display.displayGrayBuffer(/*turnOffScreen=*/false);
+
+    const unsigned long t2 = millis();
+    t.displayMs = t2 - t1;
+
+    // Reseed RED RAM and frameBufferActive from the previous-frame slot, which
+    // holds the full BW page exactly as displayBuffer() left it. Using this
+    // instead of re-rendering gives the correct baseline (images + text) and
+    // costs only one SPI write.
+    cleanupGrayscaleWithPreviousBuffer();
+
+    t.restoreMs = millis() - t2;
+    return t;
+  }
+
+  // Same plane dance as renderGrayscalePlanesSequential(), but entered while an
+  // async BW refresh is still in flight (triggerDisplayAsync()): the LSB plane
+  // renders into the write framebuffer DURING the waveform — CPU/RAM work only,
+  // the controller scans its own RAM — then finishDisplayAsync() consumes the
+  // remaining wait before the first SPI plane write. This lands the gray flush
+  // ~one plane-render earlier than deferring the whole pass to after the
+  // waveform, which is what makes the AA touch-up read as part of the page
+  // refresh instead of a separate later update.
+  //
+  // Caller contract: an async refresh MUST be in flight, and the glyphs the
+  // renderFn draws must already be prewarmed (a cache miss would issue SD reads
+  // — allowed — but a display/SPI call in renderFn is not).
+  template <typename RenderFn>
+  GrayscaleTimings renderGrayscalePlanesInterleaved(RenderFn renderFn) {
+    GrayscaleTimings t;
+    const unsigned long t0 = millis();
+
+    clearScreen(0x00);
+    setRenderMode(GRAYSCALE_LSB);
+    renderFn(GRAYSCALE_LSB);
+    const unsigned long tLsbDone = millis();
+
+    // Waveform still running: sleep out the remainder (power hooks active).
+    display.finishDisplayAsync();
+    const unsigned long tWaveDone = millis();
+
+    copyGrayscaleLsbBuffers();
+    clearScreen(0x00);
+    setRenderMode(GRAYSCALE_MSB);
+    renderFn(GRAYSCALE_MSB);
+    copyGrayscaleMsbBuffers();
+
+    const unsigned long t1 = millis();
+    // Report only actual plane work; the residual waveform sleep is not ours.
+    t.planesMs = (tLsbDone - t0) + (t1 - tWaveDone);
+
+    setRenderMode(BW);
+    display.displayGrayBuffer(/*turnOffScreen=*/false);
+
+    const unsigned long t2 = millis();
+    t.displayMs = t2 - t1;
+
+    cleanupGrayscaleWithPreviousBuffer();
+
+    t.restoreMs = millis() - t2;
+    return t;
+  }
+
+  // X3-only: trade AA visual fidelity for ~2.2 s faster page-flip wall clock.
+  // No effect on X4 (its single grayscale LUT already runs at ~500 ms).
+  void setFastGrayscaleLut(bool fast) const { display.setFastGrayscaleLut(fast); }
+  bool getFastGrayscaleLut() const { return display.getFastGrayscaleLut(); }
+
+  // Active pixel-write target for raw writers that bypass drawPixel for speed.
+  // Returns the full framebuffer and its extent ([0, panelHeight)).
+  uint8_t* getWriteTarget() const { return frameBuffer; }
+  int getWriteOriginY() const { return 0; }
+  int getWriteRows() const { return static_cast<int>(panelHeight); }
+  bool isStripActive() const { return false; }
+  bool glyphIntersectsStrip(int, int, int, int) const { return true; }
+
+  bool storeBwBuffer();                                         // Returns true if buffer was stored successfully
+  bool storeBwBufferRect(int x, int y, int width, int height);  // Store only rows intersecting logical rect
+  void restoreBwBuffer();                                       // Restore and free the stored buffer
+  // Re-syncs the controller's RED RAM from the current BW framebuffer so the
+  // next differential page turn has a clean baseline. Called after the tiled
+  // grayscale path, which leaves the panel's gray planes loaded but the BW
+  // framebuffer untouched.
+  //
+  // const-correctness caveat: on X3 the underlying display call (see
+  // EInkDisplay::cleanupGrayscaleBuffers) performs an in-place Y-flip of the
+  // framebuffer bytes, sends them, and flips back. The framebuffer's logical
+  // contents are identical before and after, but during the call the bytes
+  // are transiently reordered. The method stays `const` because the renderer's
+  // observable state doesn't change; callers must not race a framebuffer
+  // reader against this call.
+  void syncRedRamFromFrameBuffer() const;
   void cleanupGrayscaleWithFrameBuffer() const;
+  // Reseed controller RED RAM and frameBufferActive from the display's internal
+  // previous-frame buffer (frameBufferActive in EInkDisplay). This holds the
+  // exact full BW page that displayBuffer() committed before the grayscale pass
+  // — including images — giving a correct differential baseline for the next
+  // fast refresh without any re-render.
+  void cleanupGrayscaleWithPreviousBuffer() const;
 
   // Font helpers
   const uint8_t* getGlyphBitmap(const EpdFontData* fontData, const EpdGlyph* glyph) const;
@@ -211,17 +450,36 @@ class GfxRenderer {
   // Low level functions
   uint8_t* getFrameBuffer() const;
   size_t getBufferSize() const;
+
+  // Release both display frame buffers back to the heap (~96-104KB total).
+  // Nulls the local frameBuffer pointer too; displayBuffer() rejects flushes
+  // (LOG_ERR + no-op) while it is null instead of streaming freed memory.
+  // Only valid after the final displayBuffer(); the device must reboot before
+  // any display operation is attempted again.
+  void releaseFrameBuffers() {
+    display.releaseBuffers();
+    frameBuffer = nullptr;
+  }
+
+  // Release both display buffers and install a caller-owned scratch buffer as
+  // the active framebuffer. Pixel writes during the warm pass land in scratch
+  // (discarded on reboot) while the decoder can use the freed ~96 KB for its
+  // own allocation. scratchSize must be >= panelWidthBytes * panelHeight.
+  // The device must reboot before any display operation is attempted again.
+  bool releaseFrameBuffersWithScratch(uint8_t* scratch, size_t scratchSize) {
+    if (!scratch || scratchSize < static_cast<size_t>(panelWidthBytes) * panelHeight) return false;
+    display.releaseBuffers();
+    memset(scratch, 0, scratchSize);
+    frameBuffer = scratch;
+    return true;
+  }
   uint16_t getDisplayWidth() const { return panelWidth; }
   uint16_t getDisplayHeight() const { return panelHeight; }
   uint16_t getDisplayWidthBytes() const { return panelWidthBytes; }
 
-  // Region cache: take a logical (orientation-aware) rect, hit the framebuffer
-  // bytes that the rect can have touched, and pump them in or out of a caller-
-  // supplied buffer. Used by HomeActivity to snapshot just the cover tile
-  // (~16 KB in Portrait) instead of cloning the entire 48 KB framebuffer.
-  //
-  // getRegionByteSize: required buffer length for the rect at current orientation.
-  // copyRegionToBuffer / copyBufferToRegion: false if `bufSize` is smaller than that.
+  // Region cache helpers: operate on a logical (orientation-aware) rect and
+  // copy only the framebuffer bytes it touches. Used by HomeActivity to snapshot
+  // the cover tile (~16 KB) instead of the full 48 KB framebuffer.
   size_t getRegionByteSize(int logicalX, int logicalY, int logicalW, int logicalH) const;
   bool copyRegionToBuffer(int logicalX, int logicalY, int logicalW, int logicalH, uint8_t* buf, size_t bufSize) const;
   bool copyBufferToRegion(int logicalX, int logicalY, int logicalW, int logicalH, const uint8_t* buf,

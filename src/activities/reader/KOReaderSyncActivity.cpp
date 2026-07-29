@@ -1,93 +1,83 @@
 #include "KOReaderSyncActivity.h"
 
+#include <FontCacheManager.h>
 #include <GfxRenderer.h>
-#include <HalStorage.h>
+#include <HalClock.h>
 #include <I18n.h>
 #include <Logging.h>
 #include <WiFi.h>
-#include <esp_sntp.h>
+#include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <esp_wifi.h>
 
-#include <algorithm>
-#include <cassert>
-
-#include "Epub/Section.h"
-#include "EpubReaderUtils.h"
+#include "CrossPointSettings.h"
 #include "KOReaderCredentialStore.h"
 #include "KOReaderDocumentId.h"
 #include "MappedInputManager.h"
-#include "ReaderUtils.h"
 #include "SilentRestart.h"
-#include "activities/ActivityManager.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
 namespace {
-void syncTimeWithNTP() {
-  // Stop SNTP if already running (can't reconfigure while running)
-  if (esp_sntp_enabled()) {
-    esp_sntp_stop();
+constexpr time_t NTP_RESYNC_MIN_INTERVAL_SEC = 15 * 60;
+
+// Emits heap snapshots around sync stages so we can correlate TLS failures with
+// fragmentation and not just total free heap.
+void logSyncMemSnapshot(const char* stage) {
+  const uint32_t freeHeap = esp_get_free_heap_size();
+  const uint32_t contigHeap = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT);
+  LOG_DBG("KOSync", "Sync mem[%s]: free=%lu contig=%lu", stage, freeHeap, contigHeap);
+}
+
+// Frees renderer-owned caches inside the standalone sync activity right before
+// network work. The reader activity is already gone by this point, but sync UI
+// rendering (status popups, compare screen, result screen) can repopulate font
+// caches and chip away at the largest free block needed for TLS.
+void trimMemoryBeforeTls(const GfxRenderer& renderer) {
+  if (auto* cacheManager = renderer.getFontCacheManager()) {
+    cacheManager->clearCache();
+    cacheManager->resetStats();
+    LOG_DBG("KOSync", "Cleared font cache before TLS");
+  }
+  // Release the ~52 KB secondary (previous-frame) framebuffer for the duration of the sync.
+  // TLS needs a large *contiguous* block (~36 KB); the secondary buffer is a big resident
+  // allocation that fragments the heap so the largest free block can't reach that threshold
+  // even when total free looks sufficient. Sync UI (status popups) renders fine on the primary
+  // buffer alone, and the device silently reboots after a sync (see resumeReader -> silentRestart),
+  // so it never needs to be reallocated in-place — the reboot rebuilds clean state.
+  if (renderer.hasSecondaryBuffer()) {
+    if (renderer.releaseSecondaryBuffer()) {
+      LOG_DBG("KOSync", "Released secondary framebuffer before TLS (~52 KB contiguous)");
+      // The controller still holds the last displayed frame in RED RAM, and the
+      // sync UI only ever issues plain BW full-frame redraws, so fast
+      // differential refresh can continue against that baseline instead of
+      // downgrading every status update to a half/full waveform (X4 only; X3
+      // fast differential is unaffected by the release).
+      renderer.setSingleBufferFastDiff(true);
+    }
+  }
+}
+
+bool shouldSyncNtpNow() {
+  const time_t lastSync = HalClock::lastSyncTime();
+  const time_t now = HalClock::now();
+  if (lastSync <= 0 || now <= 0) {
+    return true;
   }
 
-  // Configure SNTP
-  esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
-  esp_sntp_setservername(0, "pool.ntp.org");
-  esp_sntp_init();
-
-  // Wait for time to sync (with timeout)
-  int retry = 0;
-  const int maxRetries = 50;  // 5 seconds max
-  while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && retry < maxRetries) {
-    vTaskDelay(100 / portTICK_PERIOD_MS);
-    retry++;
+  const time_t age = now - lastSync;
+  if (age < 0) {
+    return true;
   }
-
-  if (retry < maxRetries) {
-    LOG_DBG("KOSync", "NTP time synced");
-  } else {
-    LOG_DBG("KOSync", "NTP sync timeout, using fallback");
-  }
+  return age >= NTP_RESYNC_MIN_INTERVAL_SEC;
 }
 }  // namespace
 
-void KOReaderSyncActivity::ensureEpubLoaded() {
-  if (!epub) {
-    LOG_DBG("KOSync", "Loading epub for progress mapping (heap: %u)", (unsigned)ESP.getFreeHeap());
-    epub = std::make_shared<Epub>(epubPath, "/.crosspoint");
-    epub->setupCacheDir();
-    // Load metadata only (no CSS needed for progress mapping, don't rebuild if cache is missing).
-    if (!epub->load(false, true)) {
-      LOG_ERR("KOSync", "Failed to load epub for progress mapping");
-      epub.reset();
-      return;
-    }
-    LOG_DBG("KOSync", "Epub loaded (heap: %u)", (unsigned)ESP.getFreeHeap());
-  }
-}
-
-void KOReaderSyncActivity::saveProgressAndReturn(int spineIndex, int page) {
-  // epub is guaranteed non-null here: ensureEpubLoaded() was called in performSync() before
-  // SHOWING_RESULT state is entered, and this method is only called from that state.
-  assert(epub);
-  if (!EpubReaderUtils::saveProgress(*epub, spineIndex, page, 0)) {
-    {
-      RenderLock lock(*this);
-      state = SYNC_FAILED;
-      statusMessage = tr(STR_SAVE_PROGRESS_FAILED);
-    }
-    requestUpdate(true);
-    return;
-  }
-  returnToReader();
-}
-
-void KOReaderSyncActivity::returnToReader() { activityManager.goToReader(epubPath); }
-
 void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
   if (!success) {
-    LOG_DBG("KOSync", "WiFi connection failed, exiting");
-    returnToReader();
+    LOG_DBG("KOSync", "WiFi connection failed, resuming reader");
+    resumeReader(KOReaderSyncOutcomeState::CANCELLED);
     return;
   }
 
@@ -98,22 +88,32 @@ void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
     state = SYNCING;
     statusMessage = tr(STR_SYNCING_TIME);
   }
-  requestUpdate(true);
+  requestUpdate();
 
-  // Sync time with NTP before making API requests
-  syncTimeWithNTP();
+  // Avoid repeated NTP churn during rapid sync retries; it can fragment heap
+  // right before TLS. Re-sync only when clock is stale.
+  if (shouldSyncNtpNow()) {
+    HalClock::syncNtp(SETTINGS.ntpServer);
+  } else {
+    LOG_DBG("KOSync", "Skipping NTP sync (recently synced)");
+  }
 
   {
     RenderLock lock(*this);
     statusMessage = tr(STR_CALC_HASH);
   }
-  requestUpdate(true);
+  requestUpdate();
+
+  logSyncMemSnapshot("before_performSync");
+  trimMemoryBeforeTls(renderer);
+  logSyncMemSnapshot("after_trim_before_performSync");
 
   performSync();
+
+  logSyncMemSnapshot("after_performSync");
 }
 
-void KOReaderSyncActivity::performSync() {
-  // Calculate document hash based on user's preferred method
+bool KOReaderSyncActivity::calculateDocumentHash() {
   if (KOREADER_STORE.getMatchMethod() == DocumentMatchMethod::FILENAME) {
     documentHash = KOReaderDocumentId::calculateFromFilename(epubPath);
   } else {
@@ -126,21 +126,85 @@ void KOReaderSyncActivity::performSync() {
       statusMessage = tr(STR_HASH_FAILED);
     }
     requestUpdate(true);
-    return;
+    return false;
   }
 
   LOG_DBG("KOSync", "Document hash: %s", documentHash.c_str());
+  return true;
+}
 
+bool KOReaderSyncActivity::handleAutoPushPreflight() {
+  KOReaderSyncClient::beginPersistentSession();
+  KOReaderProgress warmupProgress;
+  const auto warmupResult = KOReaderSyncClient::getProgress(documentHash, warmupProgress);
+  if (warmupResult != KOReaderSyncClient::OK && warmupResult != KOReaderSyncClient::NOT_FOUND) {
+    KOReaderSyncClient::endPersistentSession();
+    {
+      RenderLock lock(*this);
+      state = SYNC_FAILED;
+      statusMessage = KOReaderSyncClient::errorString(warmupResult);
+      const char* detail = KOReaderSyncClient::lastFailureDetail();
+      if (detail && detail[0]) {
+        statusMessage += " — ";
+        statusMessage += detail;
+      }
+    }
+    requestUpdate(true);
+    return false;
+  }
+  // Auto-push must not overwrite progress that is already further along on the server.
+  if (syncIntent == KOReaderSyncIntentState::AUTO_PUSH && warmupResult == KOReaderSyncClient::OK &&
+      warmupProgress.percentage > localProgress.percentage) {
+    LOG_DBG("KOSync", "AUTO_PUSH skipped: remote %.4f >= local %.4f", warmupProgress.percentage,
+            localProgress.percentage);
+    KOReaderSyncClient::endPersistentSession();
+    // Drop the radio while user reads the result; full teardown happens at silent reboot.
+    esp_wifi_stop();
+    APP_STATE.koReaderSyncSession.outcome = KOReaderSyncOutcomeState::UPLOAD_COMPLETE;
+    APP_STATE.saveToFile();
+    resumeReader(KOReaderSyncOutcomeState::UPLOAD_COMPLETE);
+    return false;
+  }
+  return true;
+}
+
+void KOReaderSyncActivity::performFetchAndCompare() {
   {
     RenderLock lock(*this);
     statusMessage = tr(STR_FETCH_PROGRESS);
   }
-  requestUpdateAndWait();
+  requestUpdate();
+
+  // Keep the GET connection alive so Upload can reuse the same session and
+  // avoid a second TLS handshake under fragmented heap.
+  KOReaderSyncClient::beginPersistentSession();
 
   // Fetch remote progress
   const auto result = KOReaderSyncClient::getProgress(documentHash, remoteProgress);
 
   if (result == KOReaderSyncClient::NOT_FOUND) {
+    if (syncIntent == KOReaderSyncIntentState::PULL_REMOTE) {
+      // Pull intent must not silently fall back to upload when server has no
+      // remote progress. Failing explicitly keeps action semantics predictable.
+      KOReaderSyncClient::endPersistentSession();
+      {
+        RenderLock lock(*this);
+        state = SYNC_FAILED;
+        statusMessage = tr(STR_NO_REMOTE_MSG);
+      }
+      requestUpdate(true);
+      return;
+    }
+
+    if (syncIntent == KOReaderSyncIntentState::AUTO_PULL) {
+      // Auto-pull at book open: nothing to apply, just open the book with local progress.
+      KOReaderSyncClient::endPersistentSession();
+      esp_wifi_stop();
+      resumeReader(KOReaderSyncOutcomeState::CANCELLED);
+      return;
+    }
+
+    // Keep session open so an immediate upload can reuse the same connection.
     // No remote progress - offer to upload
     {
       RenderLock lock(*this);
@@ -152,98 +216,172 @@ void KOReaderSyncActivity::performSync() {
   }
 
   if (result != KOReaderSyncClient::OK) {
+    KOReaderSyncClient::endPersistentSession();
     {
       RenderLock lock(*this);
       state = SYNC_FAILED;
       statusMessage = KOReaderSyncClient::errorString(result);
+      const char* detail = KOReaderSyncClient::lastFailureDetail();
+      if (detail && detail[0]) {
+        statusMessage += " — ";
+        statusMessage += detail;
+      }
     }
     requestUpdate(true);
     return;
   }
 
-  // Epub was released before sync to free RAM for the TLS handshake — reload it now.
-  hasRemoteProgress = true;
-  ensureEpubLoaded();
-  if (!epub) {
+  // Prepare remote mapping state for the next step.
+  hasRemoteProgress = false;
+  remotePositionMapped = false;
+  remotePosition.spineIndex = -1;
+  remotePosition.pageNumber = -1;
+  remotePosition.totalPages = 0;
+  remotePosition.paragraphIndex = 0;
+  remotePosition.hasParagraphIndex = false;
+  remotePosition.listItemIndex = 0;
+  remotePosition.hasListItemIndex = false;
+  remoteChapterLabel.clear();
+
+  if (syncIntent == KOReaderSyncIntentState::PULL_REMOTE || syncIntent == KOReaderSyncIntentState::AUTO_PULL) {
+    // Pull intent applies immediately and exits. We bypass chooser UI to keep
+    // reader menu actions deterministic ("pull" always means apply remote).
+    if (!ensureRemotePositionMapped()) {
+      if (syncIntent == KOReaderSyncIntentState::AUTO_PULL) {
+        // Auto-pull was best-effort. Fail silently and just open the book.
+        esp_wifi_stop();
+        resumeReader(KOReaderSyncOutcomeState::CANCELLED);
+        return;
+      }
+      {
+        RenderLock lock(*this);
+        state = SYNC_FAILED;
+        statusMessage = tr(STR_SYNC_FAILED_MSG);
+      }
+      requestUpdate(true);
+      return;
+    }
+
+    // Preserve the apply result and show explicit confirmation before returning
+    // to the reader so users can tell pull succeeded.
+    auto& sync = APP_STATE.koReaderSyncSession;
+    sync.outcome = KOReaderSyncOutcomeState::APPLIED_REMOTE;
+    sync.resultSpineIndex = remotePosition.spineIndex;
+    sync.resultPage = remotePosition.pageNumber;
+    sync.resultParagraphIndex = remotePosition.paragraphIndex;
+    sync.resultHasParagraphIndex = remotePosition.hasParagraphIndex;
+    sync.resultListItemIndex = remotePosition.listItemIndex;
+    sync.resultHasListItemIndex = remotePosition.hasListItemIndex;
+    APP_STATE.saveToFile();
+
+    if (syncIntent == KOReaderSyncIntentState::AUTO_PULL) {
+      // Auto-pull skips the success-screen dwell — the reader will render the new
+      // position immediately, which is the only visible feedback the user needs.
+      esp_wifi_stop();
+      resumeReader(KOReaderSyncOutcomeState::APPLIED_REMOTE);
+      return;
+    }
+    {
+      RenderLock lock(*this);
+      state = APPLY_COMPLETE;
+      uploadCompleteTime = millis();
+    }
+    requestUpdate(true);
+    return;
+  }
+
+  // Compare intent keeps the legacy chooser flow (apply vs upload), which is
+  // still useful for manual conflict decisions.
+  // Pre-map remote progress now so compare UI always shows concrete chapter/
+  // page data. The mapped result is cached and reused if Apply is chosen.
+  // closeSessionBeforeMapping=true tears down the warmed TLS session before
+  // reverse XPath mapping so the 32 KB inflate ring buffer can allocate. The
+  // held-open wolfSSL connection otherwise pins contiguous heap and the inflate
+  // malloc fails, falling back to lossy percentage mapping.
+  // Trade-off: if the user picks Upload afterwards we eat one extra TLS
+  // handshake (~1.7s) — Apply is the common choice and silent inflate
+  // failures here previously caused syncs to land on the wrong page.
+  if (!ensureRemotePositionMapped(true)) {
     {
       RenderLock lock(*this);
       state = SYNC_FAILED;
-      statusMessage = "";
+      statusMessage = tr(STR_SYNC_FAILED_MSG);
     }
     requestUpdate(true);
     return;
   }
 
-  KOReaderPosition koPos = {remoteProgress.progress, remoteProgress.percentage};
-  remotePosition = ProgressMapper::toCrossPoint(epub, koPos, currentSpineIndex, totalPagesInSpine);
-
-  // Refine page using section cache LUTs: li index, anchor, or paragraph index.
-  if (remotePosition.hasLiIndex || remotePosition.xpathAnchorId[0] != '\0' || remotePosition.hasParagraphIndex) {
-    Section tempSection(epub, remotePosition.spineIndex, renderer);
-    bool refined = false;
-    if (remotePosition.hasLiIndex) {
-      const auto liPage = tempSection.getPageForListItemIndex(remotePosition.liIndex);
-      if (liPage.has_value()) {
-        LOG_DBG("KOSync", "Li index %u -> page %d (was %d)", remotePosition.liIndex, *liPage,
-                remotePosition.pageNumber);
-        remotePosition.pageNumber = *liPage;
-        refined = true;
-      } else {
-        LOG_DBG("KOSync", "Li index %u not found in section LUT", remotePosition.liIndex);
-      }
-    }
-    if (!refined && remotePosition.xpathAnchorId[0] != '\0') {
-      const auto anchorPage = tempSection.getPageForAnchor(std::string(remotePosition.xpathAnchorId));
-      if (anchorPage.has_value()) {
-        LOG_DBG("KOSync", "Anchor '%s' -> page %d (was %d)", remotePosition.xpathAnchorId, *anchorPage,
-                remotePosition.pageNumber);
-        remotePosition.pageNumber = *anchorPage;
-        refined = true;
-      } else {
-        LOG_DBG("KOSync", "Anchor '%s' not found in section cache", remotePosition.xpathAnchorId);
-      }
-    }
-    if (!refined && remotePosition.hasParagraphIndex) {
-      const auto paragraphPage = tempSection.getPageForParagraphIndex(remotePosition.paragraphIndex);
-      const auto nextParagraphPage = tempSection.getPageForParagraphIndex(remotePosition.paragraphIndex + 1);
-      if (paragraphPage.has_value()) {
-        int refinedPage = std::max(remotePosition.pageNumber, static_cast<int>(*paragraphPage));
-        if (nextParagraphPage.has_value()) {
-          const int lutSpan = static_cast<int>(*nextParagraphPage) - static_cast<int>(*paragraphPage);
-          // Only cap when the LUT span is >1. A span of 1 means the LUT granularity is too
-          // coarse to trust over the intra-spine position (e.g. a stale cache where the paragraph
-          // occupies different pages than at build time).
-          if (lutSpan > 1 && refinedPage >= static_cast<int>(*nextParagraphPage)) {
-            refinedPage = static_cast<int>(*nextParagraphPage) - 1;
-          }
-        }
-        char nextParaBuf[8];
-        if (nextParagraphPage.has_value())
-          snprintf(nextParaBuf, sizeof(nextParaBuf), "%d", *nextParagraphPage);
-        else
-          snprintf(nextParaBuf, sizeof(nextParaBuf), "none");
-        LOG_DBG("KOSync", "Paragraph %u -> LUT page %d, nextPara page %s, intra page %d, using %d",
-                remotePosition.paragraphIndex, *paragraphPage, nextParaBuf, remotePosition.pageNumber, refinedPage);
-        remotePosition.pageNumber = refinedPage;
-      } else {
-        LOG_DBG("KOSync", "Paragraph %u not found in section LUT", remotePosition.paragraphIndex);
-      }
-    }
-  }
-  // localProgress was pre-computed in EpubReaderActivity before the Epub was released.
+  // Local progress was precomputed before network; keep using the cached value.
+  releaseEpubForMapping();
 
   {
     RenderLock lock(*this);
     state = SHOWING_RESULT;
 
-    // Default to the option that corresponds to the furthest progress
-    if (localProgress.percentage > remoteProgress.percentage) {
-      selectedOption = 1;  // Upload local progress
-    } else {
-      selectedOption = 0;  // Apply remote progress
-    }
+    // Default to the option that corresponds to the furthest progress.
+    auto isLocalAhead = [&]() {
+      if (remotePosition.spineIndex < 0) {
+        return localProgress.percentage > remoteProgress.percentage;  // mapping unavailable; fall back
+      }
+      if (currentSpineIndex != remotePosition.spineIndex) {
+        return currentSpineIndex > remotePosition.spineIndex;
+      }
+      if (currentPage != remotePosition.pageNumber) {
+        return currentPage > remotePosition.pageNumber;
+      }
+      if (hasLocalParagraphIndex && remotePosition.hasParagraphIndex) {
+        return localParagraphIndex > remotePosition.paragraphIndex;
+      }
+      return false;
+    };
+    selectedOption = isLocalAhead() ? 1 /* Upload local */ : 0 /* Apply remote */;
   }
   requestUpdate(true);
+}
+
+void KOReaderSyncActivity::performSync() {
+  if (!calculateDocumentHash()) {
+    return;
+  }
+
+  // Local mapping is only needed for compare/upload paths.
+  // Pull-only modes can skip this expensive step and go straight to remote fetch.
+  if (syncIntent != KOReaderSyncIntentState::PULL_REMOTE && syncIntent != KOReaderSyncIntentState::AUTO_PULL) {
+    // Precompute local mapping before first network request so the expensive
+    // inflate/index work happens before TLS. This avoids a second local mapping
+    // pass later and keeps the upload path lightweight.
+    {
+      RenderLock lock(*this);
+      statusMessage = tr(STR_MAPPING_LOCAL);
+    }
+    requestUpdateAndWait();
+    if (!computeLocalProgressAndChapter()) {
+      {
+        RenderLock lock(*this);
+        state = SYNC_FAILED;
+        statusMessage = tr(STR_SYNC_FAILED_MSG);
+      }
+      requestUpdate(true);
+      return;
+    }
+  }
+
+  // Drop EPUB state before HTTPS to maximize contiguous heap for TLS.
+  releaseEpubForMapping();
+
+  // PUSH_LOCAL is an explicit user upload — go straight to PUT.
+  // AUTO_PUSH needs the preflight GET to bail out if the remote is already ahead.
+  if (syncIntent == KOReaderSyncIntentState::PUSH_LOCAL) {
+    performUpload();
+    return;
+  }
+  if (syncIntent == KOReaderSyncIntentState::AUTO_PUSH) {
+    if (!handleAutoPushPreflight()) return;
+    performUpload();
+    return;
+  }
+
+  performFetchAndCompare();
 }
 
 void KOReaderSyncActivity::performUpload() {
@@ -254,37 +392,99 @@ void KOReaderSyncActivity::performUpload() {
   }
   requestUpdateAndWait();
 
-  // localProgress was pre-computed in EpubReaderActivity before the Epub was released.
+  // If sync reached this screen without cached local progress, compute it now.
+  // This keeps upload robust when UI flow changes or retries happen.
+  if (localProgress.xpath.empty()) {
+    if (!computeLocalProgressAndChapter()) {
+      {
+        RenderLock lock(*this);
+        state = SYNC_FAILED;
+        statusMessage = tr(STR_SYNC_FAILED_MSG);
+      }
+      requestUpdate(true);
+      return;
+    }
+    releaseEpubForMapping();
+  }
+
+  // Hard-stop if we still have no xpath: sending an empty progress payload would
+  // be ambiguous server-side and hides the real local mapping failure.
+  if (localProgress.xpath.empty()) {
+    {
+      RenderLock lock(*this);
+      state = SYNC_FAILED;
+      statusMessage = tr(STR_SYNC_FAILED_MSG);
+    }
+    requestUpdate(true);
+    return;
+  }
+
+  // Sync UI rendering can repopulate glyph caches after the initial GET / compare
+  // phase, so trim again right before the upload request.
+  trimMemoryBeforeTls(renderer);
+  logSyncMemSnapshot("after_trim_before_updateProgress");
+
+  // Capture upload-phase memory separately from fetch phase to diagnose failures
+  // that only appear on PUT due to allocator state changes.
+  logSyncMemSnapshot("before_updateProgress");
+
+  // Ensure a session exists for upload. In compare flow this comes from the
+  // earlier GET; in direct-push flow it comes from the warmup GET above.
+  // In both cases, reuse avoids a second full TLS handshake.
+  KOReaderSyncClient::beginPersistentSession();
+
   KOReaderProgress progress;
   progress.document = documentHash;
   progress.progress = localProgress.xpath;
   progress.percentage = localProgress.percentage;
+  progress.metadata = localDocumentMetadata;
 
   const auto result = KOReaderSyncClient::updateProgress(progress);
-
-  // Drop the radio while user reads the result; full teardown happens at silent reboot.
-  esp_wifi_stop();
+  KOReaderSyncClient::endPersistentSession();
+  logSyncMemSnapshot("after_updateProgress");
 
   if (result != KOReaderSyncClient::OK) {
+    // Drop the radio while user reads the result; full teardown happens at silent reboot.
+    esp_wifi_stop();
     {
       RenderLock lock(*this);
       state = SYNC_FAILED;
+      // Combine the short category label with the rich diagnostic so users (and bug
+      // reports) can tell network/TLS/server/heap failures apart at a glance.
       statusMessage = KOReaderSyncClient::errorString(result);
+      const char* detail = KOReaderSyncClient::lastFailureDetail();
+      if (detail && detail[0]) {
+        statusMessage += " — ";
+        statusMessage += detail;
+      }
     }
     requestUpdate();
     return;
   }
 
+  // Drop the radio while user reads the success screen; full teardown happens at silent reboot.
+  esp_wifi_stop();
+  APP_STATE.koReaderSyncSession.outcome = KOReaderSyncOutcomeState::UPLOAD_COMPLETE;
+  APP_STATE.saveToFile();
+  if (syncIntent == KOReaderSyncIntentState::AUTO_PUSH) {
+    // Auto-push doesn't need user acknowledgement on success; resume immediately
+    // back to the calling activity (RecentBooks / FileBrowser via reader).
+    resumeReader(KOReaderSyncOutcomeState::UPLOAD_COMPLETE);
+    return;
+  }
   {
     RenderLock lock(*this);
     state = UPLOAD_COMPLETE;
+    uploadCompleteTime = millis();
   }
   requestUpdate(true);
 }
 
 void KOReaderSyncActivity::onEnter() {
   Activity::onEnter();
-  ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
+  logSyncMemSnapshot("onEnter_begin");
+  LOG_DBG("KOSync", "Standalone sync start: path=%s spine=%d page=%d/%d intent=%d", epubPath.c_str(), currentSpineIndex,
+          currentPage, totalPagesInSpine, static_cast<int>(syncIntent));
 
   // Check for credentials first
   if (!KOREADER_STORE.hasCredentials()) {
@@ -312,28 +512,82 @@ void KOReaderSyncActivity::onEnter() {
 void KOReaderSyncActivity::onExit() {
   Activity::onExit();
 
+  logSyncMemSnapshot("onExit_before_cleanup");
+  KOReaderSyncClient::endPersistentSession();
+  releaseEpubForMapping();
+  logSyncMemSnapshot("onExit_after_cleanup");
+
   if (wifiActivated) {
     WiFi.disconnect(false);
     delay(30);
-    silentRestartToReader();
+    if (exitToHomeAfterSync) {
+      silentRestart();
+    } else {
+      silentRestartToReader();
+    }
   }
 }
 
+void KOReaderSyncActivity::closeCancelled() {
+  if (closeRequested) {
+    return;
+  }
+
+  resumeReader(KOReaderSyncOutcomeState::CANCELLED);
+}
+
+void KOReaderSyncActivity::resumeReader(const KOReaderSyncOutcomeState outcome, const SyncResult* appliedResult) {
+  if (closeRequested) {
+    return;
+  }
+
+  closeRequested = true;
+  auto& sync = APP_STATE.koReaderSyncSession;
+  sync.outcome = outcome;
+  if (appliedResult) {
+    sync.resultSpineIndex = appliedResult->spineIndex;
+    sync.resultPage = appliedResult->page;
+    sync.resultParagraphIndex = appliedResult->paragraphIndex;
+    sync.resultHasParagraphIndex = appliedResult->hasParagraphIndex;
+    sync.resultListItemIndex = appliedResult->listItemIndex;
+    sync.resultHasListItemIndex = appliedResult->hasListItemIndex;
+  } else if (outcome != KOReaderSyncOutcomeState::APPLIED_REMOTE) {
+    // Only zero the result fields when not resuming an already-applied remote
+    // position. The PULL_REMOTE path pre-saves the mapped result into APP_STATE
+    // before entering APPLY_COMPLETE; zeroing here would overwrite it.
+    sync.resultSpineIndex = 0;
+    sync.resultPage = 0;
+    sync.resultParagraphIndex = 0;
+    sync.resultHasParagraphIndex = false;
+    sync.resultListItemIndex = 0;
+    sync.resultHasListItemIndex = false;
+  }
+  // Honor exit-to-home flag set by reader-close auto-sync — bouncing back into the reader
+  // the user just left would be jarring. The session state is consumed and cleared by the
+  // home destination's normal flow (no reader to apply it to in this case).
+  const bool exitToHome = sync.exitToHomeAfterSync;
+  exitToHomeAfterSync = exitToHome;
+  if (exitToHome) {
+    sync.clear();
+  }
+  APP_STATE.saveToFile();
+  logSyncMemSnapshot("before_resume_reader");
+  if (exitToHome) {
+    activityManager.goHome();
+    return;
+  }
+  activityManager.goToReader(epubPath);
+}
+
 void KOReaderSyncActivity::render(RenderLock&&) {
+  const Rect contentRect = UITheme::getContentRect(renderer, true, false);
+
   renderer.clearScreen();
+  renderer.drawCenteredText(UI_12_FONT_ID, 15 + contentRect.y, tr(STR_KOREADER_SYNC), true, EpdFontFamily::BOLD);
 
-  auto metrics = UITheme::getInstance().getMetrics();
-  Rect screen = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
-
-  GUI.drawHeader(renderer, Rect{screen.x, screen.y + metrics.topPadding, screen.width, metrics.headerHeight},
-                 tr(STR_KOREADER_SYNC));
-
-  int top = screen.y + screen.height / 2 - 40;
   if (state == NO_CREDENTIALS) {
-    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top, tr(STR_NO_CREDENTIALS_MSG), true,
-                              EpdFontFamily::BOLD);
-    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top + 40, tr(STR_KOREADER_SETUP_HINT), true,
-                              EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_10_FONT_ID, 280, tr(STR_NO_CREDENTIALS_MSG), true, EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_10_FONT_ID, 320, tr(STR_KOREADER_SETUP_HINT));
 
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -342,68 +596,62 @@ void KOReaderSyncActivity::render(RenderLock&&) {
   }
 
   if (state == SYNCING || state == UPLOADING) {
-    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top, statusMessage.c_str(), true, EpdFontFamily::BOLD);
-    renderer.displayBuffer();
+    // Title frame already composed into the write buffer above (clearScreen); overlay the popup on
+    // it. drawPopup ships the frame itself — a second displayBuffer() here would ship the stale
+    // post-swap buffer.
+    GUI.drawPopup(renderer, statusMessage.c_str(), /*overlayDisplayedFrame=*/false);
     return;
   }
 
   if (state == SHOWING_RESULT) {
     // Show comparison
-    top = screen.y + metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
-    renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_PROGRESS_FOUND), true, EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_10_FONT_ID, 120, tr(STR_PROGRESS_FOUND), true, EpdFontFamily::BOLD);
 
-    // Remote chapter name requires Epub (loaded lazily in performSync before this state).
-    const int remoteTocIndex = epub->getTocIndexForSpineIndex(remotePosition.spineIndex);
-    const std::string remoteChapter =
-        (remoteTocIndex >= 0) ? epub->getTocItem(remoteTocIndex).title
-                              : (std::string(tr(STR_SECTION_PREFIX)) + std::to_string(remotePosition.spineIndex + 1));
-    // Local chapter name was pre-computed before Epub was released.
-    const std::string localChapter =
-        !localChapterName.empty() ? localChapterName
-                                  : (std::string(tr(STR_SECTION_PREFIX)) + std::to_string(currentSpineIndex + 1));
+    // Get chapter names from TOC
+    const std::string& remoteChapter = remoteChapterLabel;
+    const std::string& localChapter = localChapterLabel;
 
     // Remote progress - chapter and page
-    renderer.drawText(UI_10_FONT_ID, screen.x + metrics.contentSidePadding, top + 40, tr(STR_REMOTE_LABEL), true);
+    renderer.drawText(UI_10_FONT_ID, contentRect.x + 20, 160, tr(STR_REMOTE_LABEL), true);
     char remoteChapterStr[128];
     snprintf(remoteChapterStr, sizeof(remoteChapterStr), "  %s", remoteChapter.c_str());
-    renderer.drawText(UI_10_FONT_ID, screen.x + metrics.contentSidePadding, top + 65, remoteChapterStr);
+    renderer.drawText(UI_10_FONT_ID, contentRect.x + 20, 185, remoteChapterStr);
     char remotePageStr[64];
     snprintf(remotePageStr, sizeof(remotePageStr), tr(STR_PAGE_OVERALL_FORMAT), remotePosition.pageNumber + 1,
              remoteProgress.percentage * 100);
-    renderer.drawText(UI_10_FONT_ID, screen.x + metrics.contentSidePadding, top + 90, remotePageStr);
+    renderer.drawText(UI_10_FONT_ID, contentRect.x + 20, 210, remotePageStr);
 
     if (!remoteProgress.device.empty()) {
       char deviceStr[64];
       snprintf(deviceStr, sizeof(deviceStr), tr(STR_DEVICE_FROM_FORMAT), remoteProgress.device.c_str());
-      renderer.drawText(UI_10_FONT_ID, screen.x + metrics.contentSidePadding, top + 115, deviceStr);
+      renderer.drawText(UI_10_FONT_ID, contentRect.x + 20, 235, deviceStr);
     }
 
     // Local progress - chapter and page
-    renderer.drawText(UI_10_FONT_ID, screen.x + metrics.contentSidePadding, top + 150, tr(STR_LOCAL_LABEL), true);
+    renderer.drawText(UI_10_FONT_ID, contentRect.x + 20, 270, tr(STR_LOCAL_LABEL), true);
     char localChapterStr[128];
     snprintf(localChapterStr, sizeof(localChapterStr), "  %s", localChapter.c_str());
-    renderer.drawText(UI_10_FONT_ID, screen.x + metrics.contentSidePadding, top + 175, localChapterStr);
+    renderer.drawText(UI_10_FONT_ID, contentRect.x + 20, 295, localChapterStr);
     char localPageStr[64];
     snprintf(localPageStr, sizeof(localPageStr), tr(STR_PAGE_TOTAL_OVERALL_FORMAT), currentPage + 1, totalPagesInSpine,
              localProgress.percentage * 100);
-    renderer.drawText(UI_10_FONT_ID, screen.x + metrics.contentSidePadding, top + 200, localPageStr);
+    renderer.drawText(UI_10_FONT_ID, contentRect.x + 20, 320, localPageStr);
 
-    const int optionY = top + 230;
+    const int optionY = 350;
     const int optionHeight = 30;
 
     // Apply option
     if (selectedOption == 0) {
-      renderer.fillRect(screen.x, optionY - 2, screen.width - 1, optionHeight);
+      renderer.fillRect(contentRect.x, optionY - 2, contentRect.width - 1, optionHeight);
     }
-    renderer.drawText(UI_10_FONT_ID, screen.x + metrics.contentSidePadding, optionY, tr(STR_APPLY_REMOTE),
-                      selectedOption != 0);
+    renderer.drawText(UI_10_FONT_ID, contentRect.x + 20, optionY, tr(STR_APPLY_REMOTE), selectedOption != 0);
 
     // Upload option
     if (selectedOption == 1) {
-      renderer.fillRect(screen.x, optionY + optionHeight - 2, screen.width - 1, optionHeight);
+      renderer.fillRect(contentRect.x, optionY + optionHeight - 2, contentRect.width - 1, optionHeight);
     }
-    renderer.drawText(UI_10_FONT_ID, screen.x + metrics.contentSidePadding, optionY + optionHeight,
-                      tr(STR_UPLOAD_LOCAL), selectedOption != 1);
+    renderer.drawText(UI_10_FONT_ID, contentRect.x + 20, optionY + optionHeight, tr(STR_UPLOAD_LOCAL),
+                      selectedOption != 1);
 
     // Bottom button hints
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
@@ -413,8 +661,8 @@ void KOReaderSyncActivity::render(RenderLock&&) {
   }
 
   if (state == NO_REMOTE_PROGRESS) {
-    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top, tr(STR_NO_REMOTE_MSG), true, EpdFontFamily::BOLD);
-    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top + 40, tr(STR_UPLOAD_PROMPT));
+    renderer.drawCenteredText(UI_10_FONT_ID, 280, tr(STR_NO_REMOTE_MSG), true, EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_10_FONT_ID, 320, tr(STR_UPLOAD_PROMPT));
 
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_UPLOAD), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -423,7 +671,16 @@ void KOReaderSyncActivity::render(RenderLock&&) {
   }
 
   if (state == UPLOAD_COMPLETE) {
-    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top, tr(STR_UPLOAD_SUCCESS), true, EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_10_FONT_ID, 300, tr(STR_UPLOAD_SUCCESS), true, EpdFontFamily::BOLD);
+
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
+    GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+    renderer.displayBuffer();
+    return;
+  }
+
+  if (state == APPLY_COMPLETE) {
+    renderer.drawCenteredText(UI_10_FONT_ID, 300, tr(STR_PULL_SUCCESS), true, EpdFontFamily::BOLD);
 
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -432,8 +689,16 @@ void KOReaderSyncActivity::render(RenderLock&&) {
   }
 
   if (state == SYNC_FAILED) {
-    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top, tr(STR_SYNC_FAILED_MSG), true, EpdFontFamily::BOLD);
-    UITheme::drawCenteredText(renderer, screen, UI_10_FONT_ID, top + 40, statusMessage.c_str());
+    renderer.drawCenteredText(UI_10_FONT_ID, 280, tr(STR_SYNC_FAILED_MSG), true, EpdFontFamily::BOLD);
+
+    // Word-wrap the detail message so long TLS/network diagnostics aren't clipped.
+    const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
+    const auto lines = renderer.wrappedText(UI_10_FONT_ID, statusMessage.c_str(), contentRect.width - 20, 4);
+    int y = 320;
+    for (const auto& line : lines) {
+      renderer.drawCenteredText(UI_10_FONT_ID, y, line.c_str());
+      y += lineHeight;
+    }
 
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -442,10 +707,126 @@ void KOReaderSyncActivity::render(RenderLock&&) {
   }
 }
 
+bool KOReaderSyncActivity::ensureEpubLoadedForMapping() {
+  if (epub) {
+    return true;
+  }
+
+  // Reload on demand to keep steady-state sync memory low. Mapping and chapter
+  // lookup need EPUB metadata; TLS steps do not.
+  epub = std::make_shared<Epub>(epubPath, "/.crosspoint");
+  if (!epub->load(true, true)) {
+    LOG_ERR("KOSync", "Failed to reload EPUB for mapping: %s", epubPath.c_str());
+    epub.reset();
+    return false;
+  }
+  epub->setupCacheDir();
+  return true;
+}
+
+bool KOReaderSyncActivity::ensureRemotePositionMapped(const bool closeSessionBeforeMapping) {
+  if (remotePositionMapped) {
+    return true;
+  }
+
+  // Mapping remote->local triggers EPUB inflate work, which needs a 32 KB
+  // contiguous block for the deflate ring buffer. The held-open wolfSSL TLS
+  // session otherwise pins contiguous heap, causing the inflate alloc to fail
+  // and the reverse XPath mapper to silently degrade to lossy percentage-only
+  // mapping. Tearing the session down here
+  // costs a fresh handshake if Upload runs afterwards, but Apply (the common
+  // outcome) wins both heap headroom and round-trip accuracy.
+  if (closeSessionBeforeMapping) {
+    KOReaderSyncClient::endPersistentSession();
+  }
+
+  {
+    RenderLock lock(*this);
+    statusMessage = tr(STR_MAPPING_REMOTE);
+  }
+  requestUpdateAndWait();
+
+  KOReaderPosition koPos = {remoteProgress.progress, remoteProgress.percentage};
+  if (!ensureEpubLoadedForMapping()) {
+    return false;
+  }
+  remotePosition = ProgressMapper::toCrossPoint(epub, koPos, currentSpineIndex, totalPagesInSpine);
+  computeRemoteChapter();
+  releaseEpubForMapping();
+  hasRemoteProgress = true;
+  remotePositionMapped = true;
+  return true;
+}
+
+void KOReaderSyncActivity::releaseEpubForMapping() { epub.reset(); }
+
+bool KOReaderSyncActivity::computeLocalProgressAndChapter() {
+  if (!ensureEpubLoadedForMapping()) {
+    localProgress = KOReaderPosition{};
+    localChapterLabel.clear();
+    return false;
+  }
+
+  CrossPointPosition localPos = {currentSpineIndex,
+                                 currentPage,
+                                 totalPagesInSpine,
+                                 localParagraphIndex,
+                                 hasLocalParagraphIndex,
+                                 0,  // no list item index
+                                 false,
+                                 localXhtmlSeekHint};
+  localProgress = ProgressMapper::toKOReader(epub, localPos);
+
+  const int localTocIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
+  localChapterLabel = (localTocIndex >= 0)
+                          ? epub->getTocItem(localTocIndex).title
+                          : (std::string(tr(STR_SECTION_PREFIX)) + std::to_string(currentSpineIndex + 1));
+
+  if (KOREADER_STORE.getSendMetadata()) {
+    const size_t slash = epubPath.rfind('/');
+    KOReaderMetadata meta;
+    meta.filename = (slash != std::string::npos) ? epubPath.substr(slash + 1) : epubPath;
+    meta.title = epub->getTitle();
+    meta.authors = epub->getAuthor();
+    localDocumentMetadata = std::move(meta);
+  } else {
+    localDocumentMetadata.reset();
+  }
+
+  return true;
+}
+
+void KOReaderSyncActivity::computeRemoteChapter() {
+  if (!epub) {
+    return;
+  }
+  const int remoteTocIndex = epub->getTocIndexForSpineIndex(remotePosition.spineIndex);
+  remoteChapterLabel = (remoteTocIndex >= 0)
+                           ? epub->getTocItem(remoteTocIndex).title
+                           : (std::string(tr(STR_SECTION_PREFIX)) + std::to_string(remotePosition.spineIndex + 1));
+}
+
 void KOReaderSyncActivity::loop() {
-  if (state == NO_CREDENTIALS || state == SYNC_FAILED || state == UPLOAD_COMPLETE) {
+  if (state == NO_CREDENTIALS || state == SYNC_FAILED || state == UPLOAD_COMPLETE || state == APPLY_COMPLETE) {
     if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
-      returnToReader();
+      if (state == APPLY_COMPLETE) {
+        resumeReader(KOReaderSyncOutcomeState::APPLIED_REMOTE);
+      } else if (state == UPLOAD_COMPLETE) {
+        resumeReader(KOReaderSyncOutcomeState::UPLOAD_COMPLETE);
+      } else if (state == SYNC_FAILED || state == NO_CREDENTIALS) {
+        resumeReader(KOReaderSyncOutcomeState::FAILED);
+      } else {
+        resumeReader(KOReaderSyncOutcomeState::CANCELLED);
+      }
+      return;
+    }
+
+    if ((state == UPLOAD_COMPLETE || state == APPLY_COMPLETE) && millis() - uploadCompleteTime >= 3000) {
+      if (state == APPLY_COMPLETE) {
+        resumeReader(KOReaderSyncOutcomeState::APPLIED_REMOTE);
+      } else {
+        resumeReader(KOReaderSyncOutcomeState::UPLOAD_COMPLETE);
+      }
     }
     return;
   }
@@ -464,7 +845,20 @@ void KOReaderSyncActivity::loop() {
 
     if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
       if (selectedOption == 0) {
-        saveProgressAndReturn(remotePosition.spineIndex, remotePosition.pageNumber);
+        if (!ensureRemotePositionMapped()) {
+          {
+            RenderLock lock(*this);
+            state = SYNC_FAILED;
+            statusMessage = tr(STR_SYNC_FAILED_MSG);
+          }
+          requestUpdate(true);
+          return;
+        }
+        // Wifi will be turned off in onExit()
+        const SyncResult result = {remotePosition.spineIndex,     remotePosition.pageNumber,
+                                   remotePosition.paragraphIndex, remotePosition.hasParagraphIndex,
+                                   remotePosition.listItemIndex,  remotePosition.hasListItemIndex};
+        resumeReader(KOReaderSyncOutcomeState::APPLIED_REMOTE, &result);
       } else if (selectedOption == 1) {
         // Upload local progress
         performUpload();
@@ -472,7 +866,7 @@ void KOReaderSyncActivity::loop() {
     }
 
     if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
-      returnToReader();
+      closeCancelled();
     }
     return;
   }
@@ -491,7 +885,7 @@ void KOReaderSyncActivity::loop() {
     }
 
     if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
-      returnToReader();
+      closeCancelled();
     }
     return;
   }

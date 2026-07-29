@@ -2,7 +2,7 @@
 
 ## `book.bin`
 
-### Version 3
+### Version 7
 
 ImHex Pattern:
 
@@ -12,7 +12,7 @@ import std.string;
 import std.core;
 
 // === Configuration ===
-#define EXPECTED_VERSION 3
+#define EXPECTED_VERSION 7
 #define MAX_STRING_LENGTH 65535
 
 // === String Structure ===
@@ -34,8 +34,12 @@ fn format_string(String s) {
 struct Metadata {
     String title [[comment("Book title")]];
     String author [[comment("Book author")]];
+    String language [[comment("BCP47 language tag")]];
     String coverItemHref [[comment("Path to cover image")]];
     String textReferenceHref [[comment("Path to guided first text reference")]];
+    String series [[comment("Series name")]];
+    String seriesIndex [[comment("Series index/position")]];
+    String description [[comment("Book description / blurb")]];
 } [[comment("Book metadata information")]];
 
 // === Spine Entry Structure ===
@@ -70,7 +74,8 @@ struct BookBin {
     u32 lutOffset [[comment("Offset to lookup tables"), color("6BCB77")]];
     u16 spineCount [[comment("Number of spine entries"), color("4D96FF")]];
     u16 tocCount [[comment("Number of TOC entries"), color("FF6B9D")]];
-    
+    u8 tocReliable [[comment("1 if TOC has >=25% spine coverage, 0 otherwise"), color("F4A261")]];
+
     // Metadata section
     Metadata metadata [[comment("Book metadata")]];
     
@@ -104,7 +109,15 @@ if (parsedSize != fileSize) {
 
 ## `section.bin`
 
-### Version 8
+### Current version
+
+`SECTION_FILE_VERSION = 29`. The on-disk layout has evolved past the v21 pattern shown below; the ImHex pattern is preserved for archeology but no longer reflects all fields. Changes since v21 (read `lib/Epub/Epub/Section.cpp` `header::*` constants for the authoritative layout):
+
+- `parseComplete` (`bool`) inserted before `pageCount` so a truncated parse can be detected on reload.
+- `paragraphLutOffset` extended: each per-page entry is now `u32 xhtmlByteOffset + u16 paragraphIndex + u16 listItemIndex` (added the running `<li>` count for KOReader list-item XPath sync).
+- `pageBreakMapOffset` (`u32`) added in the header between `anchorMapOffset` and `paragraphLutOffset`. The block at that offset stores printed-page labels: `u16 count`, then per entry `u16 pageIndex + String label`. Populated from inline `doc-pagebreak` markers and from the per-book `pagelist.bin` (NCX `<pageList>` / EPUB 3 `<nav epub:type="page-list">` / EPUB 2.01 `page-map.xml`). See `docs/epub-toc-navigation.md` for the source-format selection rules.
+
+### Version 21
 
 ImHex Pattern:
 
@@ -114,7 +127,7 @@ import std.string;
 import std.core;
 
 // === Configuration ===
-#define EXPECTED_VERSION 8
+#define EXPECTED_VERSION 21
 #define MAX_STRING_LENGTH 65535
 
 // === String Structure ===
@@ -175,36 +188,63 @@ struct Page {
     PageElement elements[elementCount] [[inline]];
 };
 
+// === Anchor Map Entry ===
+
+struct AnchorEntry {
+    String anchorId [[comment("HTML id attribute value")]];
+    u16 pageNumber [[comment("Page where the anchor appears")]];
+};
+
 // === Section Bin Structure ===
 
 struct SectionBin {
     // Header
     u8 version [[comment("Format version"), color("FFD93D")]];
-    
+
     // Version validation
     if (version != EXPECTED_VERSION) {
         std::error(std::format("Unsupported version: {} (expected {})", version, EXPECTED_VERSION));
     }
-    
+
     // Cache busting parameters
     s32 fontId;
     float lineCompression;
     bool extraParagraphSpacing;
+    u8 paragraphAlignment;
     u16 viewportWidth;
-    u16 vieportHeight;
+    u16 viewportHeight;
     u16 pageCount;
-    u32 lutOffset;
-    
+    bool hyphenationEnabled;
+    bool embeddedStyle;
+    u8 imageRendering;
+    u32 pageLutOffset [[comment("Offset to page offset LUT")]];
+    u32 anchorMapOffset [[comment("Offset to anchor map")]];
+    u32 paragraphLutOffset [[comment("Offset to per-page paragraph LUT (byte offset + <p> index)")]];
+
     Page page[pageCount];
-    
+
+    // === Page Offset LUT ===
     // Validate LUT offset alignment
     u32 currentOffset = $;
-    if (currentOffset != lutOffset) {
-        std::warning(std::format("LUT offset mismatch: expected 0x{:X}, got 0x{:X}", lutOffset, currentOffset));
+    if (currentOffset != pageLutOffset) {
+        std::warning(std::format("Page LUT offset mismatch: expected 0x{:X}, got 0x{:X}", pageLutOffset, currentOffset));
     }
-    
-    // Lookup Tables
-    u32 lut[pageCount];
+
+    u32 pageOffsets[pageCount] [[comment("File offsets to serialized pages")]];
+
+    // === Anchor Map ===
+    u16 anchorCount;
+    AnchorEntry anchors[anchorCount];
+
+    // === Paragraph LUT (deep entries) ===
+    // One entry per page: XHTML byte offset at the page break + 1-based <p> sibling index.
+    // xhtmlByteOffset is the Expat byte position within the decompressed spine XHTML at the
+    // moment the page break fired — used as a seek hint to avoid scanning from byte 0 when
+    // generating XPaths for upload.  0 means no hint (last page, recorded post-parse).
+    // paragraphIndex is 1-based, matching KOReader XPath p[N] convention.
+    struct ParagraphLutEntry { u32 xhtmlByteOffset; u16 paragraphIndex; };
+    u16 paragraphEntryCount;
+    ParagraphLutEntry paragraphLut[paragraphEntryCount];
 };
 
 // === File Parsing ===
@@ -220,26 +260,23 @@ if (parsedSize != fileSize) {
 }
 ```
 
+## `pagelist.bin`
 
-## `instapaper_tokens.txt`
+Per-book cache file produced at index time from one of the EPUB printed-page sources (NCX `<pageList>`, EPUB 3 nav `<nav epub:type="page-list">`, or EPUB 2.01 `page-map.xml`). Consumed once per section build by `Section::createSectionFile`. Absent for books that have no printed-page data.
 
-Plain UTF-8 text, four `key=value` lines, order-independent. Blank and `#`-commented lines ignored.
-
+```text
+u16 entryCount
+struct PageListEntry {
+    String href;    // normalised spine href, e.g. "OEBPS/c9_split_000.xhtml"
+    String anchor;  // fragment id; empty means "start of file"
+    String label;   // printed-page label, e.g. "42" or "iv"
+}
+PageListEntry entries[entryCount];
 ```
-consumer_key=<OAuth 1.0a consumer key from your Instapaper app registration>
-consumer_secret=<OAuth 1.0a consumer secret>
-oauth_token=<user access token>
-oauth_token_secret=<user access token secret>
-```
 
-Generate with `scripts/instapaper_auth.py`. See `README.md` for setup.
+Selection rules (see `docs/epub-toc-navigation.md`):
 
-## `/.crosspoint/instapaper/`
-
-Per-article synthesized EPUB cache. Each article fetched via the Instapaper
-API is wrapped in a minimal STORED-only ZIP archive and stored as
-`article_<bookmark_id>.epub`. The existing EPUB pipeline treats these files
-exactly like any other EPUB, so paginated sections, progress, and rendered
-thumbnails live in the standard `.crosspoint/epub_<hash>/` cache keyed by the
-synthesized filepath. To re-fetch an article (e.g. after Instapaper re-parses
-it), delete both `article_<id>.epub` and the matching `epub_<hash>/` directory.
+- The EPUB 3 nav page-list parser runs first.
+- The NCX `<pageList>` writer runs only if the nav writer produced nothing.
+- The EPUB 2.01 `page-map.xml` writer runs only if `pagelist.bin` doesn't already exist on disk.
+- Inline `doc-pagebreak` markers in XHTML are matched at chapter parse time and don't need the cache file; they coexist with whichever source above won.

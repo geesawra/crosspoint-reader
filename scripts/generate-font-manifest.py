@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """Generate a fonts.json manifest from a directory of .cpfont files.
 
 Scans the input directory (flat or nested by family) for .cpfont files, reads
@@ -16,8 +17,6 @@ The input directory may be flat (all .cpfont files in one dir) or nested
 convention <FamilyName>_<size>.cpfont.
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import os
@@ -25,10 +24,6 @@ import struct
 import sys
 import zlib
 from pathlib import Path
-
-# Import canonical version constants from the shared file in lib/EpdFont/scripts/
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "EpdFont" / "scripts"))
-from cpfont_version import CPFONT_VERSION, FONTS_MANIFEST_VERSION
 
 # --- .cpfont binary format constants ---
 # Global header: 8s magic, H version, H flags, B styleCount, 19x reserved
@@ -41,6 +36,7 @@ STYLE_TOC_ENTRY_SIZE = 32
 STYLE_TOC_ENTRY_FORMAT = "<B31x"
 
 CPFONT_MAGIC = b"CPFONT\x00\x00"
+CPFONT_VERSION = 4
 
 STYLE_NAMES = {0: "regular", 1: "bold", 2: "italic", 3: "bolditalic"}
 
@@ -101,6 +97,17 @@ def read_cpfont_styles(filepath: Path) -> list[str]:
         return styles
 
 
+def compute_crc32(filepath: Path) -> int:
+    # Matches the on-device esp_rom_crc32_le(0, buf, len) accumulator used by
+    # FontDownloadActivity::computeFileCrc32. Originally introduced upstream in
+    # crosspoint-reader PR #1904 ("verify CRC32 checksum for font files").
+    crc = 0
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            crc = zlib.crc32(chunk, crc)
+    return crc & 0xFFFFFFFF
+
+
 def parse_filename(filename: str) -> tuple[str, str] | None:
     """Parse '<FamilyName>_<size>.cpfont' into (family, size_str).
 
@@ -116,15 +123,6 @@ def parse_filename(filename: str) -> tuple[str, str] | None:
     if not size_str.isdigit():
         return None
     return family, size_str
-
-
-def compute_crc32(filepath: Path) -> int:
-    """Compute CRC32 of a file, matching esp_rom_crc32_le(0xFFFFFFFF, ...) ^ 0xFFFFFFFF."""
-    crc = 0
-    with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            crc = zlib.crc32(chunk, crc)
-    return crc & 0xFFFFFFFF
 
 
 def scan_cpfont_files(input_dir: Path) -> dict[str, list[Path]]:
@@ -148,7 +146,7 @@ def scan_cpfont_files(input_dir: Path) -> dict[str, list[Path]]:
 
 
 def build_manifest(
-    families: dict[str, list[Path]], base_url: str
+    families: dict[str, list[Path]], base_url: str, input_dir: Path
 ) -> dict:
     """Build the manifest dict from discovered font families."""
     manifest_families = []
@@ -174,7 +172,7 @@ def build_manifest(
         for filepath in sorted(files, key=lambda p: p.name):
             file_entries.append(
                 {
-                    "name": filepath.name,
+                    "name": filepath.relative_to(input_dir).as_posix(),
                     "size": filepath.stat().st_size,
                     "crc32": compute_crc32(filepath),
                 }
@@ -190,7 +188,9 @@ def build_manifest(
         )
 
     return {
-        "version": FONTS_MANIFEST_VERSION,
+        # v2 adds per-file crc32 (kept optional on the device side so old v1
+        # manifests still load — see FontDownloadActivity::fetchAndParseManifest).
+        "version": 2,
         "baseUrl": base_url,
         "families": manifest_families,
     }
@@ -253,7 +253,7 @@ def main():
     for name, files in sorted(families.items()):
         print(f"  {name}: {len(files)} files")
 
-    manifest = build_manifest(families, base_url)
+    manifest = build_manifest(families, base_url, input_dir)
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

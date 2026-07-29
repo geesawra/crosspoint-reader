@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+// Ported from crosspoint-reader/crosspoint-reader (MIT),
+// initially authored in PR #1810 by znelson and contributors.
 struct JsonCallbacks {
   void* ctx;
   void (*onKey)(void* ctx, const char* key, size_t len);

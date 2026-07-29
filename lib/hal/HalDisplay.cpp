@@ -1,8 +1,14 @@
+#include <BootHeapProbe.h>
 #include <HalDisplay.h>
 #include <HalGPIO.h>
+#include <HalPowerManager.h>
+#include <Logging.h>
+#include <esp_heap_caps.h>
 
-// Global HalDisplay instance
+// Global HalDisplay instance, bracketed by static-init heap probes (slots 0/1).
+static BootHeapProbe s_probePreDisplay(0);
 HalDisplay display;
+static BootHeapProbe s_probePostDisplay(1);
 
 #define SD_SPI_MISO 7
 
@@ -16,20 +22,23 @@ void HalDisplay::begin(bool seamless) {
     einkDisplay.setDisplayX3();
   }
 
+  // Drop the CPU clock while the render task sleeps out a waveform (any BUSY
+  // wait that proves long — the SDK's bus fires the hooks around the ISR sleep
+  // or the poll loop) and restore it before the post-waveform SPI work. Policy
+  // (WiFi / lock / idle low-power guards) lives in HalPowerManager; the driver
+  // just brackets the wait.
+  einkDisplay.setBusyWaitHooks([] { powerManager.enterWaveformWait(); }, [] { powerManager.exitWaveformWait(); });
+
   einkDisplay.begin();
 
-  if (seamless) {
-    // Defuse the SDK's X3 _x3InitialFullSyncsRemaining counter (no-op on X4)
-    // so the first paint isn't promoted to FULL (~770ms). Skips the wakeup-
-    // gated requestResync() below for the same reason.
-    // einkDisplay.skipInitialResync();  // TODO: method missing in SDK
-    return;
-  }
   // Request resync after specific wakeup events to ensure clean display state.
-  const auto wakeupReason = gpio.getWakeupReason();
-  if (wakeupReason == HalGPIO::WakeupReason::PowerButton || wakeupReason == HalGPIO::WakeupReason::AfterFlash ||
-      wakeupReason == HalGPIO::WakeupReason::Other) {
-    einkDisplay.requestResync();
+  // Skip when seamless=true so the current panel content is preserved (Quick Resume).
+  if (!seamless) {
+    const auto wakeupReason = gpio.getWakeupReason();
+    if (wakeupReason == HalGPIO::WakeupReason::PowerButton || wakeupReason == HalGPIO::WakeupReason::AfterFlash ||
+        wakeupReason == HalGPIO::WakeupReason::Other) {
+      einkDisplay.requestResync();
+    }
   }
 }
 
@@ -45,6 +54,18 @@ void HalDisplay::drawImageTransparent(const uint8_t* imageData, uint16_t x, uint
   einkDisplay.drawImageTransparent(imageData, x, y, w, h, fromProgmem);
 }
 
+static uint8_t refreshModeToByte(HalDisplay::RefreshMode mode) {
+  switch (mode) {
+    case HalDisplay::RefreshMode::FAST_REFRESH:
+      return 0x0C;
+    case HalDisplay::RefreshMode::HALF_REFRESH:
+      return 0xD4;
+    case HalDisplay::RefreshMode::FULL_REFRESH:
+    default:
+      return 0x34;
+  }
+}
+
 EInkDisplay::RefreshMode convertRefreshMode(HalDisplay::RefreshMode mode) {
   switch (mode) {
     case HalDisplay::FULL_REFRESH:
@@ -57,18 +78,36 @@ EInkDisplay::RefreshMode convertRefreshMode(HalDisplay::RefreshMode mode) {
   }
 }
 
-void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen) {
-  if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
-    einkDisplay.requestResync(1);
+void HalDisplay::requestResync(uint8_t settlePasses) {
+  if (gpio.deviceIsX3() && settlePasses > pendingX3SettlePasses) {
+    pendingX3SettlePasses = settlePasses;
   }
+}
+
+void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen) {
+  lastRefreshMode = mode;
+  lastDisplayModeByte = refreshModeToByte(mode);
+
+  if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
+    einkDisplay.requestResync(pendingX3SettlePasses > 1 ? pendingX3SettlePasses : 1);
+  } else if (pendingX3SettlePasses > 0) {
+    einkDisplay.requestResync(pendingX3SettlePasses);
+  }
+  pendingX3SettlePasses = 0;
 
   einkDisplay.displayBuffer(convertRefreshMode(mode), turnOffScreen);
 }
 
 void HalDisplay::refreshDisplay(HalDisplay::RefreshMode mode, bool turnOffScreen) {
+  lastRefreshMode = mode;
+  lastDisplayModeByte = refreshModeToByte(mode);
+
   if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
-    einkDisplay.requestResync(1);
+    einkDisplay.requestResync(pendingX3SettlePasses > 1 ? pendingX3SettlePasses : 1);
+  } else if (pendingX3SettlePasses > 0) {
+    einkDisplay.requestResync(pendingX3SettlePasses);
   }
+  pendingX3SettlePasses = 0;
 
   einkDisplay.refreshDisplay(convertRefreshMode(mode), turnOffScreen);
 }
@@ -76,6 +115,83 @@ void HalDisplay::refreshDisplay(HalDisplay::RefreshMode mode, bool turnOffScreen
 void HalDisplay::deepSleep() { einkDisplay.deepSleep(); }
 
 uint8_t* HalDisplay::getFrameBuffer() const { return einkDisplay.getFrameBuffer(); }
+
+void HalDisplay::syncWriteBufferFromActive() const { einkDisplay.syncWriteBufferFromActive(); }
+
+void HalDisplay::releaseBuffers() { einkDisplay.releaseBuffers(); }
+
+// FBUF: centralized framebuffer-state trace. Every secondary-buffer / RED-RAM / single-buffer
+// transition logs here so a ghosting regression can be tracked to the exact op that left the panel
+// diffing against the wrong baseline. free=largest contiguous 8-bit block (what a realloc needs).
+static uint32_t fbufContig() { return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT); }
+
+bool HalDisplay::releaseSecondaryBuffer() {
+  // Double-release guard. releaseSecondaryBuffer() returning false means the
+  // secondary buffer was already gone — i.e. a caller released it without
+  // tracking that it had, then released again. The release windows here are
+  // NOT lexically scoped (Background-C releases in buildSection and restores in
+  // recoverSecondaryBufferIfNeeded(), across page turns), so a lost release-flag
+  // is a real, plausible bug rather than a theoretical one. It is not fatal —
+  // the buffer is already freed — but it signals confused ownership that can
+  // strand the reader in degraded (single-buffer) mode, so log it loudly.
+  if (!einkDisplay.hasSecondaryBuffer()) {
+    LOG_INF("FBUF", "releaseSecondary called but secondary already released (double-release; caller lost track)");
+    return false;
+  }
+  const bool ok = einkDisplay.releaseSecondaryBuffer();
+  LOG_INF("FBUF", "releaseSecondary -> %d (hasSecondary=%d redSynced=%d contig=%lu)", ok ? 1 : 0,
+          einkDisplay.hasSecondaryBuffer() ? 1 : 0, einkDisplay.isRedRamSynced() ? 1 : 0,
+          static_cast<unsigned long>(fbufContig()));
+  return ok;
+}
+
+bool HalDisplay::reallocSecondaryBuffer() {
+  const bool ok = einkDisplay.reallocSecondaryBuffer();
+  LOG_INF("FBUF", "reallocSecondary -> %d (hasSecondary=%d redSynced=%d contig=%lu)", ok ? 1 : 0,
+          einkDisplay.hasSecondaryBuffer() ? 1 : 0, einkDisplay.isRedRamSynced() ? 1 : 0,
+          static_cast<unsigned long>(fbufContig()));
+  return ok;
+}
+
+bool HalDisplay::hasSecondaryBuffer() const { return einkDisplay.hasSecondaryBuffer(); }
+
+uint8_t* HalDisplay::borrowSecondaryBuffer(size_t* size) {
+  uint8_t* buf = einkDisplay.borrowSecondaryBuffer(size);
+  LOG_INF("FBUF", "borrowSecondary -> %d (size=%lu hasSecondary=%d)", buf ? 1 : 0,
+          static_cast<unsigned long>(buf && size ? *size : 0), einkDisplay.hasSecondaryBuffer() ? 1 : 0);
+  return buf;
+}
+
+bool HalDisplay::returnSecondaryBuffer() {
+  const bool ok = einkDisplay.returnSecondaryBuffer();
+  LOG_INF("FBUF", "returnSecondary -> %d (hasSecondary=%d)", ok ? 1 : 0, einkDisplay.hasSecondaryBuffer() ? 1 : 0);
+  return ok;
+}
+
+void HalDisplay::setSingleBufferFastDiff(bool enabled) {
+  LOG_INF("FBUF", "singleBufferFastDiff=%d (hasSecondary=%d redSynced=%d)", enabled ? 1 : 0,
+          einkDisplay.hasSecondaryBuffer() ? 1 : 0, einkDisplay.isRedRamSynced() ? 1 : 0);
+  einkDisplay.setSingleBufferFastDiff(enabled);
+}
+
+void HalDisplay::triggerDisplay(RefreshMode mode, bool turnOffScreen) {
+  einkDisplay.triggerDisplay(static_cast<EInkDisplay::RefreshMode>(mode), turnOffScreen);
+}
+
+void HalDisplay::completeDisplay() { einkDisplay.completeDisplay(); }
+
+void HalDisplay::triggerDisplayAsync(RefreshMode mode, bool turnOffScreen) {
+  einkDisplay.triggerDisplayAsync(convertRefreshMode(mode), turnOffScreen);
+}
+
+void HalDisplay::finishDisplayAsync() { einkDisplay.finishDisplayAsync(); }
+
+bool HalDisplay::isRefreshPending() const { return einkDisplay.isRefreshPending(); }
+bool HalDisplay::isRedRamSynced() const { return einkDisplay.isRedRamSynced(); }
+
+HalDisplay::RefreshMode HalDisplay::getLastRefreshMode() const { return lastRefreshMode; }
+
+uint8_t HalDisplay::getLastDisplayModeByte() const { return lastDisplayModeByte; }
 
 void HalDisplay::copyGrayscaleBuffers(const uint8_t* lsbBuffer, const uint8_t* msbBuffer) {
   einkDisplay.copyGrayscaleBuffers(lsbBuffer, msbBuffer);
@@ -85,9 +201,27 @@ void HalDisplay::copyGrayscaleLsbBuffers(const uint8_t* lsbBuffer) { einkDisplay
 
 void HalDisplay::copyGrayscaleMsbBuffers(const uint8_t* msbBuffer) { einkDisplay.copyGrayscaleMsbBuffers(msbBuffer); }
 
+void HalDisplay::syncRedRamFromFrameBuffer() {
+  einkDisplay.syncRedRamFromFrameBuffer();
+  LOG_INF("FBUF", "syncRedRamFromFrameBuffer (hasSecondary=%d redSynced=%d)", einkDisplay.hasSecondaryBuffer() ? 1 : 0,
+          einkDisplay.isRedRamSynced() ? 1 : 0);
+}
+
 void HalDisplay::cleanupGrayscaleBuffers(const uint8_t* bwBuffer) { einkDisplay.cleanupGrayscaleBuffers(bwBuffer); }
 
+void HalDisplay::cleanupGrayscaleWithPreviousBuffer() { einkDisplay.cleanupGrayscaleWithPreviousBuffer(); }
+
 void HalDisplay::displayGrayBuffer(bool turnOffScreen) { einkDisplay.displayGrayBuffer(turnOffScreen); }
+
+void HalDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool turnOffScreen) {
+  einkDisplay.displayWindow(x, y, w, h, turnOffScreen);
+}
+
+bool HalDisplay::deviceIsX3() const { return einkDisplay.isX3Mode(); }
+
+void HalDisplay::setFastGrayscaleLut(bool fast) { einkDisplay.setFastGrayscaleLut(fast); }
+
+bool HalDisplay::getFastGrayscaleLut() const { return einkDisplay.getFastGrayscaleLut(); }
 
 uint16_t HalDisplay::getDisplayWidth() const { return einkDisplay.getDisplayWidth(); }
 

@@ -3,8 +3,7 @@
 #include <GfxRenderer.h>
 #include <I18n.h>
 
-#include <cstring>
-
+#include "CrossPointSettings.h"
 #include "KOReaderAuthActivity.h"
 #include "KOReaderCredentialStore.h"
 #include "MappedInputManager.h"
@@ -12,47 +11,73 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 
-namespace {
-constexpr int MENU_ITEMS = 5;
-const StrId menuNames[MENU_ITEMS] = {StrId::STR_USERNAME, StrId::STR_PASSWORD, StrId::STR_SYNC_SERVER_URL,
-                                     StrId::STR_DOCUMENT_MATCHING, StrId::STR_AUTHENTICATE};
-}  // namespace
-
-void KOReaderSettingsActivity::onEnter() {
-  Activity::onEnter();
-
-  selectedIndex = 0;
-  requestUpdate();
+KOReaderSettingsActivity::KOReaderSettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
+    : MenuListActivity("KOReaderSettings", renderer, mappedInput) {
+  buildMenuItems();
 }
 
-void KOReaderSettingsActivity::onExit() { Activity::onExit(); }
+void KOReaderSettingsActivity::buildMenuItems() {
+  menuItems.reserve(8);
+  // Username, Password, Server URL: ACTION items with custom value display
+  menuItems.push_back(SettingInfo::Action(StrId::STR_SYNC_SERVER_URL, SettingAction::None)
+                          .withSubcategory(StrId::STR_MENU_KOSYNC_SERVER));
+  menuItems.push_back(SettingInfo::Action(StrId::STR_USERNAME, SettingAction::None));
+  menuItems.push_back(SettingInfo::Action(StrId::STR_PASSWORD, SettingAction::None));
 
-void KOReaderSettingsActivity::loop() {
-  if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
-    finish();
-    return;
+  // Document matching: DynamicEnum toggling between Filename and Binary
+  menuItems.push_back(SettingInfo::DynamicEnum(
+                          StrId::STR_DOCUMENT_MATCHING, {StrId::STR_FILENAME, StrId::STR_BINARY},
+                          [](const void*) -> uint8_t { return static_cast<uint8_t>(KOREADER_STORE.getMatchMethod()); },
+                          [](void*, uint8_t v) {
+                            KOREADER_STORE.setMatchMethod(static_cast<DocumentMatchMethod>(v));
+                            KOREADER_STORE.saveToFile();
+                          })
+                          .withSubcategory(StrId::STR_MENU_KOSYNC_BEHAVIOR));
+  menuItems.push_back(SettingInfo::Toggle(StrId::STR_KO_SYNC_ON_BOOK_CLOSE, &CrossPointSettings::koSyncOnBookClose,
+                                          "koSyncOnBookClose"));
+  {
+    SettingInfo s;
+    s.nameId = StrId::STR_SEND_METADATA;
+    s.type = SettingType::TOGGLE;
+    s.valueGetter = [](const void*) -> uint8_t { return KOREADER_STORE.getSendMetadata() ? 1u : 0u; };
+    s.valueSetter = [](void*, uint8_t v) {
+      KOREADER_STORE.setSendMetadata(v != 0);
+      KOREADER_STORE.saveToFile();
+    };
+    menuItems.push_back(std::move(s));
   }
 
-  if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
-    handleSelection();
-    return;
-  }
-
-  // Handle navigation
-  buttonNavigator.onNext([this] {
-    selectedIndex = (selectedIndex + 1) % MENU_ITEMS;
-    requestUpdate();
-  });
-
-  buttonNavigator.onPrevious([this] {
-    selectedIndex = (selectedIndex + MENU_ITEMS - 1) % MENU_ITEMS;
-    requestUpdate();
-  });
+  // Authenticate and Register: ACTION items
+  menuItems.push_back(
+      SettingInfo::Action(StrId::STR_AUTHENTICATE, SettingAction::None).withSubcategory(StrId::STR_MENU_KOSYNC_AUTH));
+  menuItems.push_back(SettingInfo::Action(StrId::STR_REGISTER, SettingAction::None));
 }
 
-void KOReaderSettingsActivity::handleSelection() {
-  if (selectedIndex == 0) {
-    // Username
+std::string KOReaderSettingsActivity::getItemValueString(int index) const {
+  const auto& item = menuItems[index];
+
+  if (item.nameId == StrId::STR_USERNAME) {
+    auto username = KOREADER_STORE.getUsername();
+    return username.empty() ? std::string(tr(STR_NOT_SET)) : username;
+  }
+  if (item.nameId == StrId::STR_PASSWORD) {
+    return KOREADER_STORE.getPassword().empty() ? std::string(tr(STR_NOT_SET)) : std::string("******");
+  }
+  if (item.nameId == StrId::STR_SYNC_SERVER_URL) {
+    auto serverUrl = KOREADER_STORE.getServerUrl();
+    return serverUrl.empty() ? std::string(tr(STR_DEFAULT_VALUE)) : serverUrl;
+  }
+  if (item.nameId == StrId::STR_AUTHENTICATE || item.nameId == StrId::STR_REGISTER) {
+    return KOREADER_STORE.hasCredentials() ? "" : std::string("[") + tr(STR_SET_CREDENTIALS_FIRST) + "]";
+  }
+
+  return MenuListActivity::getItemValueString(index);
+}
+
+void KOReaderSettingsActivity::onActionSelected(int index) {
+  const auto& item = menuItems[index];
+
+  if (item.nameId == StrId::STR_USERNAME) {
     startActivityForResult(std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_KOREADER_USERNAME),
                                                                    KOREADER_STORE.getUsername(), 64, InputType::Text),
                            [this](const ActivityResult& result) {
@@ -62,8 +87,7 @@ void KOReaderSettingsActivity::handleSelection() {
                                KOREADER_STORE.saveToFile();
                              }
                            });
-  } else if (selectedIndex == 1) {
-    // Password
+  } else if (item.nameId == StrId::STR_PASSWORD) {
     startActivityForResult(
         std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_KOREADER_PASSWORD),
                                                 KOREADER_STORE.getPassword(), 64, InputType::Password),
@@ -74,8 +98,7 @@ void KOReaderSettingsActivity::handleSelection() {
             KOREADER_STORE.saveToFile();
           }
         });
-  } else if (selectedIndex == 2) {
-    // Sync Server URL - prefill with https:// if empty to save typing
+  } else if (item.nameId == StrId::STR_SYNC_SERVER_URL) {
     const std::string currentUrl = KOREADER_STORE.getServerUrl();
     const std::string prefillUrl = currentUrl.empty() ? "https://" : currentUrl;
     startActivityForResult(std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, tr(STR_SYNC_SERVER_URL),
@@ -89,21 +112,16 @@ void KOReaderSettingsActivity::handleSelection() {
                                KOREADER_STORE.saveToFile();
                              }
                            });
-  } else if (selectedIndex == 3) {
-    // Document Matching - toggle between Filename and Binary
-    const auto current = KOREADER_STORE.getMatchMethod();
-    const auto newMethod =
-        (current == DocumentMatchMethod::FILENAME) ? DocumentMatchMethod::BINARY : DocumentMatchMethod::FILENAME;
-    KOREADER_STORE.setMatchMethod(newMethod);
-    KOREADER_STORE.saveToFile();
-    requestUpdate();
-  } else if (selectedIndex == 4) {
-    // Authenticate
-    if (!KOREADER_STORE.hasCredentials()) {
-      // Can't authenticate without credentials - just show message briefly
-      return;
-    }
-    startActivityForResult(std::make_unique<KOReaderAuthActivity>(renderer, mappedInput), [](const ActivityResult&) {});
+  } else if (item.nameId == StrId::STR_AUTHENTICATE) {
+    if (!KOREADER_STORE.hasCredentials()) return;
+    startActivityForResult(
+        std::make_unique<KOReaderAuthActivity>(renderer, mappedInput, KOReaderAuthActivity::Mode::LOGIN),
+        [](const ActivityResult&) {});
+  } else if (item.nameId == StrId::STR_REGISTER) {
+    if (!KOREADER_STORE.hasCredentials()) return;
+    startActivityForResult(
+        std::make_unique<KOReaderAuthActivity>(renderer, mappedInput, KOReaderAuthActivity::Mode::REGISTER),
+        [](const ActivityResult&) {});
   }
 }
 
@@ -111,38 +129,15 @@ void KOReaderSettingsActivity::render(RenderLock&&) {
   renderer.clearScreen();
 
   const auto& metrics = UITheme::getInstance().getMetrics();
-  const auto pageWidth = renderer.getScreenWidth();
-  const auto pageHeight = renderer.getScreenHeight();
+  const Rect contentRect = UITheme::getContentRect(renderer, true, false);
 
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_KOREADER_SYNC));
+  GUI.drawHeader(renderer, Rect{contentRect.x, metrics.topPadding, contentRect.width, metrics.headerHeight},
+                 tr(STR_KOREADER_SYNC));
 
   const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
-  const int contentHeight = pageHeight - contentTop - metrics.buttonHintsHeight - metrics.verticalSpacing * 2;
-  GUI.drawList(
-      renderer, Rect{0, contentTop, pageWidth, contentHeight}, static_cast<int>(MENU_ITEMS),
-      static_cast<int>(selectedIndex), [](int index) { return std::string(I18N.get(menuNames[index])); }, nullptr,
-      nullptr,
-      [this](int index) {
-        // Draw status for each setting
-        if (index == 0) {
-          auto username = KOREADER_STORE.getUsername();
-          return username.empty() ? std::string(tr(STR_NOT_SET)) : username;
-        } else if (index == 1) {
-          return KOREADER_STORE.getPassword().empty() ? std::string(tr(STR_NOT_SET)) : std::string("******");
-        } else if (index == 2) {
-          auto serverUrl = KOREADER_STORE.getServerUrl();
-          return serverUrl.empty() ? std::string(tr(STR_DEFAULT_VALUE)) : serverUrl;
-        } else if (index == 3) {
-          return KOREADER_STORE.getMatchMethod() == DocumentMatchMethod::FILENAME ? std::string(tr(STR_FILENAME))
-                                                                                  : std::string(tr(STR_BINARY));
-        } else if (index == 4) {
-          return KOREADER_STORE.hasCredentials() ? "" : std::string("[") + tr(STR_SET_CREDENTIALS_FIRST) + "]";
-        }
-        return std::string(tr(STR_NOT_SET));
-      },
-      true);
+  const int contentHeight = contentRect.height - contentTop - metrics.verticalSpacing * 2;
+  drawMenuList(Rect{contentRect.x, contentTop, contentRect.width, contentHeight});
 
-  // Draw help text at bottom
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 

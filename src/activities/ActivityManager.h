@@ -9,14 +9,30 @@
 #include <string>
 #include <vector>
 
+#include "ButtonEventManager.h"
+#include "CrossPointSettings.h"
 #include "GfxRenderer.h"
 #include "MappedInputManager.h"
-#include "util/ScreenshotInfo.h"
 
 class Activity;    // forward declaration
 class RenderLock;  // forward declaration
 
-enum class HomeMenuItem { NONE, FILE_BROWSER, RECENTS, OPDS_BROWSER, READ_IT_LATER, FILE_TRANSFER, SETTINGS_MENU };
+// Where a "child" activity (launched via one of the replaceWith* helpers) should route
+// control when it exits successfully. See ActivityManager::returnFromChild().
+enum class ReturnTo : uint8_t { Home, FileBrowser, RecentBooks, GlobalBookmarks };
+
+// Minimal state the returning parent needs to restore its previous view (directory,
+// focused item, list index, or bookmark selection). Kept as a plain struct stored by
+// value on the ActivityManager — single instance, overwritten per transition, no heap
+// churn beyond the small strings.
+struct ReturnHint {
+  ReturnTo target = ReturnTo::Home;
+  std::string path;              // FileBrowser directory to restore
+  std::string selectName;        // item to re-focus in a list (file name, book title)
+  int selectIndex = -1;          // e.g. Recents index
+  std::string selectionContext;  // optional activity-specific restore key
+  int selectBookmarkIndex = -1;  // optional bookmark index for GlobalBookmarks
+};
 
 /**
  * ActivityManager
@@ -38,6 +54,7 @@ class ActivityManager {
  protected:
   GfxRenderer& renderer;
   MappedInputManager& mappedInput;
+  ButtonEventManager& buttonEvents;
   std::vector<std::unique_ptr<Activity>> stackActivities;
   std::unique_ptr<Activity> currentActivity;
 
@@ -63,12 +80,26 @@ class ActivityManager {
 
   // Whether to trigger a render after the current loop()
   // This variable must only be set by the main loop, to avoid race conditions
-  bool requestedUpdate = false;
+  volatile bool requestedUpdate = false;
+
+  // When true, input events are consumed (discarded) until all buttons are released
+  // and no press/release events remain.  Armed automatically on activity transitions
+  // (push / pop / replace) so that the button used to leave one activity cannot bleed
+  // into the next one.
+  bool drainInput = false;
+
+  // Where returnFromChild() should route to. Set by replaceWith*() helpers and
+  // preserved across plain goTo*() chains so a chained navigation flow can still
+  // restore its original parent state. Cleared only by returnFromChild() or by
+  // explicit goHome()/replaceWith*() calls, not by ordinary goTo*() transitions.
+  // Relevant symbols: ReturnHint, returnHint, hasReturnHint, returnFromChild(),
+  // goHome(), goTo*(), replaceWith*().
+  ReturnHint returnHint;
+  bool hasReturnHint = false;
 
  public:
   explicit ActivityManager(GfxRenderer& renderer, MappedInputManager& mappedInput)
-      : renderer(renderer), mappedInput(mappedInput), renderingMutex(xSemaphoreCreateMutex()) {
-    assert(renderingMutex != nullptr && "Failed to create rendering mutex");
+      : renderer(renderer), mappedInput(mappedInput), buttonEvents(globalButtonEvents()) {
     stackActivities.reserve(10);
   }
   ~ActivityManager() { assert(false); /* should never be called */ };
@@ -81,17 +112,49 @@ class ActivityManager {
 
   // goTo... functions are convenient wrapper for replaceActivity()
   void goToFileTransfer();
+  void goToSerialTransfer();  // direct entry (also used by the boot-into-transfer path)
   void goToSettings();
-  void goToFileBrowser(std::string path = {});
-  void goToRecentBooks();
+  void goToClockSettings();
+  void goToFileBrowser(std::string path = {}, std::string focusName = {});
+  void goToRecentBooks(int focusIndex = -1);
+  void goToGlobalBookmarks();
+  void goToGlobalBookmarks(ReturnHint hint);
   void goToBrowser();
-  void goToReadItLater();
+  void goToBrowserWithSearch(std::string query);
   void goToReader(std::string path);
+  void goToReadItLater();
+  void goToKOReaderSync();
+  // fromTimeout=true marks this as an auto-sleep (used to gate Quick Resume on Timeout).
   void goToSleep(bool fromTimeout = false);
   void goToBoot();
   void goToFullScreenMessage(std::string message, EpdFontFamily::Style style = EpdFontFamily::REGULAR);
-  void goToCrashReport();
-  void goHome(HomeMenuItem initialMenuItem = HomeMenuItem::NONE);
+  void goToWeather();
+  void goHome(std::string focusBookPath = {}, int focusSelectorIndex = -1);
+
+  // Replace-with-hint helpers: destroy the current activity before launching the new
+  // one (freeing its memory) and record where to route control when the new activity
+  // exits. Consumed by returnFromChild().
+  void replaceWithReader(std::string path, ReturnHint hint);
+  void replaceWithFileBrowser(std::string path, ReturnHint hint, std::string focusName = {});
+  void replaceWithRecentBooks(ReturnHint hint);
+
+  // Called by a "child" activity on successful exit. Consults the stored ReturnHint,
+  // clears it, and dispatches to the corresponding parent with restoration args. If
+  // no hint is set, defaults to goHome().
+  void returnFromChild();
+
+  // Record a ReturnHint before calling any plain goTo*() helper. Allows an activity
+  // (e.g. Home) to declare "when this flow ends, come back here with this state" for
+  // transitions where we don't want a dedicated replaceWith*() wrapper.
+  // Cleared by returnFromChild() or by an explicit goHome()/replaceWith*() call.
+  void setReturnHint(ReturnHint hint) {
+    returnHint = std::move(hint);
+    hasReturnHint = true;
+  }
+  void clearReturnHint() {
+    returnHint = {};
+    hasReturnHint = false;
+  }
 
   // This will move current activity to stack instead of deleting it
   void pushActivity(std::unique_ptr<Activity>&& activity);
@@ -101,12 +164,22 @@ class ActivityManager {
   void popActivity();
 
   bool preventAutoSleep() const;
-  bool isInReaderContext() const;
+  bool isReaderActivity() const;
   bool skipLoopDelay() const;
-  ScreenshotInfo getScreenshotInfo() const;
 
-  // Notify the current activity that the physical orientation has changed.
-  void notifyOrientationChanged(uint8_t orientation);
+  // True while the current activity owns the raw serial input stream (see
+  // Activity::ownsSerialInput()). main.cpp consults this to suppress its
+  // line-based `CMD:` serial reader so it doesn't steal protocol bytes.
+  bool currentOwnsSerialInput() const;
+
+  // Forward to the current activity so it can redraw the visible screen into the frame
+  // buffer before a raw capture (e.g. a screenshot). See Activity::prepareFramebufferForCapture().
+  void prepareFramebufferForCapture();
+
+  // Dispatch a globally-configured button action to the current activity.
+  // Reader-specific actions (page navigation, TOC, bookmarks, footnotes) are forwarded
+  // only when the current activity is a reader; others are no-ops in other contexts.
+  void dispatchButtonAction(CrossPointSettings::BUTTON_ACTION action);
 
   // If immediate is true, the update will be triggered immediately.
   // Otherwise, it will be deferred until the end of the current loop iteration.

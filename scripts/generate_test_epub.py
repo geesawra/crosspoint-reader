@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
 """
-Generate test EPUBs for image rendering verification.
+Generate test EPUBs for rendering verification.
 
-Creates EPUBs with annotated JPEG and PNG images to verify:
-- Grayscale rendering (4 levels)
-- Image scaling
-- Image centering
-- Cache performance
-- Page serialization
+Creates EPUBs to verify:
+- Image: Grayscale rendering (4 levels), scaling, centering, cache performance
+- Text: pre element line breaks, blank lines, nested code element
 """
 
 import os
-import sys
 import zipfile
 from pathlib import Path
-
-if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
-    print(__doc__.strip())
-    sys.exit(0)
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -29,15 +21,35 @@ OUTPUT_DIR = Path(__file__).parent.parent / "test" / "epubs"
 SCREEN_WIDTH = 480
 SCREEN_HEIGHT = 800
 
+
 def get_font(size=20):
     """Get a font, falling back to default if needed."""
-    try:
-        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
-    except:
+    import sys
+
+    candidates = []
+    if sys.platform == "darwin":
+        candidates = [
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/Library/Fonts/Arial.ttf",
+        ]
+    elif sys.platform == "win32":
+        windir = os.environ.get("WINDIR", "C:\\Windows")
+        candidates = [
+            os.path.join(windir, "Fonts", "arial.ttf"),
+            os.path.join(windir, "Fonts", "calibri.ttf"),
+        ]
+    else:
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        ]
+    for path in candidates:
         try:
-            return ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans.ttf", size)
+            return ImageFont.truetype(path, size)
         except:
-            return ImageFont.load_default()
+            continue
+    return ImageFont.load_default()
+
 
 def draw_text_centered(draw, y, text, font, fill=0):
     """Draw centered text at given y position."""
@@ -46,6 +58,7 @@ def draw_text_centered(draw, y, text, font, fill=0):
     x = (draw.im.size[0] - text_width) // 2
     draw.text((x, y), text, font=font, fill=fill)
 
+
 def draw_text_wrapped(draw, x, y, text, font, max_width, fill=0):
     """Draw text with word wrapping."""
     words = text.split()
@@ -53,29 +66,37 @@ def draw_text_wrapped(draw, x, y, text, font, max_width, fill=0):
     current_line = []
 
     for word in words:
-        test_line = ' '.join(current_line + [word])
+        test_line = " ".join(current_line + [word])
         bbox = draw.textbbox((0, 0), test_line, font=font)
         if bbox[2] - bbox[0] <= max_width:
             current_line.append(word)
         else:
             if current_line:
-                lines.append(' '.join(current_line))
+                lines.append(" ".join(current_line))
             current_line = [word]
     if current_line:
-        lines.append(' '.join(current_line))
+        lines.append(" ".join(current_line))
 
-    line_height = font.size + 4 if hasattr(font, 'size') else 20
+    line_height = font.size + 4 if hasattr(font, "size") else 20
     for i, line in enumerate(lines):
         draw.text((x, y + i * line_height), line, font=font, fill=fill)
 
     return len(lines) * line_height
 
-def create_grayscale_test_image(filename, is_png=True):
+
+def save_test_image(img, filename, is_png, progressive=False):
+    if is_png:
+        img.save(filename, "PNG")
+    else:
+        img.save(filename, "JPEG", quality=95, progressive=progressive)
+
+
+def create_grayscale_test_image(filename, is_png=True, progressive=False):
     """
     Create image with 4 grayscale squares to verify 4-level rendering.
     """
     width, height = 400, 600
-    img = Image.new('L', (width, height), 255)
+    img = Image.new("L", (width, height), 255)
     draw = ImageDraw.Draw(img)
     font = get_font(16)
     font_small = get_font(14)
@@ -104,13 +125,18 @@ def create_grayscale_test_image(filename, is_png=True):
         x = (width - square_size) // 2
 
         # Draw square with border
-        draw.rectangle([x-2, y-2, x + square_size + 2, y + square_size + 2], fill=0)
+        draw.rectangle([x - 2, y - 2, x + square_size + 2, y + square_size + 2], fill=0)
         draw.rectangle([x, y, x + square_size, y + square_size], fill=gray_value)
 
         # Label below square
         bbox = draw.textbbox((0, 0), label, font=font_small)
         label_width = bbox[2] - bbox[0]
-        draw.text(((width - label_width) // 2, y + square_size + 5), label, font=font_small, fill=0)
+        draw.text(
+            ((width - label_width) // 2, y + square_size + 5),
+            label,
+            font=font_small,
+            fill=0,
+        )
 
     # Instructions at bottom (well below the last square)
     y = height - 70
@@ -119,28 +145,31 @@ def create_grayscale_test_image(filename, is_png=True):
     draw_text_centered(draw, y + 38, "muddy/indistinct grays", font_small, fill=64)
 
     # Save
-    if is_png:
-        img.save(filename, 'PNG')
-    else:
-        img.save(filename, 'JPEG', quality=95)
+    save_test_image(img, filename, is_png, progressive)
 
-def create_centering_test_image(filename, is_png=True):
+
+def create_centering_test_image(filename, is_png=True, progressive=False):
     """
     Create image with border markers to verify centering.
     """
     width, height = 350, 400
-    img = Image.new('L', (width, height), 255)
+    img = Image.new("L", (width, height), 255)
     draw = ImageDraw.Draw(img)
     font = get_font(16)
     font_small = get_font(14)
 
     # Draw border
-    draw.rectangle([0, 0, width-1, height-1], outline=0, width=3)
+    draw.rectangle([0, 0, width - 1, height - 1], outline=0, width=3)
 
     # Corner markers
     marker_size = 20
-    for x, y in [(0, 0), (width-marker_size, 0), (0, height-marker_size), (width-marker_size, height-marker_size)]:
-        draw.rectangle([x, y, x+marker_size, y+marker_size], fill=0)
+    for x, y in [
+        (0, 0),
+        (width - marker_size, 0),
+        (0, height - marker_size),
+        (width - marker_size, height - marker_size),
+    ]:
+        draw.rectangle([x, y, x + marker_size, y + marker_size], fill=0)
 
     # Center cross
     cx, cy = width // 2, height // 2
@@ -157,46 +186,62 @@ def create_centering_test_image(filename, is_png=True):
 
     y = 150
     draw_text_centered(draw, y, "Check:", font_small, fill=0)
-    draw_text_centered(draw, y + 25, "- Equal margins left & right", font_small, fill=64)
+    draw_text_centered(
+        draw, y + 25, "- Equal margins left & right", font_small, fill=64
+    )
     draw_text_centered(draw, y + 45, "- All 4 corners visible", font_small, fill=64)
-    draw_text_centered(draw, y + 65, "- Border is complete rectangle", font_small, fill=64)
+    draw_text_centered(
+        draw, y + 65, "- Border is complete rectangle", font_small, fill=64
+    )
 
     # Pass/fail
     y = height - 80
-    draw_text_centered(draw, y, "PASS: Centered, all corners visible", font_small, fill=0)
+    draw_text_centered(
+        draw, y, "PASS: Centered, all corners visible", font_small, fill=0
+    )
     draw_text_centered(draw, y + 20, "FAIL: Off-center or cropped", font_small, fill=64)
 
-    if is_png:
-        img.save(filename, 'PNG')
-    else:
-        img.save(filename, 'JPEG', quality=95)
+    save_test_image(img, filename, is_png, progressive)
 
-def create_scaling_test_image(filename, is_png=True):
+
+def create_scaling_test_image(filename, is_png=True, progressive=False):
     """
     Create large image to verify scaling works.
     """
     # Make image larger than screen but within decoder limits (max 2048x1536)
     width, height = 1200, 1500
-    img = Image.new('L', (width, height), 240)
+    img = Image.new("L", (width, height), 240)
     draw = ImageDraw.Draw(img)
     font = get_font(48)
     font_medium = get_font(32)
     font_small = get_font(24)
 
     # Border
-    draw.rectangle([0, 0, width-1, height-1], outline=0, width=8)
-    draw.rectangle([20, 20, width-21, height-21], outline=128, width=4)
+    draw.rectangle([0, 0, width - 1, height - 1], outline=0, width=8)
+    draw.rectangle([20, 20, width - 21, height - 21], outline=128, width=4)
 
     # Title
     draw_text_centered(draw, 60, "SCALING TEST", font, fill=0)
-    draw_text_centered(draw, 130, f"Original: {width}x{height} (larger than screen)", font_medium, fill=64)
+    draw_text_centered(
+        draw,
+        130,
+        f"Original: {width}x{height} (larger than screen)",
+        font_medium,
+        fill=64,
+    )
 
     # Grid pattern to verify scaling quality
     grid_start_y = 220
     grid_size = 400
     cell_size = 50
 
-    draw_text_centered(draw, grid_start_y - 40, "Grid pattern (check for artifacts):", font_small, fill=0)
+    draw_text_centered(
+        draw,
+        grid_start_y - 40,
+        "Grid pattern (check for artifacts):",
+        font_small,
+        fill=0,
+    )
 
     grid_x = (width - grid_size) // 2
     for row in range(grid_size // cell_size):
@@ -210,7 +255,9 @@ def create_scaling_test_image(filename, is_png=True):
 
     # Size indicator bars
     y = grid_start_y + grid_size + 60
-    draw_text_centered(draw, y, "Width markers (should fit on screen):", font_small, fill=0)
+    draw_text_centered(
+        draw, y, "Width markers (should fit on screen):", font_small, fill=0
+    )
 
     bar_y = y + 40
     # Full width bar
@@ -238,33 +285,41 @@ def create_scaling_test_image(filename, is_png=True):
         draw_text_centered(draw, y + i * 35, text, font_small, fill=64)
 
     y = height - 100
-    draw_text_centered(draw, y, "PASS: Scaled down, readable, complete", font_small, fill=0)
-    draw_text_centered(draw, y + 30, "FAIL: Cropped, distorted, or unreadable", font_small, fill=64)
+    draw_text_centered(
+        draw, y, "PASS: Scaled down, readable, complete", font_small, fill=0
+    )
+    draw_text_centered(
+        draw, y + 30, "FAIL: Cropped, distorted, or unreadable", font_small, fill=64
+    )
 
-    if is_png:
-        img.save(filename, 'PNG')
-    else:
-        img.save(filename, 'JPEG', quality=95)
+    save_test_image(img, filename, is_png, progressive)
 
-def create_wide_scaling_test_image(filename, is_png=True):
+
+def create_wide_scaling_test_image(filename, is_png=True, progressive=False):
     """
     Create wide image (1807x736) to test scaling with specific dimensions
     that can trigger cache dimension mismatches due to floating-point rounding.
     """
     width, height = 1807, 736
-    img = Image.new('L', (width, height), 240)
+    img = Image.new("L", (width, height), 240)
     draw = ImageDraw.Draw(img)
     font = get_font(48)
     font_medium = get_font(32)
     font_small = get_font(24)
 
     # Border
-    draw.rectangle([0, 0, width-1, height-1], outline=0, width=6)
-    draw.rectangle([15, 15, width-16, height-16], outline=128, width=3)
+    draw.rectangle([0, 0, width - 1, height - 1], outline=0, width=6)
+    draw.rectangle([15, 15, width - 16, height - 16], outline=128, width=3)
 
     # Title
     draw_text_centered(draw, 40, "WIDE SCALING TEST", font, fill=0)
-    draw_text_centered(draw, 100, f"Original: {width}x{height} (tests rounding edge case)", font_medium, fill=64)
+    draw_text_centered(
+        draw,
+        100,
+        f"Original: {width}x{height} (tests rounding edge case)",
+        font_medium,
+        fill=64,
+    )
 
     # Grid pattern to verify scaling quality
     grid_start_x = 100
@@ -273,7 +328,12 @@ def create_wide_scaling_test_image(filename, is_png=True):
     grid_height = 300
     cell_size = 50
 
-    draw.text((grid_start_x, grid_start_y - 35), "Grid pattern (check for artifacts):", font=font_small, fill=0)
+    draw.text(
+        (grid_start_x, grid_start_y - 35),
+        "Grid pattern (check for artifacts):",
+        font=font_small,
+        fill=0,
+    )
 
     for row in range(grid_height // cell_size):
         for col in range(grid_width // cell_size):
@@ -305,27 +365,29 @@ def create_wide_scaling_test_image(filename, is_png=True):
 
     # Pass/fail at bottom
     y = height - 80
-    draw_text_centered(draw, y, "PASS: Single decode, cached correctly", font_small, fill=0)
-    draw_text_centered(draw, y + 30, "FAIL: Cache mismatch, multiple decodes", font_small, fill=64)
+    draw_text_centered(
+        draw, y, "PASS: Single decode, cached correctly", font_small, fill=0
+    )
+    draw_text_centered(
+        draw, y + 30, "FAIL: Cache mismatch, multiple decodes", font_small, fill=64
+    )
 
-    if is_png:
-        img.save(filename, 'PNG')
-    else:
-        img.save(filename, 'JPEG', quality=95)
+    save_test_image(img, filename, is_png, progressive)
 
-def create_cache_test_image(filename, page_num, is_png=True):
+
+def create_cache_test_image(filename, page_num, is_png=True, progressive=False):
     """
     Create image for cache performance testing.
     """
     width, height = 400, 300
-    img = Image.new('L', (width, height), 255)
+    img = Image.new("L", (width, height), 255)
     draw = ImageDraw.Draw(img)
     font = get_font(18)
     font_small = get_font(14)
     font_large = get_font(36)
 
     # Border
-    draw.rectangle([0, 0, width-1, height-1], outline=0, width=2)
+    draw.rectangle([0, 0, width - 1, height - 1], outline=0, width=2)
 
     # Page number prominent
     draw_text_centered(draw, 30, f"CACHE TEST PAGE {page_num}", font, fill=0)
@@ -334,29 +396,33 @@ def create_cache_test_image(filename, page_num, is_png=True):
     # Instructions
     y = 140
     draw_text_centered(draw, y, "Navigate away then return", font_small, fill=64)
-    draw_text_centered(draw, y + 25, "Second load should be faster", font_small, fill=64)
+    draw_text_centered(
+        draw, y + 25, "Second load should be faster", font_small, fill=64
+    )
 
     y = 220
     draw_text_centered(draw, y, "PASS: Faster reload from cache", font_small, fill=0)
-    draw_text_centered(draw, y + 20, "FAIL: Same slow decode each time", font_small, fill=64)
+    draw_text_centered(
+        draw, y + 20, "FAIL: Same slow decode each time", font_small, fill=64
+    )
 
-    if is_png:
-        img.save(filename, 'PNG')
-    else:
-        img.save(filename, 'JPEG', quality=95)
+    save_test_image(img, filename, is_png, progressive)
 
-def create_gradient_test_image(filename, is_png=True):
+
+def create_gradient_test_image(filename, is_png=True, progressive=False):
     """
     Create horizontal gradient to test grayscale banding.
     """
     width, height = 400, 500
-    img = Image.new('L', (width, height), 255)
+    img = Image.new("L", (width, height), 255)
     draw = ImageDraw.Draw(img)
     font = get_font(16)
     font_small = get_font(14)
 
     draw_text_centered(draw, 10, "GRADIENT TEST", font, fill=0)
-    draw_text_centered(draw, 35, "Smooth gradient → 4 bands expected", font_small, fill=64)
+    draw_text_centered(
+        draw, 35, "Smooth gradient → 4 bands expected", font_small, fill=64
+    )
 
     # Horizontal gradient
     gradient_y = 70
@@ -366,7 +432,11 @@ def create_gradient_test_image(filename, is_png=True):
         draw.line([(x, gradient_y), (x, gradient_y + gradient_height)], fill=gray)
 
     # Border around gradient
-    draw.rectangle([0, gradient_y-1, width-1, gradient_y + gradient_height + 1], outline=0, width=1)
+    draw.rectangle(
+        [0, gradient_y - 1, width - 1, gradient_y + gradient_height + 1],
+        outline=0,
+        width=1,
+    )
 
     # Labels
     y = gradient_y + gradient_height + 10
@@ -375,7 +445,9 @@ def create_gradient_test_image(filename, is_png=True):
 
     # 4-step gradient (what it should look like)
     y = 220
-    draw_text_centered(draw, y, "Expected result (4 distinct bands):", font_small, fill=0)
+    draw_text_centered(
+        draw, y, "Expected result (4 distinct bands):", font_small, fill=0
+    )
 
     band_y = y + 25
     band_height = 60
@@ -383,7 +455,9 @@ def create_gradient_test_image(filename, is_png=True):
     for i, gray in enumerate([0, 85, 170, 255]):
         x = i * band_width
         draw.rectangle([x, band_y, x + band_width, band_y + band_height], fill=gray)
-    draw.rectangle([0, band_y-1, width-1, band_y + band_height + 1], outline=0, width=1)
+    draw.rectangle(
+        [0, band_y - 1, width - 1, band_y + band_height + 1], outline=0, width=1
+    )
 
     # Vertical gradient
     y = 340
@@ -394,31 +468,33 @@ def create_gradient_test_image(filename, is_png=True):
     for row in range(vgrad_height):
         gray = int(255 * row / vgrad_height)
         draw.line([(50, vgrad_y + row), (width - 50, vgrad_y + row)], fill=gray)
-    draw.rectangle([49, vgrad_y-1, width-49, vgrad_y + vgrad_height + 1], outline=0, width=1)
+    draw.rectangle(
+        [49, vgrad_y - 1, width - 49, vgrad_y + vgrad_height + 1], outline=0, width=1
+    )
 
     # Pass/fail
     y = height - 50
     draw_text_centered(draw, y, "PASS: Clear 4-band quantization", font_small, fill=0)
-    draw_text_centered(draw, y + 20, "FAIL: Binary/noisy dithering", font_small, fill=64)
+    draw_text_centered(
+        draw, y + 20, "FAIL: Binary/noisy dithering", font_small, fill=64
+    )
 
-    if is_png:
-        img.save(filename, 'PNG')
-    else:
-        img.save(filename, 'JPEG', quality=95)
+    save_test_image(img, filename, is_png, progressive)
 
-def create_format_test_image(filename, format_name, is_png=True):
+
+def create_format_test_image(filename, format_name, is_png=True, progressive=False):
     """
     Create simple image to verify format support.
     """
     width, height = 350, 250
-    img = Image.new('L', (width, height), 255)
+    img = Image.new("L", (width, height), 255)
     draw = ImageDraw.Draw(img)
     font = get_font(20)
     font_large = get_font(36)
     font_small = get_font(14)
 
     # Border
-    draw.rectangle([0, 0, width-1, height-1], outline=0, width=3)
+    draw.rectangle([0, 0, width - 1, height - 1], outline=0, width=3)
 
     # Format name
     draw_text_centered(draw, 30, f"{format_name} FORMAT TEST", font, fill=0)
@@ -427,15 +503,17 @@ def create_format_test_image(filename, format_name, is_png=True):
     # Checkmark area
     y = 140
     draw_text_centered(draw, y, "If you can read this,", font_small, fill=64)
-    draw_text_centered(draw, y + 20, f"{format_name} decoding works!", font_small, fill=64)
+    draw_text_centered(
+        draw, y + 20, f"{format_name} decoding works!", font_small, fill=64
+    )
 
     y = height - 40
-    draw_text_centered(draw, y, f"PASS: {format_name} image visible", font_small, fill=0)
+    draw_text_centered(
+        draw, y, f"PASS: {format_name} image visible", font_small, fill=0
+    )
 
-    if is_png:
-        img.save(filename, 'PNG')
-    else:
-        img.save(filename, 'JPEG', quality=95)
+    save_test_image(img, filename, is_png, progressive)
+
 
 def create_epub(epub_path, title, chapters):
     """
@@ -444,18 +522,20 @@ def create_epub(epub_path, title, chapters):
     chapters: list of (chapter_title, html_content, images)
               images: list of (image_filename, image_data)
     """
-    with zipfile.ZipFile(epub_path, 'w', zipfile.ZIP_DEFLATED) as epub:
+    with zipfile.ZipFile(epub_path, "w", zipfile.ZIP_DEFLATED) as epub:
         # mimetype (must be first, uncompressed)
-        epub.writestr('mimetype', 'application/epub+zip', compress_type=zipfile.ZIP_STORED)
+        epub.writestr(
+            "mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED
+        )
 
         # Container
-        container_xml = '''<?xml version="1.0" encoding="UTF-8"?>
+        container_xml = """<?xml version="1.0" encoding="UTF-8"?>
 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
   <rootfiles>
     <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
   </rootfiles>
-</container>'''
-        epub.writestr('META-INF/container.xml', container_xml)
+</container>"""
+        epub.writestr("META-INF/container.xml", container_xml)
 
         # Collect all images and chapters
         manifest_items = []
@@ -463,22 +543,28 @@ def create_epub(epub_path, title, chapters):
 
         # Add chapters and images
         for i, (chapter_title, html_content, images) in enumerate(chapters):
-            chapter_id = f'chapter{i+1}'
-            chapter_file = f'chapter{i+1}.xhtml'
+            chapter_id = f"chapter{i + 1}"
+            chapter_file = f"chapter{i + 1}.xhtml"
 
             # Add images for this chapter
             for img_filename, img_data in images:
-                media_type = 'image/png' if img_filename.endswith('.png') else 'image/jpeg'
-                manifest_items.append(f'    <item id="{img_filename.replace(".", "_")}" href="images/{img_filename}" media-type="{media_type}"/>')
-                epub.writestr(f'OEBPS/images/{img_filename}', img_data)
+                media_type = (
+                    "image/png" if img_filename.endswith(".png") else "image/jpeg"
+                )
+                manifest_items.append(
+                    f'    <item id="{img_filename.replace(".", "_")}" href="images/{img_filename}" media-type="{media_type}"/>'
+                )
+                epub.writestr(f"OEBPS/images/{img_filename}", img_data)
 
             # Add chapter
-            manifest_items.append(f'    <item id="{chapter_id}" href="{chapter_file}" media-type="application/xhtml+xml"/>')
+            manifest_items.append(
+                f'    <item id="{chapter_id}" href="{chapter_file}" media-type="application/xhtml+xml"/>'
+            )
             spine_items.append(f'    <itemref idref="{chapter_id}"/>')
-            epub.writestr(f'OEBPS/{chapter_file}', html_content)
+            epub.writestr(f"OEBPS/{chapter_file}", html_content)
 
         # content.opf
-        content_opf = f'''<?xml version="1.0" encoding="UTF-8"?>
+        content_opf = f"""<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
     <dc:identifier id="uid">test-epub-{title.lower().replace(" ", "-")}</dc:identifier>
@@ -492,13 +578,17 @@ def create_epub(epub_path, title, chapters):
   <spine>
 {chr(10).join(spine_items)}
   </spine>
-</package>'''
-        epub.writestr('OEBPS/content.opf', content_opf)
+</package>"""
+        epub.writestr("OEBPS/content.opf", content_opf)
 
         # Navigation document
-        nav_items = '\n'.join([f'      <li><a href="chapter{i+1}.xhtml">{chapters[i][0]}</a></li>'
-                               for i in range(len(chapters))])
-        nav_xhtml = f'''<?xml version="1.0" encoding="UTF-8"?>
+        nav_items = "\n".join(
+            [
+                f'      <li><a href="chapter{i + 1}.xhtml">{chapters[i][0]}</a></li>'
+                for i in range(len(chapters))
+            ]
+        )
+        nav_xhtml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
 <head><title>Navigation</title></head>
@@ -510,12 +600,13 @@ def create_epub(epub_path, title, chapters):
     </ol>
   </nav>
 </body>
-</html>'''
-        epub.writestr('OEBPS/nav.xhtml', nav_xhtml)
+</html>"""
+        epub.writestr("OEBPS/nav.xhtml", nav_xhtml)
+
 
 def make_chapter(title, body_content):
     """Create XHTML chapter content."""
-    return f'''<?xml version="1.0" encoding="UTF-8"?>
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head><title>{title}</title></head>
@@ -523,13 +614,15 @@ def make_chapter(title, body_content):
 <h1>{title}</h1>
 {body_content}
 </body>
-</html>'''
+</html>"""
+
 
 def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     # Temp directory for images
     import tempfile
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
 
@@ -539,33 +632,46 @@ def main():
         images = {}
 
         # JPEG tests
-        create_grayscale_test_image(tmpdir / 'grayscale_test.jpg', is_png=False)
-        create_centering_test_image(tmpdir / 'centering_test.jpg', is_png=False)
-        create_scaling_test_image(tmpdir / 'scaling_test.jpg', is_png=False)
-        create_wide_scaling_test_image(tmpdir / 'wide_scaling_test.jpg', is_png=False)
-        create_gradient_test_image(tmpdir / 'gradient_test.jpg', is_png=False)
-        create_format_test_image(tmpdir / 'jpeg_format.jpg', 'JPEG', is_png=False)
-        create_cache_test_image(tmpdir / 'cache_test_1.jpg', 1, is_png=False)
-        create_cache_test_image(tmpdir / 'cache_test_2.jpg', 2, is_png=False)
+        create_grayscale_test_image(
+            tmpdir / "grayscale_test.jpg", is_png=False, progressive=True
+        )
+        create_centering_test_image(tmpdir / "centering_test.jpg", is_png=False)
+        create_scaling_test_image(
+            tmpdir / "scaling_test.jpg", is_png=False, progressive=True
+        )
+        create_wide_scaling_test_image(
+            tmpdir / "wide_scaling_test.jpg", is_png=False, progressive=True
+        )
+        create_gradient_test_image(
+            tmpdir / "gradient_test.jpg", is_png=False, progressive=True
+        )
+        create_format_test_image(tmpdir / "jpeg_format.jpg", "JPEG", is_png=False)
+        create_cache_test_image(tmpdir / "cache_test_1.jpg", 1, is_png=False)
+        create_cache_test_image(tmpdir / "cache_test_2.jpg", 2, is_png=False)
 
         # PNG tests
-        create_grayscale_test_image(tmpdir / 'grayscale_test.png', is_png=True)
-        create_centering_test_image(tmpdir / 'centering_test.png', is_png=True)
-        create_scaling_test_image(tmpdir / 'scaling_test.png', is_png=True)
-        create_wide_scaling_test_image(tmpdir / 'wide_scaling_test.png', is_png=True)
-        create_gradient_test_image(tmpdir / 'gradient_test.png', is_png=True)
-        create_format_test_image(tmpdir / 'png_format.png', 'PNG', is_png=True)
-        create_cache_test_image(tmpdir / 'cache_test_1.png', 1, is_png=True)
-        create_cache_test_image(tmpdir / 'cache_test_2.png', 2, is_png=True)
+        create_grayscale_test_image(tmpdir / "grayscale_test.png", is_png=True)
+        create_centering_test_image(tmpdir / "centering_test.png", is_png=True)
+        create_scaling_test_image(tmpdir / "scaling_test.png", is_png=True)
+        create_wide_scaling_test_image(tmpdir / "wide_scaling_test.png", is_png=True)
+        create_gradient_test_image(tmpdir / "gradient_test.png", is_png=True)
+        create_format_test_image(tmpdir / "png_format.png", "PNG", is_png=True)
+        create_cache_test_image(tmpdir / "cache_test_1.png", 1, is_png=True)
+        create_cache_test_image(tmpdir / "cache_test_2.png", 2, is_png=True)
 
         # Read all images
-        for img_file in tmpdir.glob('*.*'):
+        for img_file in tmpdir.glob("*.*"):
             images[img_file.name] = img_file.read_bytes()
 
         print("Creating JPEG test EPUB...")
         jpeg_chapters = [
-            ("Introduction", make_chapter("JPEG Image Tests", """
+            (
+                "Introduction",
+                make_chapter(
+                    "JPEG Image Tests",
+                    """
 <p>This EPUB tests JPEG image rendering.</p>
+<p>It contains both baseline and progressive JPEGs.</p>
 <p>Navigate through chapters to verify each test case.</p>
 <p><strong>Test Plan:</strong></p>
 <ul>
@@ -574,45 +680,113 @@ def main():
 <li>Large image scaling</li>
 <li>Cache performance</li>
 </ul>
-"""), []),
-            ("1. JPEG Format", make_chapter("JPEG Format Test", """
+""",
+                ),
+                [],
+            ),
+            (
+                "1. JPEG Format",
+                make_chapter(
+                    "JPEG Format Test",
+                    """
 <p>Basic JPEG decoding test.</p>
+<p>This image uses baseline JPEG encoding.</p>
 <img src="images/jpeg_format.jpg" alt="JPEG format test"/>
 <p>If the image above is visible, JPEG decoding works.</p>
-"""), [('jpeg_format.jpg', images['jpeg_format.jpg'])]),
-            ("2. Grayscale", make_chapter("Grayscale Test", """
+""",
+                ),
+                [("jpeg_format.jpg", images["jpeg_format.jpg"])],
+            ),
+            (
+                "2. Grayscale",
+                make_chapter(
+                    "Grayscale Test",
+                    """
 <p>Verify 4 distinct gray levels are visible.</p>
+<p>This image uses progressive JPEG encoding.</p>
 <img src="images/grayscale_test.jpg" alt="Grayscale test"/>
-"""), [('grayscale_test.jpg', images['grayscale_test.jpg'])]),
-            ("3. Gradient", make_chapter("Gradient Test", """
+""",
+                ),
+                [("grayscale_test.jpg", images["grayscale_test.jpg"])],
+            ),
+            (
+                "3. Gradient",
+                make_chapter(
+                    "Gradient Test",
+                    """
 <p>Verify gradient quantizes to 4 bands.</p>
+<p>This image uses progressive JPEG encoding.</p>
 <img src="images/gradient_test.jpg" alt="Gradient test"/>
-"""), [('gradient_test.jpg', images['gradient_test.jpg'])]),
-            ("4. Centering", make_chapter("Centering Test", """
+""",
+                ),
+                [("gradient_test.jpg", images["gradient_test.jpg"])],
+            ),
+            (
+                "4. Centering",
+                make_chapter(
+                    "Centering Test",
+                    """
 <p>Verify image is centered horizontally.</p>
 <img src="images/centering_test.jpg" alt="Centering test"/>
-"""), [('centering_test.jpg', images['centering_test.jpg'])]),
-            ("5. Scaling", make_chapter("Scaling Test", """
+""",
+                ),
+                [("centering_test.jpg", images["centering_test.jpg"])],
+            ),
+            (
+                "5. Scaling",
+                make_chapter(
+                    "Scaling Test",
+                    """
 <p>This image is 1200x1500 pixels - larger than the screen.</p>
 <p>It should be scaled down to fit.</p>
+<p>This image uses progressive JPEG encoding.</p>
 <img src="images/scaling_test.jpg" alt="Scaling test"/>
-"""), [('scaling_test.jpg', images['scaling_test.jpg'])]),
-            ("6. Wide Scaling", make_chapter("Wide Scaling Test", """
+""",
+                ),
+                [("scaling_test.jpg", images["scaling_test.jpg"])],
+            ),
+            (
+                "6. Wide Scaling",
+                make_chapter(
+                    "Wide Scaling Test",
+                    """
 <p>This image is 1807x736 pixels - a wide landscape format.</p>
 <p>Tests scaling with dimensions that can cause cache mismatches.</p>
+<p>This image uses progressive JPEG encoding.</p>
 <img src="images/wide_scaling_test.jpg" alt="Wide scaling test"/>
-"""), [('wide_scaling_test.jpg', images['wide_scaling_test.jpg'])]),
-            ("7. Cache Test A", make_chapter("Cache Test - Page A", """
+""",
+                ),
+                [("wide_scaling_test.jpg", images["wide_scaling_test.jpg"])],
+            ),
+            (
+                "7. Cache Test A",
+                make_chapter(
+                    "Cache Test - Page A",
+                    """
 <p>First cache test page. Note the load time.</p>
 <img src="images/cache_test_1.jpg" alt="Cache test 1"/>
 <p>Navigate to next page, then come back.</p>
-"""), [('cache_test_1.jpg', images['cache_test_1.jpg'])]),
-            ("8. Cache Test B", make_chapter("Cache Test - Page B", """
+""",
+                ),
+                [("cache_test_1.jpg", images["cache_test_1.jpg"])],
+            ),
+            (
+                "8. Cache Test B",
+                make_chapter(
+                    "Cache Test - Page B",
+                    """
 <p>Second cache test page.</p>
 <img src="images/cache_test_2.jpg" alt="Cache test 2"/>
 <p>Navigate back to Page A - it should load faster from cache.</p>
-"""), [('cache_test_2.jpg', images['cache_test_2.jpg'])]),
-            ("9. Alignment Bleed", make_chapter("Image Centering Bleed Test", """
+""",
+                ),
+                [("cache_test_2.jpg", images["cache_test_2.jpg"])],
+            ),
+            (
+                "9. Alignment Bleed",
+                make_chapter(
+                    "Image Centering Bleed Test",
+                    """
 <p>Tests that image centering does not bleed into following text blocks (issue #1026).</p>
 <p>Set Paragraph Alignment to Justify and Embedded Style to OFF before testing.</p>
 <p>All paragraphs below the images should be justified, not centered.</p>
@@ -622,14 +796,23 @@ def main():
 <p>FIRST PARAGRAPH after image. This paragraph follows an empty heading and an image-only paragraph. With the bug present, this text appears centered instead of justified because the empty heading's default Center alignment bleeds through the chain of empty text blocks. Lorem ipsum dolor sit amet, consectetur adipiscing elit sed do eiusmod tempor.</p>
 <p>SECOND PARAGRAPH in the same div. This paragraph should always be justified because the first paragraph's text block was flushed. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident sunt in culpa qui officia.</p>
 </div>
-"""), []),  # centering_test.jpg already included by chapter 4
+""",
+                ),
+                [],
+            ),  # centering_test.jpg already included by chapter 4
         ]
 
-        create_epub(OUTPUT_DIR / 'test_jpeg_images.epub', 'JPEG Image Tests', jpeg_chapters)
+        create_epub(
+            OUTPUT_DIR / "test_jpeg_images.epub", "JPEG Image Tests", jpeg_chapters
+        )
 
         print("Creating PNG test EPUB...")
         png_chapters = [
-            ("Introduction", make_chapter("PNG Image Tests", """
+            (
+                "Introduction",
+                make_chapter(
+                    "PNG Image Tests",
+                    """
 <p>This EPUB tests PNG image rendering.</p>
 <p>Navigate through chapters to verify each test case.</p>
 <p><strong>Test Plan:</strong></p>
@@ -639,45 +822,108 @@ def main():
 <li>Image centering</li>
 <li>Large image scaling</li>
 </ul>
-"""), []),
-            ("1. PNG Format", make_chapter("PNG Format Test", """
+""",
+                ),
+                [],
+            ),
+            (
+                "1. PNG Format",
+                make_chapter(
+                    "PNG Format Test",
+                    """
 <p>Basic PNG decoding test.</p>
 <img src="images/png_format.png" alt="PNG format test"/>
 <p>If the image above is visible and no crash occurred, PNG decoding works.</p>
-"""), [('png_format.png', images['png_format.png'])]),
-            ("2. Grayscale", make_chapter("Grayscale Test", """
+""",
+                ),
+                [("png_format.png", images["png_format.png"])],
+            ),
+            (
+                "2. Grayscale",
+                make_chapter(
+                    "Grayscale Test",
+                    """
 <p>Verify 4 distinct gray levels are visible.</p>
 <img src="images/grayscale_test.png" alt="Grayscale test"/>
-"""), [('grayscale_test.png', images['grayscale_test.png'])]),
-            ("3. Gradient", make_chapter("Gradient Test", """
+""",
+                ),
+                [("grayscale_test.png", images["grayscale_test.png"])],
+            ),
+            (
+                "3. Gradient",
+                make_chapter(
+                    "Gradient Test",
+                    """
 <p>Verify gradient quantizes to 4 bands.</p>
 <img src="images/gradient_test.png" alt="Gradient test"/>
-"""), [('gradient_test.png', images['gradient_test.png'])]),
-            ("4. Centering", make_chapter("Centering Test", """
+""",
+                ),
+                [("gradient_test.png", images["gradient_test.png"])],
+            ),
+            (
+                "4. Centering",
+                make_chapter(
+                    "Centering Test",
+                    """
 <p>Verify image is centered horizontally.</p>
 <img src="images/centering_test.png" alt="Centering test"/>
-"""), [('centering_test.png', images['centering_test.png'])]),
-            ("5. Scaling", make_chapter("Scaling Test", """
+""",
+                ),
+                [("centering_test.png", images["centering_test.png"])],
+            ),
+            (
+                "5. Scaling",
+                make_chapter(
+                    "Scaling Test",
+                    """
 <p>This image is 1200x1500 pixels - larger than the screen.</p>
 <p>It should be scaled down to fit.</p>
 <img src="images/scaling_test.png" alt="Scaling test"/>
-"""), [('scaling_test.png', images['scaling_test.png'])]),
-            ("6. Wide Scaling", make_chapter("Wide Scaling Test", """
+""",
+                ),
+                [("scaling_test.png", images["scaling_test.png"])],
+            ),
+            (
+                "6. Wide Scaling",
+                make_chapter(
+                    "Wide Scaling Test",
+                    """
 <p>This image is 1807x736 pixels - a wide landscape format.</p>
 <p>Tests scaling with dimensions that can cause cache mismatches.</p>
 <img src="images/wide_scaling_test.png" alt="Wide scaling test"/>
-"""), [('wide_scaling_test.png', images['wide_scaling_test.png'])]),
-            ("7. Cache Test A", make_chapter("Cache Test - Page A", """
+""",
+                ),
+                [("wide_scaling_test.png", images["wide_scaling_test.png"])],
+            ),
+            (
+                "7. Cache Test A",
+                make_chapter(
+                    "Cache Test - Page A",
+                    """
 <p>First cache test page. Note the load time.</p>
 <img src="images/cache_test_1.png" alt="Cache test 1"/>
 <p>Navigate to next page, then come back.</p>
-"""), [('cache_test_1.png', images['cache_test_1.png'])]),
-            ("8. Cache Test B", make_chapter("Cache Test - Page B", """
+""",
+                ),
+                [("cache_test_1.png", images["cache_test_1.png"])],
+            ),
+            (
+                "8. Cache Test B",
+                make_chapter(
+                    "Cache Test - Page B",
+                    """
 <p>Second cache test page.</p>
 <img src="images/cache_test_2.png" alt="Cache test 2"/>
 <p>Navigate back to Page A - it should load faster from cache.</p>
-"""), [('cache_test_2.png', images['cache_test_2.png'])]),
-            ("9. Alignment Bleed", make_chapter("Image Centering Bleed Test", """
+""",
+                ),
+                [("cache_test_2.png", images["cache_test_2.png"])],
+            ),
+            (
+                "9. Alignment Bleed",
+                make_chapter(
+                    "Image Centering Bleed Test",
+                    """
 <p>Tests that image centering does not bleed into following text blocks (issue #1026).</p>
 <p>Set Paragraph Alignment to Justify and Embedded Style to OFF before testing.</p>
 <p>All paragraphs below the images should be justified, not centered.</p>
@@ -687,41 +933,342 @@ def main():
 <p>FIRST PARAGRAPH after image. This paragraph follows an empty heading and an image-only paragraph. With the bug present, this text appears centered instead of justified because the empty heading's default Center alignment bleeds through the chain of empty text blocks. Lorem ipsum dolor sit amet, consectetur adipiscing elit sed do eiusmod tempor.</p>
 <p>SECOND PARAGRAPH in the same div. This paragraph should always be justified because the first paragraph's text block was flushed. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident sunt in culpa qui officia.</p>
 </div>
-"""), []),  # centering_test.png already included by chapter 4
+""",
+                ),
+                [],
+            ),  # centering_test.png already included by chapter 4
         ]
 
-        create_epub(OUTPUT_DIR / 'test_png_images.epub', 'PNG Image Tests', png_chapters)
+        create_epub(
+            OUTPUT_DIR / "test_png_images.epub", "PNG Image Tests", png_chapters
+        )
 
         print("Creating mixed format test EPUB...")
         mixed_chapters = [
-            ("Introduction", make_chapter("Mixed Image Format Tests", """
+            (
+                "Introduction",
+                make_chapter(
+                    "Mixed Image Format Tests",
+                    """
 <p>This EPUB contains both JPEG and PNG images.</p>
-<p>Tests format detection and mixed rendering.</p>
-"""), []),
-            ("1. JPEG Image", make_chapter("JPEG in Mixed EPUB", """
+<p>Tests baseline JPEG, progressive JPEG, PNG, and mixed rendering.</p>
+""",
+                ),
+                [],
+            ),
+            (
+                "1. JPEG Image",
+                make_chapter(
+                    "JPEG in Mixed EPUB",
+                    """
 <p>This is a JPEG image:</p>
+<p>This image uses baseline JPEG encoding.</p>
 <img src="images/jpeg_format.jpg" alt="JPEG"/>
-"""), [('jpeg_format.jpg', images['jpeg_format.jpg'])]),
-            ("2. PNG Image", make_chapter("PNG in Mixed EPUB", """
+""",
+                ),
+                [("jpeg_format.jpg", images["jpeg_format.jpg"])],
+            ),
+            (
+                "2. PNG Image",
+                make_chapter(
+                    "PNG in Mixed EPUB",
+                    """
 <p>This is a PNG image:</p>
 <img src="images/png_format.png" alt="PNG"/>
-"""), [('png_format.png', images['png_format.png'])]),
-            ("3. Both Formats", make_chapter("Both Formats on One Page", """
-<p>JPEG image:</p>
+""",
+                ),
+                [("png_format.png", images["png_format.png"])],
+            ),
+            (
+                "3. Both Formats",
+                make_chapter(
+                    "Both Formats on One Page",
+                    """
+<p>Progressive JPEG image:</p>
 <img src="images/grayscale_test.jpg" alt="JPEG grayscale"/>
 <p>PNG image:</p>
 <img src="images/grayscale_test.png" alt="PNG grayscale"/>
 <p>Both should render with proper grayscale.</p>
-"""), [('grayscale_test.jpg', images['grayscale_test.jpg']),
-       ('grayscale_test.png', images['grayscale_test.png'])]),
+""",
+                ),
+                [
+                    ("grayscale_test.jpg", images["grayscale_test.jpg"]),
+                    ("grayscale_test.png", images["grayscale_test.png"]),
+                ],
+            ),
         ]
 
-        create_epub(OUTPUT_DIR / 'test_mixed_images.epub', 'Mixed Format Tests', mixed_chapters)
+        create_epub(
+            OUTPUT_DIR / "test_mixed_images.epub", "Mixed Format Tests", mixed_chapters
+        )
+
+        print("Creating text rendering test EPUB...")
+        text_chapters = [
+            (
+                "Introduction",
+                make_chapter(
+                    "Text Rendering Tests",
+                    """
+<p>This EPUB tests text rendering edge cases.</p>
+<p><strong>Test Plan:</strong></p>
+<ul>
+<li>pre element: intrinsic line breaks preserved</li>
+<li>pre element: leading/trailing blank lines</li>
+<li>pre with inline code element</li>
+<li>horizontal rules between paragraphs</li>
+<li>superscript and subscript rendering (&lt;sup&gt;/&lt;sub&gt; tags)</li>
+<li>superscript and subscript via CSS vertical-align property</li>
+<li>list rendering: ul, ol, nested, start/value attributes, bare li</li>
+</ul>
+""",
+                ),
+                [],
+            ),
+            (
+                "1. pre Line Breaks",
+                make_chapter(
+                    "pre: Intrinsic Line Breaks",
+                    """
+<p>The block below is a single &lt;pre&gt; element. Each source line must appear on its own line:</p>
+<pre>Line one
+Line two
+Line three</pre>
+<p>Normal paragraph after the pre block. Text resumes as a regular wrapped paragraph.</p>
+""",
+                ),
+                [],
+            ),
+            (
+                "2. pre Blank Lines",
+                make_chapter(
+                    "pre: Blank Lines",
+                    """
+<p>The pre block below contains intentional blank lines between code lines:</p>
+<pre>First line
+
+Third line (blank line above)
+
+Fifth line (blank line above)</pre>
+<p>Each blank line in the source should produce an empty line in the output.</p>
+""",
+                ),
+                [],
+            ),
+            (
+                "3. pre with code",
+                make_chapter(
+                    "pre with Nested code Element",
+                    """
+<p>Common EPUB pattern: &lt;pre&gt;&lt;code&gt;...&lt;/code&gt;&lt;/pre&gt;. Line breaks must still be preserved:</p>
+<pre><code>function greet(name) {
+    return "Hello, " + name;
+}
+
+greet("World");</code></pre>
+<p>Normal paragraph after pre/code block.</p>
+""",
+                ),
+                [],
+            ),
+            (
+                "4. Horizontal Rules",
+                make_chapter(
+                    "Horizontal Rule Tests",
+                    """
+<p>A plain &lt;hr&gt; between two paragraphs. A thin line should appear between the two blocks of text.</p>
+<p>Paragraph before the first rule. Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>
+<hr/>
+<p>Paragraph after the first rule. The rule above should be a full-width horizontal line.</p>
+<hr/>
+<p>Second rule above. Two rules in a row with no text between them:</p>
+<hr/>
+<hr/>
+<p>Two rules appeared above. Now a rule right after the heading:</p>
+<hr/>
+<p>Rule appeared right after the paragraph above. Finally, a rule near the end of the page to verify it does not cause a spurious page break when there is still room:</p>
+<p>Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>
+<hr/>
+<p>End of horizontal rule tests.</p>
+""",
+                ),
+                [],
+            ),
+            (
+                "5. Superscript and Subscript",
+                make_chapter(
+                    "Superscript and Subscript",
+                    """
+<h2>Basic superscript</h2>
+<p>E = mc<sup>2</sup> is Einstein's mass-energy equivalence.</p>
+<p>The area of a circle is &#960;r<sup>2</sup>.</p>
+<p>2<sup>10</sup> = 1024.</p>
+<p>x<sup>n</sup> + y<sup>n</sup> = z<sup>n</sup></p>
+
+<h2>Basic subscript</h2>
+<p>Water is H<sub>2</sub>O.</p>
+<p>Carbon dioxide is CO<sub>2</sub>.</p>
+<p>The sequence a<sub>1</sub>, a<sub>2</sub>, a<sub>3</sub>, ..., a<sub>n</sub>.</p>
+<p>Glucose: C<sub>6</sub>H<sub>12</sub>O<sub>6</sub>.</p>
+
+<h2>Mixed sup and sub</h2>
+<p>The pH of water is 7, meaning [H<sub>3</sub>O<sup>+</sup>] = 10<sup>-7</sup> mol/L.</p>
+<p>Footnote reference<sup>1</sup> and another<sup>2</sup> in the same sentence.</p>
+
+<h2>Ordinals</h2>
+<p>On the 1<sup>st</sup> of January, the 2<sup>nd</sup> quarter begins on the 3<sup>rd</sup> month.</p>
+
+<h2>Nested with bold and italic</h2>
+<p>Speed of light: c = 2.998 &#215; 10<sup>8</sup> m/s.</p>
+<p>Avogadro: 6.022 &#215; 10<sup>23</sup> mol<sup>-1</sup>.</p>
+<p>Bold superscript: x<sup><b>2</b></sup> and italic subscript: H<sub><i>n</i></sub>.</p>
+
+<h2>Long runs</h2>
+<p>This word<sup>has a rather long superscript attached to it</sup> continuing normally.</p>
+<p>This word<sub>has a rather long subscript attached to it</sub> continuing normally.</p>
+""",
+                ),
+                [],
+            ),
+            (
+                "5b. vertical-align CSS",
+                make_chapter(
+                    "vertical-align CSS Superscript and Subscript",
+                    """<style>
+.sup-css { vertical-align: super; }
+.sub-css { vertical-align: sub; }
+.baseline-reset { vertical-align: baseline; }
+</style>
+
+<h2>Inline style: vertical-align super (should match &lt;sup&gt;)</h2>
+<p>E = mc<span style="vertical-align:super">2</span> (inline style super)</p>
+<p>2<span style="vertical-align:super">10</span> = 1024</p>
+<p>x<span style="vertical-align:super">n</span> + y<span style="vertical-align:super">n</span> = z<span style="vertical-align:super">n</span></p>
+
+<h2>Inline style: vertical-align sub (should match &lt;sub&gt;)</h2>
+<p>Water is H<span style="vertical-align:sub">2</span>O (inline style sub)</p>
+<p>CO<span style="vertical-align:sub">2</span> carbon dioxide</p>
+<p>C<span style="vertical-align:sub">6</span>H<span style="vertical-align:sub">12</span>O<span style="vertical-align:sub">6</span> glucose</p>
+
+<h2>Stylesheet class: vertical-align super</h2>
+<p>E = mc<span class="sup-css">2</span> (class-based super)</p>
+<p>Footnote<span class="sup-css">1</span> and another<span class="sup-css">2</span></p>
+
+<h2>Stylesheet class: vertical-align sub</h2>
+<p>H<span class="sub-css">2</span>O (class-based sub)</p>
+<p>a<span class="sub-css">1</span>, a<span class="sub-css">2</span>, ..., a<span class="sub-css">n</span></p>
+
+<h2>Mixed: tag-based vs CSS-based side by side</h2>
+<p>Tag: H<sub>2</sub>O &#8212; CSS: H<span style="vertical-align:sub">2</span>O (should look identical)</p>
+<p>Tag: mc<sup>2</sup> &#8212; CSS: mc<span style="vertical-align:super">2</span> (should look identical)</p>
+
+<h2>baseline reset cancels inherited super</h2>
+<p>Outer<span style="vertical-align:super">raised<span class="baseline-reset">normal</span>raised</span>outer</p>
+
+<h2>vertical-align super with bold and italic</h2>
+<p>Bold super: x<span style="vertical-align:super"><b>2</b></span> and italic sub: H<span style="vertical-align:sub"><i>n</i></span></p>
+
+<h2>Long run via CSS</h2>
+<p>This word<span style="vertical-align:super">has a rather long superscript via CSS</span> continuing normally.</p>
+<p>This word<span style="vertical-align:sub">has a rather long subscript via CSS</span> continuing normally.</p>
+""",
+                ),
+                [],
+            ),
+            (
+                "6. Lists",
+                make_chapter(
+                    "List Rendering Tests",
+                    """
+<h2>Unordered list (bullets)</h2>
+<ul>
+<li>First item</li>
+<li>Second item</li>
+<li>Third item</li>
+</ul>
+
+<h2>Ordered list (numbers 1, 2, 3)</h2>
+<ol>
+<li>One</li>
+<li>Two</li>
+<li>Three</li>
+</ol>
+
+<h2>Ordered list with start="5" (should begin at 5)</h2>
+<ol start="5">
+<li>Five</li>
+<li>Six</li>
+<li>Seven</li>
+</ol>
+
+<h2>Ordered list with li value override (should show 1, 2, 5, 6)</h2>
+<ol>
+<li>One</li>
+<li>Two</li>
+<li value="5">Five</li>
+<li>Six</li>
+</ol>
+
+<h2>Nested lists</h2>
+<ul>
+<li>Fruit
+  <ul>
+  <li>Apple</li>
+  <li>Banana</li>
+  </ul>
+</li>
+<li>Vegetables
+  <ul>
+  <li>Carrot</li>
+  <li>Pea</li>
+  </ul>
+</li>
+</ul>
+
+<h2>Nested ordered lists (outer 1,2 / inner 1,2,3)</h2>
+<ol>
+<li>Chapter one
+  <ol>
+  <li>Section A</li>
+  <li>Section B</li>
+  <li>Section C</li>
+  </ol>
+</li>
+<li>Chapter two
+  <ol>
+  <li>Section A</li>
+  <li>Section B</li>
+  </ol>
+</li>
+</ol>
+
+<h2>Bare li outside any list (no bullet should appear)</h2>
+<p>The line below is a bare &lt;li&gt; with no enclosing &lt;ul&gt; or &lt;ol&gt;. No bullet or number should appear before it.</p>
+<li>This bare li should have no marker</li>
+<p>Normal paragraph resumed.</p>
+
+<h2>List with inline formatting</h2>
+<ul>
+<li><b>Bold</b> item text</li>
+<li><i>Italic</i> item text</li>
+<li>Item with <b>bold</b> and <i>italic</i> mixed</li>
+</ul>
+""",
+                ),
+                [],
+            ),
+        ]
+
+        create_epub(
+            OUTPUT_DIR / "test_text_rendering.epub",
+            "Text Rendering Tests",
+            text_chapters,
+        )
 
         print(f"\nTest EPUBs created in: {OUTPUT_DIR}")
         print("Files:")
-        for f in OUTPUT_DIR.glob('*.epub'):
+        for f in OUTPUT_DIR.glob("*.epub"):
             print(f"  - {f.name}")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

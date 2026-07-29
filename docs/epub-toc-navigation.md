@@ -1,0 +1,220 @@
+# EPUB TOC Anchor Navigation
+
+This document describes how the reader handles EPUB Table of Contents (TOC) entries that use fragment anchors to point into spine files, enabling navigation to sub-chapters within a single XHTML file.
+
+## Background: EPUB spine and TOC structure
+
+An EPUB's **spine** is an ordered list of XHTML files that define reading order. The **TOC** (table of contents) maps chapter names to positions in the spine, optionally with fragment anchors (e.g. `chapter1.xhtml#section-5`).
+
+Two layouts are relevant here:
+
+- **1:1** -- one TOC entry per spine item (most common, no anchors needed)
+- **Multi-TOC-per-spine** -- multiple TOC entries point into a single spine file using fragment anchors (e.g. Moby Dick from Project Gutenberg packs 3-9 chapters per file)
+
+Spine items before the first TOC entry (cover pages) and after the last (appendices, copyright) have no TOC entry of their own.
+
+## BookMetadataCache and TOC-to-spine mapping
+
+`BookMetadataCache` builds the mapping between spine items and TOC entries at epub open time. Key details:
+
+- Each `SpineEntry` has a `tocIndex` field set during cache building. For spines with no matching TOC entry, `tocIndex` inherits the previous spine's value (`lastSpineTocIndex`). This means orphan spines (cover pages, appendices) are treated as continuations of the nearest preceding chapter.
+- `getTocIndexForSpineIndex(i)` returns the stored `tocIndex` for spine `i` -- a file seek into BookMetadataCache, not computed on the fly.
+- `getTocItem(i)` returns the TOC entry (title, spineIndex, anchor) for TOC index `i` -- also a file seek per call, not cached in memory. Code that queries TOC metadata in a loop should cache the results locally first.
+- `getSpineIndexForTocIndex(i)` does the reverse lookup (TOC index to spine index).
+
+### Cached TOC reliability flag
+
+`hasReliableToc()` answers whether the TOC has enough spine coverage (>=25% of spines referenced) to drive chapter UX, with short-circuits for `tocCount <= 0` and the "large book with one TOC entry" pathology.
+
+The result is computed once during `buildBookBin` (folded into the existing `spineIndex->tocIndex` scan, so no extra disk pass) and persisted as a single byte in book.bin's header A. `Epub::hasReliableToc()` reads `BookMetadataCache::isTocReliable()` and caches the bool in `tocReliabilityState`.
+
+This matters because the check used to recompute the answer on demand by calling `getTocEntry(i)` for every TOC entry, which does two SD-card seeks per call. On a 2858-entry web-novel TOC that was ~5700 seeks (~7 seconds) added to first-page latency. `BOOK_CACHE_VERSION` was bumped to 7 for this layout change; older caches are rebuilt on next open.
+
+## Section cache file format
+
+The section cache (`.bin`) stores pre-rendered page data for a spine item. The file layout:
+
+```
+[header: version, render parameters, pageCount, lutOffset, anchorMapOffset]
+[serialized pages...]
+[page LUT: array of uint32_t file offsets, one per page]
+[anchor map: uint16_t count, then (string, uint16_t) pairs]
+```
+
+The header size is defined by `HEADER_SIZE` (a constexpr computed via `sizeof` sum) and validated with a `static_assert`. Three functions read this header independently and must stay in sync:
+
+- `loadSectionFile` -- full section load, reads header + builds TOC boundaries from anchor map
+- `getPageForAnchor` -- seeks directly to anchor map offset from header
+- `writeSectionFileHeader` -- writes the header during cache creation
+
+When modifying the header layout, bump `SECTION_FILE_VERSION` to invalidate stale caches and update all read paths.
+
+## Anchor-to-page mapping
+
+### Recording anchors during parsing
+
+`ChapterHtmlSlimParser` records every HTML `id` attribute and its corresponding page number into `anchorData` (a flat `std::vector<std::pair<std::string, uint16_t>>`). Recording is deferred via `pendingAnchorId` until `startNewTextBlock()`, after the previous text block is flushed to pages via `makePages()`. This ensures `completedPageCount` reflects the correct page.
+
+For TOC anchors specifically, `startNewTextBlock` also forces a page break before recording, so chapters start on fresh pages rather than mid-page. The parser receives the set of TOC anchor strings via `tocAnchors` (a `std::vector<std::string>`) from `Section::createSectionFile`.
+
+### On-disk format
+
+The anchor data is serialized at the end of the section cache file (`.bin`), after the page LUT. The header stores the anchor map offset. Format:
+
+```
+[uint16_t count]
+[string anchor_1][uint16_t page_1]
+[string anchor_2][uint16_t page_2]
+...
+```
+
+This data serves two purposes:
+- **Footnote navigation** (`getPageForAnchor`): on-demand linear scan for a single anchor
+- **TOC boundary resolution** (`buildTocBoundariesFromFile`): scan matching only TOC anchors
+
+### Data structure choices
+
+All anchor storage uses flat vectors, not `std::map` or `std::set`. On the ESP32-C3, each `std::map`/`std::set` node requires its own heap allocation, causing fragmentation. Vectors use a single contiguous allocation. The entry counts are small enough (typically 1-10 TOC anchors per spine, dozens to hundreds of total anchors) that linear scans are faster than tree lookups at these sizes.
+
+## TOC boundaries in Section
+
+When a section is loaded or created, `Section` builds an in-memory `tocBoundaries` vector mapping each TOC entry in that spine to its start page. This is a small vector (1-3 entries typically) that enables O(1) lookups without file I/O.
+
+### Two build paths
+
+**From in-memory anchors** (`buildTocBoundaries`): Called after `createSectionFile` when the parser's anchor vector is still in memory. Iterates TOC entries and does linear scans against the anchor vector.
+
+**From disk** (`buildTocBoundariesFromFile`): Called from `loadSectionFile` when loading a cached section. Caches the small set of TOC anchor strings first (since `getTocItem()` does file I/O to `BookMetadataCache`), then streams through on-disk anchors matching only those, stopping early once all are resolved. Uses a reusable `std::string` buffer to avoid per-entry heap allocation.
+
+The two functions are kept separate because their iteration patterns differ fundamentally: in-memory iterates TOC entries with inner scans of anchors, while the disk path iterates disk entries with inner scans of the small TOC anchor set.
+
+### Early exit optimization
+
+If no TOC entries in the spine have anchors (`unresolvedCount == 0`), both functions return immediately without storing any boundaries. `getTocIndexForPage` falls back to `epub->getTocIndexForSpineIndex`, which gives the correct answer for the common 1:1 case.
+
+### Query methods
+
+- `getTocIndexForPage(page)` -- binary search on sorted `tocBoundaries` to find which chapter a page belongs to
+- `getPageForTocIndex(tocIndex)` -- linear scan to find a chapter's start page
+- `getPageRangeForTocIndex(tocIndex)` -- returns `[startPage, endPage)` range for a chapter within this spine
+
+All are in-memory, no file I/O.
+
+## Chapter navigation in EpubReaderActivity
+
+### Chapter skip (long-press)
+
+Navigates by TOC index, not spine index. Uses `getTocIndexForPage` to determine the current chapter, then increments or decrements.
+
+- **Same-spine skip**: Resolves the target page via `getPageForTocIndex` entirely in memory
+- **Cross-spine skip**: Sets `pendingTocIndex` (a `std::optional<int>`) which is resolved after the target section loads in `render()`
+- **Forward past last TOC entry**: Jumps to end-of-book (spine index clamped in `render()`)
+- **Backward before first TOC entry**: Jumps to the spine before the current chapter's first spine (clamped to 0 in `render()`)
+- **No TOC entry for spine** (`curTocIndex < 0`): Falls back to spine-level skip
+
+### Chapter selector
+
+The chapter selection activity receives `currentTocIndex` (per-page, not per-spine) so it highlights the correct sub-chapter. Returns `ChapterResult` with both `spineIndex` and `std::optional<int> tocIndex`. The reader resolves the page via `getPageForTocIndex` for same-spine navigation or defers via `pendingTocIndex` for cross-spine.
+
+### Footnote navigation
+
+Uses the existing `pendingAnchor` mechanism from the footnote anchor navigation commit (4d222567). `getPageForAnchor` does an on-demand linear scan of the on-disk anchor data. This is separate from TOC boundaries -- it reads all anchors (not just TOC ones) and is only called for footnote jumps.
+
+### Status bar
+
+Uses `getTocIndexForPage()` for the chapter title, so the status bar shows the correct sub-chapter name when reading a multi-TOC-per-spine file.
+
+## Orphan spine handling
+
+Spine items without a TOC entry inherit the previous spine's `tocIndex` in `BookMetadataCache`. This means:
+
+- Pre-TOC spines (cover pages) may have `tocIndex == -1` if they're before any chapter
+- Post-TOC spines (appendices, copyright) inherit the last chapter's `tocIndex`
+
+The chapter skip logic guards against `curTocIndex < 0` and falls back to spine-level navigation.
+
+## Implementation pitfalls and edge cases
+
+### Anchor recording timing
+
+The `pendingAnchorId` deferred recording pattern is critical for correctness. Anchors must be recorded *after* `makePages()` flushes the previous text block (so `completedPageCount` reflects the right page) but the TOC page break must happen *before* recording (so the anchor lands on the new page). Both of these happen inside `startNewTextBlock()`. An earlier design used a `recordAnchor` lambda called at various points in `startElement()`, but this had wrong timing for headings and block elements -- `startNewTextBlock` would consume `pendingAnchorId` before `recordAnchor` could force the page break. Moving all page-break logic into `startNewTextBlock` fixed this.
+
+### pendingAnchorId overwrite on consecutive elements
+
+If two elements with `id` attributes appear before any `startNewTextBlock` call (e.g. nested divs), the second `id` overwrites `pendingAnchorId` and the first anchor is never recorded. This is a known limitation inherited from the footnote anchor navigation commit (4d222567) on master. In practice, TOC anchors are on chapter headings which trigger `startNewTextBlock`, so this doesn't affect TOC navigation.
+
+### wordsExtractedInBlock reset on empty block reuse
+
+When `startNewTextBlock` reuses an empty text block (the early-return path), `wordsExtractedInBlock` must be reset to 0. Without this, footnotes in the reused block could be assigned to wrong pages based on stale word counts from a prior block.
+
+### getTocItem() does file I/O
+
+`epub->getTocItem()` reads from `BookMetadataCache` via file seek on every call. This is why `buildTocBoundariesFromFile` caches the TOC anchor strings into a small vector before entering the disk scan loop -- otherwise the inner loop would do file I/O (BookMetadataCache) for every on-disk anchor entry.
+
+### Defensive sort on tocBoundaries
+
+`tocBoundaries` is sorted by `startPage` after building. In well-formed EPUBs, entries are already in order (TOC follows document order). The sort is a safety net for malformed EPUBs where TOC entries might be out of document order. With 1-3 entries it has no measurable cost.
+
+## Test epub
+
+`scripts/generate_spine_toc_edges_epub.py` generates `test/epubs/test_spine_toc_edges.epub`, a purpose-built epub that exercises spine/TOC relationship patterns. See the script header for the full list of edge cases covered.
+
+## Printed-page labels (status bar hint)
+
+The status bar can show the printed-book page number for the current rendered page in addition to the device-relative `currentPage/pageCount` counter, e.g. `(42) 137/305  18%`. The printed-page label is sourced from the EPUB itself; the device counter remains authoritative for spine pagination.
+
+### Three input formats
+
+The reader accepts printed-page data from three places, in priority order:
+
+1. **Inline `doc-pagebreak` markers** in the XHTML (EPUB 3 accessibility convention): any element with `role="doc-pagebreak"` or `epub:type="pagebreak"`. The visible label is read from `aria-label`, falling back to `title`, falling back to the NCX/nav/page-map label if cross-referenced.
+2. **EPUB 3 `<nav epub:type="page-list">`** in the nav document (`TocNavParser`).
+3. **NCX `<pageList>`** (EPUB 2 extension) and **`page-map.xml`** (EPUB 2.01, a separate top-level manifest item with media-type `application/oebps-page-map+xml`), both parsed by `TocNcxParser` / `PageMapParser`.
+
+Only one of (2), (3a), or (3b) writes the cache file `<book-cache>/pagelist.bin`. The nav parser runs first; the NCX page-list is written only if the nav parser found nothing. The page-map parser runs last and is skipped if `pagelist.bin` already exists. Inline `doc-pagebreak` markers always take effect in addition to the cache file (they are matched at chapter parse time, independent of the cache).
+
+### pagelist.bin format
+
+Written once per book at index time; consumed once per section build. Format:
+
+```text
+[uint16_t entryCount]
+[String href][String anchor][String label]    // repeated entryCount times
+```
+
+`href` is the normalised spine href (e.g. `OEBPS/c9_split_000.xhtml`). `anchor` is the fragment id (empty for "start of file"). `label` is the visible printed-page label (e.g. `"42"`, `"iv"`).
+
+### Section parse path
+
+When `Section::createSectionFile` runs for a chapter, it streams `pagelist.bin`, filters to entries whose `href` matches the current spine item, and passes the resulting `(anchor → label)` pairs to `ChapterHtmlSlimParser::setExternalPageBreakAnchors`. During parsing, an element whose `id=` matches a known external anchor is treated as if it carried an inline `doc-pagebreak` marker — the existing `recordPageBreakLabel()` path is reused. The NCX/nav/page-map "start of file" entries (empty anchor) emit their label on the very first element of the chapter.
+
+### Section cache storage
+
+The section cache file (`section.bin`) gained a `pageBreakMap` block: `uint16_t count`, then for each entry `uint16_t pageIndex` + `String label`. The header carries a `pageBreakMapOffset` between `anchorMapOffset` and `paragraphLutOffset`. On reload, `Section::buildPageBreakLabelsFromFile` populates `pageBreakLabels` for status-bar queries.
+
+### Status bar lookup
+
+`Section::getPrintedPageLabelForPage(devicePage)` returns the parenthesised label (e.g. `"(42)"`) for the rendered device page if one or more printed-page anchors land on it. When several labels co-occur on a single device page (short page contains both `page_7` and `page_8`), the result collapses to `"(7/8)"`. Returns `nullopt` when no printed-page anchor falls on this exact device page — in that case the status bar shows only the device counter.
+
+### Sleep overlay lookup
+
+`Section::getPrintedPageLabelFromCache(sectionsDir, spineIndex, page)` is a standalone helper used by `SleepActivity` — it reads the printed-page label directly from `section.bin`'s page-break map without instantiating a `Section` or supplying render parameters. It walks the sections cache directory, finds any cache variant for `spineIndex` (all variants share the same printed-page anchors since those are content-derived), reads its `pageBreakMap` block, and returns the same `"(42)"` formatting as the in-memory query. The function is version-guarded against `SECTION_FILE_VERSION` so a cache from a different layout is skipped silently. Cost: one extra `section.bin` open per sleep entry, skipped when no cache exists.
+
+### "Jump to printed page" navigation
+
+The reader menu exposes a `STR_GO_TO_PRINTED_PAGE` entry, gated on the book having at least one integer-parseable label in `pagelist.bin` (roman-only or empty page lists hide the menu item). Selecting it opens `EpubReaderPrintedPageInputActivity`, a numeric input dialog:
+
+- Up/Down adjust the digit under the cursor by ±1 (with carry). PageBack/PageForward mirror Up/Down so the physical page-turn buttons still work.
+- Left/Right move the cursor between digits.
+- Confirm returns a `PrintedPageResult { std::string label }`; Back cancels.
+- Pre-fills with the printed-page label currently shown on the status bar (stripped of parens), falling back to the lowest integer label in the book.
+- Shows the valid integer range underneath ("Range: 1 - 305") and a step hint.
+
+On confirmation, `EpubReaderActivity` resolves the typed label by linear scan through the loaded `pagelist.bin` entries to recover `(href, anchor)`, calls `Epub::resolveHrefToSpineIndex` to get the target spine, and sets `navTarget = NavigationTarget::makeAnchor(anchor)` (or `makePage(0)` for top-of-file entries). The existing anchor-jump infrastructure in the renderer then handles the actual page-resolution and section load. Labels that exist in the dialog's integer range but skip in the book's `pagelist.bin` (e.g. publisher omitted page 17) are logged at DBG and the reader stays put — no navigation happens.
+
+## Performance characteristics
+
+- **Per page turn**: All in-memory. `getTocIndexForPage` (binary search on 1-3 entries), `getTocItem` for title (one file seek to BookMetadataCache -- noted as a future optimization opportunity).
+- **Section load**: One file open for the section cache. `buildTocBoundariesFromFile` scans the anchor map for a few TOC entries with early exit.
+- **Footnote navigation**: One additional file open to scan the anchor map for a single anchor.
+- **1:1 TOC-to-spine (common case)**: No overhead. `unresolvedCount == 0`, `tocBoundaries` stays empty, all queries fall back to spine-level methods.

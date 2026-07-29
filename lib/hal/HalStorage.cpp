@@ -2,23 +2,50 @@
 #include "HalStorage.h"
 
 #include <FS.h>  // need to be included before SdFat.h for compatibility with FS.h's File class
+#include <HalClock.h>
 #include <Logging.h>
 #include <SDCardManager.h>
+#include <SdFat.h>
 
 #include <cassert>
+#include <ctime>
+#include <new>
 
 #define SDCard SDCardManager::getInstance()
 
 HalStorage HalStorage::instance;
 
-HalStorage::HalStorage() {
-  storageMutex = xSemaphoreCreateMutex();
-  assert(storageMutex != nullptr);
-}
+HalStorage::HalStorage() {}
 
 // begin() and ready() are only called from setup, no need to acquire mutex for them
 
-bool HalStorage::begin() { return SDCard.begin(); }
+bool HalStorage::begin() {
+  // Create the mutex here rather than in the constructor: HalStorage::instance
+  // is a global, and its constructor runs before the FreeRTOS scheduler starts.
+  // Calling xSemaphoreCreateMutex() that early corrupts the TLSF heap metadata.
+  if (!storageMutex) {
+    storageMutex = xSemaphoreCreateMutex();
+    assert(storageMutex != nullptr);
+  }
+  if (!SDCard.begin()) return false;
+  FsDateTime::setCallback([](uint16_t* date, uint16_t* time) {
+    if (!HalClock::isSynced()) {
+      *date = FS_DATE(1980, 1, 1);
+      *time = FS_TIME(0, 0, 0);
+      return;
+    }
+    const time_t t = HalClock::now();
+    const struct tm* tm = localtime(&t);
+    if (!tm) {
+      *date = FS_DATE(1980, 1, 1);
+      *time = FS_TIME(0, 0, 0);
+      return;
+    }
+    *date = FS_DATE(tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday);
+    *time = FS_TIME(tm->tm_hour, tm->tm_min, tm->tm_sec);
+  });
+  return true;
+}
 
 bool HalStorage::ready() const { return SDCard.ready(); }
 
@@ -53,6 +80,23 @@ bool HalStorage::writeFile(const char* path, const String& content) {
 }
 
 bool HalStorage::ensureDirectoryExists(const char* path) { HAL_STORAGE_WRAPPED_CALL(ensureDirectoryExists, path); }
+
+uint64_t HalStorage::sdTotalBytes() const {
+  StorageLock lock;
+  return SDCard.sdTotalBytes();
+}
+
+uint64_t HalStorage::sdUsedBytes() {
+  StorageLock lock;
+  return SDCard.sdUsedBytes();
+}
+
+uint64_t HalStorage::sdFreeBytes() {
+  uint64_t total = sdTotalBytes();
+  uint64_t used = sdUsedBytes();
+  if (total <= used) return 0;
+  return total - used;
+}
 
 class HalFile::Impl {
  public:
@@ -120,6 +164,35 @@ bool HalStorage::openFileForWrite(const char* moduleName, const String& path, Ha
 
 bool HalStorage::removeDir(const char* path) { HAL_STORAGE_WRAPPED_CALL(removeDir, path); }
 
+bool HalStorage::copyFile(const char* moduleName, const std::string& srcPath, const char* dstPath) {
+  HalFile src, dst;
+  if (!openFileForRead(moduleName, srcPath, src)) return false;
+  if (!openFileForWrite(moduleName, dstPath, dst)) {
+    src.close();
+    return false;
+  }
+  constexpr size_t BUF_SIZE = 4096;
+  auto* buf = new (std::nothrow) uint8_t[BUF_SIZE];
+  if (!buf) {
+    dst.close();
+    src.close();
+    return false;
+  }
+  bool ok = true;
+  while (src.available()) {
+    const auto bytesRead = src.read(buf, BUF_SIZE);
+    if (bytesRead <= 0) break;
+    if (dst.write(buf, bytesRead) != static_cast<size_t>(bytesRead)) {
+      ok = false;
+      break;
+    }
+  }
+  delete[] buf;
+  dst.close();
+  src.close();
+  return ok;
+}
+
 // HalFile implementation
 // Allow doing file operations while ensuring thread safety via HalStorage's mutex.
 // Please keep the list below in sync with the HalFile.h header
@@ -135,23 +208,41 @@ bool HalStorage::removeDir(const char* path) { HAL_STORAGE_WRAPPED_CALL(removeDi
 
 void HalFile::flush() { HAL_FILE_WRAPPED_CALL(flush, ); }
 size_t HalFile::getName(char* name, size_t len) { HAL_FILE_WRAPPED_CALL(getName, name, len); }
-size_t HalFile::size() { HAL_FILE_FORWARD_CALL(size, ); }              // already thread-safe, no need to wrap
-size_t HalFile::fileSize() { HAL_FILE_FORWARD_CALL(fileSize, ); }      // already thread-safe, no need to wrap
-uint64_t HalFile::fileSize64() { HAL_FILE_FORWARD_CALL(fileSize, ); }  // already thread-safe, no need to wrap
+size_t HalFile::size() {
+  assert(impl != nullptr);
+  return static_cast<size_t>(impl->file.size());
+}
+size_t HalFile::fileSize() {
+  assert(impl != nullptr);
+  return static_cast<size_t>(impl->file.fileSize());
+}
 bool HalFile::seek(size_t pos) { HAL_FILE_WRAPPED_CALL(seekSet, pos); }
-bool HalFile::seek64(uint64_t pos) { HAL_FILE_WRAPPED_CALL(seekSet, pos); }
 bool HalFile::seekCur(int64_t offset) { HAL_FILE_WRAPPED_CALL(seekCur, offset); }
 bool HalFile::seekSet(size_t offset) { HAL_FILE_WRAPPED_CALL(seekSet, offset); }
 int HalFile::available() const { HAL_FILE_WRAPPED_CALL(available, ); }
-size_t HalFile::position() const { HAL_FILE_WRAPPED_CALL(position, ); }
+size_t HalFile::position() const {
+  assert(impl != nullptr);
+  return static_cast<size_t>(impl->file.position());
+}
 int HalFile::read(void* buf, size_t count) { HAL_FILE_WRAPPED_CALL(read, buf, count); }
 int HalFile::read() { HAL_FILE_WRAPPED_CALL(read, ); }
 size_t HalFile::write(const void* buf, size_t count) { HAL_FILE_WRAPPED_CALL(write, buf, count); }
 size_t HalFile::write(uint8_t b) { HAL_FILE_WRAPPED_CALL(write, b); }
 bool HalFile::rename(const char* newPath) { HAL_FILE_WRAPPED_CALL(rename, newPath); }
+bool HalFile::getModifyDateTime(uint16_t* pdate, uint16_t* ptime) {
+  HAL_FILE_WRAPPED_CALL(getModifyDateTime, pdate, ptime);
+}
+bool HalFile::getCreateDateTime(uint16_t* pdate, uint16_t* ptime) {
+  HAL_FILE_WRAPPED_CALL(getCreateDateTime, pdate, ptime);
+}
 bool HalFile::isDirectory() const { HAL_FILE_FORWARD_CALL(isDirectory, ); }  // already thread-safe, no need to wrap
 void HalFile::rewindDirectory() { HAL_FILE_WRAPPED_CALL(rewindDirectory, ); }
 bool HalFile::close() { HAL_FILE_WRAPPED_CALL(close, ); }
+uint64_t HalFile::size64() { HAL_FILE_FORWARD_CALL(size, ); }
+uint64_t HalFile::fileSize64() { HAL_FILE_FORWARD_CALL(fileSize, ); }
+bool HalFile::seek64(uint64_t pos) { HAL_FILE_WRAPPED_CALL(seekSet, pos); }
+bool HalFile::seekSet64(uint64_t offset) { HAL_FILE_WRAPPED_CALL(seekSet, offset); }
+uint64_t HalFile::position64() const { HAL_FILE_FORWARD_CALL(position, ); }
 HalFile HalFile::openNextFile() {
   HalStorage::StorageLock lock;
   assert(impl != nullptr);

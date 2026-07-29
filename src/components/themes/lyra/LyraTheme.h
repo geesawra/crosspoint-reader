@@ -14,7 +14,7 @@ constexpr ThemeMetrics values = {.batteryWidth = 16,
                                  .verticalSpacing = 16,
                                  .contentSidePadding = 20,
                                  .listRowHeight = 40,
-                                 .listWithSubtitleRowHeight = 60,
+                                 .listWithSubtitleRowHeight = 68,
                                  .menuRowHeight = 64,
                                  .menuSpacing = 8,
                                  .tabSpacing = 8,
@@ -25,8 +25,6 @@ constexpr ThemeMetrics values = {.batteryWidth = 16,
                                  .homeCoverHeight = 226,
                                  .homeCoverTileHeight = 242,
                                  .homeRecentBooksCount = 1,
-                                 .homeContinueReadingInMenu = false,
-                                 .homeMenuTopOffset = 16,
                                  .buttonHintsHeight = 40,
                                  .sideButtonHintsWidth = 30,
                                  .progressBarHeight = 16,
@@ -42,37 +40,15 @@ constexpr ThemeMetrics values = {.batteryWidth = 16,
                                  .keyboardCenteredText = false,
                                  .keyboardVerticalOffset = -7,
                                  .keyboardTextFieldWidthPercent = 85,
-                                 .keyboardWidthPercent = 90,
-                                 .keyboardKeyCornerRadius = 6,
-                                 .keyboardFillUnselected = false,
-                                 .keyboardOutlineAllUnselected = false,
-                                 .keyboardDrawSpecialOutlineWhenUnselected = true,
-                                 .keyboardSecondaryLabelRightPadding = 1,
-                                 .keyboardSecondaryLabelTopPadding = 0,
-                                 .keyboardMinArrowHeadSize = 0,
-                                 .popupTopOffsetRatio = 0.165f,
-                                 .popupMarginX = 16,
-                                 .popupMarginY = 12,
-                                 .popupFrameThickness = 2,
-                                 .popupCornerRadius = 6,
-                                 .popupTextBold = false,
-                                 .popupTextInverted = false,
-                                 .popupTextBaselineOffsetY = -2,
-                                 .popupProgressBarHeight = 4,
-                                 .popupProgressDrawOutline = false,
-                                 .popupProgressClampPercent = false,
-                                 .popupProgressFillInverted = false,
-                                 .popupProgressOutlineInverted = false,
-                                 .textFieldHorizontalPadding = 6,
-                                 .textFieldNormalThickness = 1,
-                                 .textFieldCursorThickness = 3,
-                                 .textFieldLineEndOffset = 0};
+                                 .keyboardWidthPercent = 90};
 }
 
 class LyraTheme : public BaseTheme {
  public:
   // Component drawing methods
-  void fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage) const override;
+  //   void drawProgressBar(const GfxRenderer& renderer, Rect rect, size_t current, size_t total) override;
+  void drawBatteryLeft(const GfxRenderer& renderer, Rect rect, bool showPercentage = true) const override;
+  void drawBatteryRight(const GfxRenderer& renderer, Rect rect, bool showPercentage = true) const override;
   void drawHeader(const GfxRenderer& renderer, Rect rect, const char* title, const char* subtitle) const override;
   void drawSubHeader(const GfxRenderer& renderer, Rect rect, const char* label,
                      const char* rightLabel = nullptr) const override;
@@ -82,7 +58,7 @@ class LyraTheme : public BaseTheme {
                 const std::function<std::string(int index)>& rowTitle,
                 const std::function<std::string(int index)>& rowSubtitle,
                 const std::function<UIIcon(int index)>& rowIcon, const std::function<std::string(int index)>& rowValue,
-                bool highlightValue, const std::function<bool(int index)>& rowDimmed = nullptr) const override;
+                bool highlightValue) const override;
   void drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
                        const char* btn4) const override;
   void drawSideButtonHints(const GfxRenderer& renderer, const char* topBtn, const char* bottomBtn) const override;
@@ -93,5 +69,16 @@ class LyraTheme : public BaseTheme {
                            const int selectorIndex, bool& coverRendered, bool& coverBufferStored, bool& bufferRestored,
                            std::function<bool()> storeCoverBuffer) const override;
   void drawEmptyRecents(const GfxRenderer& renderer, const Rect rect) const;
+  Rect drawPopup(const GfxRenderer& renderer, const char* message, bool overlayDisplayedFrame = true) const override;
+  void fillPopupProgress(const GfxRenderer& renderer, const Rect& layout, const int progress) const override;
+  void drawTextField(const GfxRenderer& renderer, Rect rect, const int textWidth, bool cursorMode = false,
+                     int contentStartX = 0, int contentWidth = 0) const override;
+  void drawKeyboardKey(const GfxRenderer& renderer, Rect rect, const char* label, const bool isSelected,
+                       const char* secondaryLabel = nullptr, KeyboardKeyType keyType = KeyboardKeyType::Normal,
+                       bool inactiveSelection = false) const override;
   bool showsFileIcons() const override { return true; }
+
+ protected:
+  static int getRecentBookProgressPercent(const RecentBook& book);
+  static const uint8_t* iconForName(UIIcon icon, int size);
 };

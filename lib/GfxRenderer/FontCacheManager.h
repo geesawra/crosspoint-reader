@@ -16,6 +16,9 @@ class FontCacheManager {
   void setFontDecompressor(FontDecompressor* d);
 
   void clearCache();
+  // Prewarm one font's glyphs for the given text. Appends into existing page slots
+  // WITHOUT clearing them (multi-font pages call this once per font); clear once via
+  // clearCache() before a batch — endScanAndPrewarm() does exactly that.
   void prewarmCache(int fontId, const char* utf8Text, uint8_t styleMask = 0x0F);
   void logStats(const char* label = "render");
   void resetStats();
@@ -51,7 +54,17 @@ class FontCacheManager {
 
   enum class ScanMode : uint8_t { None, Scanning };
   ScanMode scanMode_ = ScanMode::None;
-  std::string scanText_;
-  uint32_t scanStyleCounts_[4] = {};
-  int scanFontId_ = -1;
+  // Prewarm scan accumulates text PER fontId, not just the first one seen. A page that mixes
+  // fonts — e.g. a chapter opener with an h1/h2 heading in a taller font plus body text — must
+  // prewarm every font it uses, or the render thrashes the glyph cache (seconds of per-glyph
+  // flash decode) on whichever font wasn't warmed. Typically 1-2 entries.
+  //
+  // Within a font, text is kept PER BASE STYLE (R/B/I/BI) so each style slot is warmed with
+  // only the glyphs actually drawn in that style. Sharing one text buffer across styles warmed
+  // the WHOLE page into every style that appeared — one italic word cost a full ~4-5 KB italic
+  // slot, and a bionic page held 4 full slots (~20-26 KB of page buffers instead of ~5-8 KB).
+  struct ScanEntry {
+    std::string textByStyle[4];
+  };
+  std::map<int, ScanEntry> scanByFont_;
 };

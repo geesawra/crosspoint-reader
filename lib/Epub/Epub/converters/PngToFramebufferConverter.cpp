@@ -1,269 +1,133 @@
 #include "PngToFramebufferConverter.h"
 
+#include <BitmapHelpers.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <Logging.h>
-#include <PNGdec.h>
+#include <PngStreamDecoder.h>
+#include <esp_task_wdt.h>
 
 #include <cstdlib>
+#include <memory>
 #include <new>
 
 #include "DirectPixelWriter.h"
 #include "DitherUtils.h"
 #include "PixelCache.h"
 
+// PNG decode now runs on uzlib (PngStreamDecoder) instead of PNGdec. The PNGdec
+// PNGIMAGE object was ~49.5 KB — larger than the 48 KB framebuffer the reader
+// frees to make room for it — so `new PNG()` failed intermittently under heap
+// fragmentation and images silently vanished. PngStreamDecoder needs only the
+// DEFLATE window (≤32 KB, sized down for small images) plus a couple of scanline
+// buffers, so it fits the freed framebuffer with margin.
+
 namespace {
 
-// Context struct passed through PNGdec callbacks to avoid global mutable state.
-// The draw callback receives this via pDraw->pUser (set by png.decode()).
-// The file I/O callbacks receive the FsFile* via pFile->fHandle (set by pngOpen()).
-struct PngContext {
-  GfxRenderer* renderer{nullptr};
+// Ditherer state, mirroring the modes the old PNGdec path supported:
+//   monochromeOutput -> 1-bit Atkinson (reader images)
+//   else             -> 4-level Bayer (sleep-screen grayscale planes), plus the
+//                       optional error-diffusion ditherers behind the extension flag.
+struct DitherState {
   const RenderConfig* config{nullptr};
-  int screenWidth{0};
-  int screenHeight{0};
-
-  // Scaling state
-  float scale{1.f};
-  int srcWidth{0};
-  int srcHeight{0};
-  int dstWidth{0};
-  int dstHeight{0};
-  int lastDstY{-1};  // Track last rendered destination Y to avoid duplicates
-
-  PixelCache cache;
-  bool caching{false};
-
-  uint8_t* grayLineBuffer{nullptr};
+  std::unique_ptr<Atkinson1BitDitherer> atkinson1Bit;
+#ifdef ENABLE_IMAGE_DITHERING_EXTENSION
+  std::unique_ptr<AtkinsonDitherer> atkinson4;
+  std::unique_ptr<DiffusedBayerDitherer> bayerDiff;
+#endif
 };
 
-// File I/O callbacks use pFile->fHandle to access the FsFile*,
-// avoiding the need for global file state.
-void* pngOpenWithHandle(const char* filename, int32_t* size) {
-  FsFile* f = new FsFile();
-  if (!Storage.openFileForRead("PNG", std::string(filename), *f)) {
-    delete f;
-    return nullptr;
-  }
-  *size = f->size();
-  return f;
-}
-
-void pngCloseWithHandle(void* handle) {
-  FsFile* f = reinterpret_cast<FsFile*>(handle);
-  if (f) {
-    f->close();
-    delete f;
-  }
-}
-
-int32_t pngReadWithHandle(PNGFILE* pFile, uint8_t* pBuf, int32_t len) {
-  FsFile* f = reinterpret_cast<FsFile*>(pFile->fHandle);
-  if (!f) return 0;
-  return f->read(pBuf, len);
-}
-
-int32_t pngSeekWithHandle(PNGFILE* pFile, int32_t pos) {
-  FsFile* f = reinterpret_cast<FsFile*>(pFile->fHandle);
-  if (!f) return -1;
-  return f->seek(pos);
-}
-
-// The PNG decoder (PNGdec) is ~42 KB due to internal zlib decompression buffers.
-// We heap-allocate it on demand rather than using a static instance, so this memory
-// is only consumed while actually decoding/querying PNG images. This is critical on
-// the ESP32-C3 where total RAM is ~320 KB.
-constexpr size_t PNG_DECODER_APPROX_SIZE = 44 * 1024;                          // ~42 KB + overhead
-constexpr size_t MIN_FREE_HEAP_FOR_PNG = PNG_DECODER_APPROX_SIZE + 16 * 1024;  // decoder + 16 KB headroom
-
-// PNGdec keeps TWO scanlines in its internal ucPixels buffer (current + previous)
-// and each scanline includes a leading filter byte.
-// Required storage is therefore approximately: 2 * (pitch + 1) + alignment slack.
-// If PNG_MAX_BUFFERED_PIXELS is smaller than this requirement for a given image,
-// PNGdec can overrun its internal buffer before our draw callback executes.
-int bytesPerPixelFromType(int pixelType) {
-  switch (pixelType) {
-    case PNG_PIXEL_TRUECOLOR:
-      return 3;
-    case PNG_PIXEL_GRAY_ALPHA:
-      return 2;
-    case PNG_PIXEL_TRUECOLOR_ALPHA:
-      return 4;
-    case PNG_PIXEL_GRAYSCALE:
-    case PNG_PIXEL_INDEXED:
-    default:
-      return 1;
-  }
-}
-
-int requiredPngInternalBufferBytes(int srcWidth, int pixelType) {
-  // +1 filter byte per scanline, *2 for current+previous lines, +32 for alignment margin.
-  int pitch = srcWidth * bytesPerPixelFromType(pixelType);
-  return ((pitch + 1) * 2) + 32;
-}
-
-// Convert entire source line to grayscale with alpha blending to white background.
-// For indexed PNGs with tRNS chunk, alpha values are stored at palette[768] onwards.
-// Processing the whole line at once improves cache locality and reduces per-pixel overhead.
-void convertLineToGray(uint8_t* pPixels, uint8_t* grayLine, int width, int pixelType, uint8_t* palette, int hasAlpha) {
-  switch (pixelType) {
-    case PNG_PIXEL_GRAYSCALE:
-      memcpy(grayLine, pPixels, width);
-      break;
-
-    case PNG_PIXEL_TRUECOLOR:
-      for (int x = 0; x < width; x++) {
-        uint8_t* p = &pPixels[x * 3];
-        grayLine[x] = (uint8_t)((p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8);
-      }
-      break;
-
-    case PNG_PIXEL_INDEXED:
-      if (palette) {
-        if (hasAlpha) {
-          for (int x = 0; x < width; x++) {
-            uint8_t idx = pPixels[x];
-            uint8_t* p = &palette[idx * 3];
-            uint8_t gray = (uint8_t)((p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8);
-            uint8_t alpha = palette[768 + idx];
-            grayLine[x] = (uint8_t)((gray * alpha + 255 * (255 - alpha)) / 255);
-          }
-        } else {
-          for (int x = 0; x < width; x++) {
-            uint8_t* p = &palette[pPixels[x] * 3];
-            grayLine[x] = (uint8_t)((p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8);
-          }
-        }
-      } else {
-        memcpy(grayLine, pPixels, width);
-      }
-      break;
-
-    case PNG_PIXEL_GRAY_ALPHA:
-      for (int x = 0; x < width; x++) {
-        uint8_t gray = pPixels[x * 2];
-        uint8_t alpha = pPixels[x * 2 + 1];
-        grayLine[x] = (uint8_t)((gray * alpha + 255 * (255 - alpha)) / 255);
-      }
-      break;
-
-    case PNG_PIXEL_TRUECOLOR_ALPHA:
-      for (int x = 0; x < width; x++) {
-        uint8_t* p = &pPixels[x * 4];
-        uint8_t gray = (uint8_t)((p[0] * 77 + p[1] * 150 + p[2] * 29) >> 8);
-        uint8_t alpha = p[3];
-        grayLine[x] = (uint8_t)((gray * alpha + 255 * (255 - alpha)) / 255);
-      }
-      break;
-
-    default:
-      memset(grayLine, 128, width);
-      break;
-  }
-}
-
-int pngDrawCallback(PNGDRAW* pDraw) {
-  PngContext* ctx = reinterpret_cast<PngContext*>(pDraw->pUser);
-  if (!ctx || !ctx->config || !ctx->renderer || !ctx->grayLineBuffer) return 0;
-
-  int srcY = pDraw->y;
-  int srcWidth = ctx->srcWidth;
-
-  // Calculate destination Y with scaling
-  int dstY = (int)(srcY * ctx->scale);
-
-  // Skip if we already rendered this destination row (multiple source rows map to same dest)
-  if (dstY == ctx->lastDstY) return 1;
-  ctx->lastDstY = dstY;
-
-  // Check bounds
-  if (dstY >= ctx->dstHeight) return 1;
-
-  int outY = ctx->config->y + dstY;
-  if (outY >= ctx->screenHeight) return 1;
-
-  // Convert entire source line to grayscale (improves cache locality)
-  convertLineToGray(pDraw->pPixels, ctx->grayLineBuffer, srcWidth, pDraw->iPixelType, pDraw->pPalette,
-                    pDraw->iHasAlpha);
-
-  // Render scaled row using Bresenham-style integer stepping (no floating-point division)
-  int dstWidth = ctx->dstWidth;
-  int outXBase = ctx->config->x;
-  int screenWidth = ctx->screenWidth;
-  bool useDithering = ctx->config->useDithering;
-  bool caching = ctx->caching;
-
-  // Pre-compute orientation and render-mode state once per row
-  DirectPixelWriter pw;
-  pw.init(*ctx->renderer);
-  pw.beginRow(outY);
-
-  DirectCacheWriter cw;
-  if (caching) {
-    cw.init(ctx->cache.buffer, ctx->cache.bytesPerRow, ctx->cache.originX);
-    cw.beginRow(outY, ctx->config->y);
-  }
-
-  int srcX = 0;
-  int error = 0;
-
-  for (int dstX = 0; dstX < dstWidth; dstX++) {
-    int outX = outXBase + dstX;
-    if (outX < screenWidth) {
-      uint8_t gray = ctx->grayLineBuffer[srcX];
-
-      uint8_t ditheredGray;
-      if (useDithering) {
-        ditheredGray = applyBayerDither4Level(gray, outX, outY);
-      } else {
-        ditheredGray = gray / 85;
-        if (ditheredGray > 3) ditheredGray = 3;
-      }
-      pw.writePixel(outX, ditheredGray);
-      if (caching) cw.writePixel(outX, ditheredGray);
-    }
-
-    // Bresenham-style stepping: advance srcX based on ratio srcWidth/dstWidth
-    error += srcWidth;
-    while (error >= dstWidth) {
-      error -= dstWidth;
-      srcX++;
+// Map one grayscale sample to a 2-bit value (0..3). Called for every destination
+// column — including off-screen ones — so error-diffusion state stays consistent
+// across the row; only the framebuffer/cache write is bounds-guarded by the caller.
+uint8_t ditherGray(DitherState& d, uint8_t gray, int localX, int outX, int outY) {
+  if (d.atkinson1Bit) return d.atkinson1Bit->processPixel(gray, localX) ? 3 : 0;
+#ifdef ENABLE_IMAGE_DITHERING_EXTENSION
+  if (d.config->useDithering) {
+    switch (d.config->ditherMode) {
+      case ImageDitherMode::Atkinson:
+        if (d.atkinson4) return d.atkinson4->processPixel(gray, localX);
+        break;
+      case ImageDitherMode::DiffusedBayer:
+        if (d.bayerDiff) return d.bayerDiff->processPixel(gray, localX, outX, outY);
+        break;
+      default:
+        break;
     }
   }
-
-  return 1;
+#endif
+  return applyBayerDither4Level(gray, outX, outY);
 }
+
+void advanceDitherRow(DitherState& d) {
+  if (d.atkinson1Bit) d.atkinson1Bit->nextRow();
+#ifdef ENABLE_IMAGE_DITHERING_EXTENSION
+  if (d.atkinson4) d.atkinson4->nextRow();
+  if (d.bayerDiff) d.bayerDiff->nextRow();
+#endif
+}
+
+// Below this free heap we don't even start: the uzlib ring (≤32 KB) plus scanline
+// buffers won't fit. begin() also fails gracefully if a specific malloc fails.
+constexpr size_t PNG_DECODE_HEAP_FLOOR = 36 * 1024;
 
 }  // namespace
 
+bool PngToFramebufferConverter::getDimensionsFromBuffer(const uint8_t* buf, const size_t len, ImageDimensions& out) {
+  if (!buf || len < 24) return false;
+  static constexpr uint8_t kPngSig[8] = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
+  if (memcmp(buf, kPngSig, 8) != 0) return false;
+  if (buf[12] != 'I' || buf[13] != 'H' || buf[14] != 'D' || buf[15] != 'R') return false;
+  const uint32_t w =
+      ((uint32_t)buf[16] << 24) | ((uint32_t)buf[17] << 16) | ((uint32_t)buf[18] << 8) | (uint32_t)buf[19];
+  const uint32_t h =
+      ((uint32_t)buf[20] << 24) | ((uint32_t)buf[21] << 16) | ((uint32_t)buf[22] << 8) | (uint32_t)buf[23];
+  if (w == 0 || h == 0 || w > 0x7FFF || h > 0x7FFF) return false;
+  out.width = static_cast<int16_t>(w);
+  out.height = static_cast<int16_t>(h);
+  return true;
+}
+
 bool PngToFramebufferConverter::getDimensionsStatic(const std::string& imagePath, ImageDimensions& out) {
-  size_t freeHeap = ESP.getFreeHeap();
-  if (freeHeap < MIN_FREE_HEAP_FOR_PNG) {
-    LOG_ERR("PNG", "Not enough heap for PNG decoder (%u free, need %u)", freeHeap, MIN_FREE_HEAP_FOR_PNG);
+  // PNG file layout: 8-byte signature, then chunks. The IHDR chunk is mandatory and
+  // must be the first chunk: 4 bytes length + "IHDR" + 13 bytes IHDR data + 4 bytes CRC.
+  // Width and height live at bytes 16..23 (big-endian uint32s) of the file. Reading
+  // those bytes directly avoids allocating any decode buffers.
+  FsFile f;
+  if (!Storage.openFileForRead("PNG", imagePath, f)) {
+    LOG_ERR("PNG", "Failed to open file for dimensions: %s", imagePath.c_str());
     return false;
   }
 
-  PNG* png = new (std::nothrow) PNG();
-  if (!png) {
-    LOG_ERR("PNG", "Failed to allocate PNG decoder for dimensions");
+  uint8_t hdr[24];
+  int n = f.read(hdr, sizeof(hdr));
+  f.close();
+  if (n < (int)sizeof(hdr)) {
+    LOG_ERR("PNG", "Short read on PNG header: %s", imagePath.c_str());
     return false;
   }
 
-  int rc = png->open(imagePath.c_str(), pngOpenWithHandle, pngCloseWithHandle, pngReadWithHandle, pngSeekWithHandle,
-                     nullptr);
-
-  if (rc != 0) {
-    LOG_ERR("PNG", "Failed to open PNG for dimensions: %d", rc);
-    delete png;
+  static constexpr uint8_t kPngSig[8] = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
+  if (memcmp(hdr, kPngSig, 8) != 0) {
+    LOG_ERR("PNG", "Not a PNG file: %s", imagePath.c_str());
+    return false;
+  }
+  if (hdr[12] != 'I' || hdr[13] != 'H' || hdr[14] != 'D' || hdr[15] != 'R') {
+    LOG_ERR("PNG", "First chunk not IHDR: %s", imagePath.c_str());
     return false;
   }
 
-  out.width = png->getWidth();
-  out.height = png->getHeight();
+  uint32_t width = ((uint32_t)hdr[16] << 24) | ((uint32_t)hdr[17] << 16) | ((uint32_t)hdr[18] << 8) | (uint32_t)hdr[19];
+  uint32_t height =
+      ((uint32_t)hdr[20] << 24) | ((uint32_t)hdr[21] << 16) | ((uint32_t)hdr[22] << 8) | (uint32_t)hdr[23];
+  if (width == 0 || height == 0 || width > 0x7FFF || height > 0x7FFF) {
+    LOG_ERR("PNG", "Implausible PNG dimensions %ux%u: %s", width, height, imagePath.c_str());
+    return false;
+  }
 
-  png->close();
-  delete png;
+  out.width = (int16_t)width;
+  out.height = (int16_t)height;
   return true;
 }
 
@@ -271,130 +135,165 @@ bool PngToFramebufferConverter::decodeToFramebuffer(const std::string& imagePath
                                                     const RenderConfig& config) {
   LOG_DBG("PNG", "Decoding PNG: %s", imagePath.c_str());
 
-  size_t freeHeap = ESP.getFreeHeap();
-  if (freeHeap < MIN_FREE_HEAP_FOR_PNG) {
-    LOG_ERR("PNG", "Not enough heap for PNG decoder (%u free, need %u)", freeHeap, MIN_FREE_HEAP_FOR_PNG);
+  const size_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < PNG_DECODE_HEAP_FLOOR) {
+    LOG_ERR("PNG", "Not enough heap for PNG decode (%u free, need %u)", (unsigned)freeHeap,
+            (unsigned)PNG_DECODE_HEAP_FLOOR);
     return false;
   }
 
-  // Heap-allocate PNG decoder (~42 KB) - freed at end of function
-  PNG* png = new (std::nothrow) PNG();
-  if (!png) {
+  FsFile file;
+  if (!Storage.openFileForRead("PNG", imagePath, file)) {
+    LOG_ERR("PNG", "Failed to open PNG: %s", imagePath.c_str());
+    return false;
+  }
+
+  auto decoder = std::unique_ptr<PngStreamDecoder>(new (std::nothrow) PngStreamDecoder());
+  if (!decoder) {
     LOG_ERR("PNG", "Failed to allocate PNG decoder");
+    file.close();
+    return false;
+  }
+  PngStreamDecoder::Info info;
+  if (!decoder->begin(file, info)) {
+    LOG_ERR("PNG", "Failed to start PNG decode: %s", imagePath.c_str());
+    file.close();
     return false;
   }
 
-  PngContext ctx;
-  ctx.renderer = &renderer;
-  ctx.config = &config;
-  ctx.screenWidth = renderer.getScreenWidth();
-  ctx.screenHeight = renderer.getScreenHeight();
+  const int srcWidth = static_cast<int>(info.width);
+  const int srcHeight = static_cast<int>(info.height);
+  const int screenWidth = renderer.getScreenWidth();
+  const int screenHeight = renderer.getScreenHeight();
 
-  int rc = png->open(imagePath.c_str(), pngOpenWithHandle, pngCloseWithHandle, pngReadWithHandle, pngSeekWithHandle,
-                     pngDrawCallback);
-  if (rc != PNG_SUCCESS) {
-    LOG_ERR("PNG", "Failed to open PNG: %d", rc);
-    delete png;
-    return false;
-  }
-
-  if (!validateImageDimensions(png->getWidth(), png->getHeight(), "PNG")) {
-    png->close();
-    delete png;
-    return false;
-  }
-
-  // Calculate output dimensions
-  ctx.srcWidth = png->getWidth();
-  ctx.srcHeight = png->getHeight();
-
+  // Output dimensions (same policy as the old decoder).
+  int dstWidth, dstHeight;
   if (config.useExactDimensions && config.maxWidth > 0 && config.maxHeight > 0) {
-    // Use exact dimensions as specified (avoids rounding mismatches with pre-calculated sizes)
-    ctx.dstWidth = config.maxWidth;
-    ctx.dstHeight = config.maxHeight;
-    ctx.scale = (float)ctx.dstWidth / ctx.srcWidth;
+    dstWidth = config.maxWidth;
+    dstHeight = config.maxHeight;
   } else {
-    // Calculate scale factor to fit within maxWidth/maxHeight
-    float scaleX = (float)config.maxWidth / ctx.srcWidth;
-    float scaleY = (float)config.maxHeight / ctx.srcHeight;
-    ctx.scale = (scaleX < scaleY) ? scaleX : scaleY;
-    if (ctx.scale > 1.0f) ctx.scale = 1.0f;  // Don't upscale
-
-    ctx.dstWidth = (int)(ctx.srcWidth * ctx.scale);
-    ctx.dstHeight = (int)(ctx.srcHeight * ctx.scale);
+    const float scaleX = (float)config.maxWidth / srcWidth;
+    const float scaleY = (float)config.maxHeight / srcHeight;
+    float scale = (scaleX < scaleY) ? scaleX : scaleY;
+    if (scale > 1.0f) scale = 1.0f;  // never upscale
+    dstWidth = (int)(srcWidth * scale);
+    dstHeight = (int)(srcHeight * scale);
+    if (dstWidth < 1) dstWidth = 1;
+    if (dstHeight < 1) dstHeight = 1;
   }
-  ctx.lastDstY = -1;  // Reset row tracking
+  // Aspect ratio is preserved by the caller's sizing, so a single factor maps both axes.
+  const float scale = (float)dstWidth / srcWidth;
 
-  LOG_DBG("PNG", "PNG %dx%d -> %dx%d (scale %.2f), bpp: %d", ctx.srcWidth, ctx.srcHeight, ctx.dstWidth, ctx.dstHeight,
-          ctx.scale, png->getBpp());
+  LOG_DBG("PNG", "PNG %dx%d -> %dx%d (scale %.2f), colorType=%d bitDepth=%d", srcWidth, srcHeight, dstWidth, dstHeight,
+          scale, info.colorType, info.bitDepth);
 
-  const int pixelType = png->getPixelType();
-  const int requiredInternal = requiredPngInternalBufferBytes(ctx.srcWidth, pixelType);
-  if (requiredInternal > PNG_MAX_BUFFERED_PIXELS) {
-    LOG_ERR("PNG",
-            "PNG row buffer too small: need %d bytes for width=%d type=%d, configured PNG_MAX_BUFFERED_PIXELS=%d",
-            requiredInternal, ctx.srcWidth, pixelType, PNG_MAX_BUFFERED_PIXELS);
-    LOG_ERR("PNG", "Aborting decode to avoid PNGdec internal buffer overflow");
-    png->close();
-    delete png;
-    return false;
-  }
-
-  if (png->getBpp() != 8) {
-    warnUnsupportedFeature("bit depth (" + std::to_string(png->getBpp()) + "bpp)", imagePath);
-  }
-
-  // Allocate grayscale line buffer on demand (~3.2 KB) - freed after decode
-  const size_t grayBufSize = PNG_MAX_BUFFERED_PIXELS / 2;
-  ctx.grayLineBuffer = static_cast<uint8_t*>(malloc(grayBufSize));
-  if (!ctx.grayLineBuffer) {
+  auto grayLine = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[srcWidth]);
+  if (!grayLine) {
     LOG_ERR("PNG", "Failed to allocate gray line buffer");
-    png->close();
-    delete png;
+    file.close();
     return false;
   }
 
-  // Allocate cache buffer using SCALED dimensions.
-  // PNG decode is fast enough (~135ms for 400x600) that caching provides minimal benefit
-  // for larger images, while the cache buffer competes with the 44KB PNG decoder for heap.
-  // Skip caching when the buffer would exceed the framebuffer size (48KB).
-  static constexpr size_t PNG_MAX_CACHE_BYTES = 48000;
-  ctx.caching = !config.cachePath.empty();
-  if (ctx.caching) {
-    size_t cacheSize = (size_t)((ctx.dstWidth + 3) / 4) * ctx.dstHeight;
-    if (cacheSize > PNG_MAX_CACHE_BYTES) {
-      LOG_DBG("PNG", "Skipping cache: %zu bytes exceeds PNG limit (%zu)", cacheSize, PNG_MAX_CACHE_BYTES);
-      ctx.caching = false;
-    } else if (!ctx.cache.allocate(ctx.dstWidth, ctx.dstHeight, config.x, config.y)) {
-      LOG_ERR("PNG", "Failed to allocate cache buffer, continuing without caching");
-      ctx.caching = false;
+  DitherState dither;
+  dither.config = &config;
+  if (config.monochromeOutput) {
+    dither.atkinson1Bit.reset(new (std::nothrow) Atkinson1BitDitherer(dstWidth));
+  }
+#ifdef ENABLE_IMAGE_DITHERING_EXTENSION
+  else if (config.useDithering) {
+    switch (config.ditherMode) {
+      case ImageDitherMode::Atkinson:
+        dither.atkinson4.reset(new (std::nothrow) AtkinsonDitherer(dstWidth));
+        break;
+      case ImageDitherMode::DiffusedBayer:
+        dither.bayerDiff.reset(new (std::nothrow) DiffusedBayerDitherer(dstWidth));
+        break;
+      default:
+        break;
+    }
+  }
+#endif
+
+  // Stream the 2-bit pixel cache to disk one row band at a time.
+  PixelCache cache;
+  bool caching = !config.cachePath.empty();
+  if (caching && !cache.begin(config.cachePath, dstWidth, dstHeight, config.x, config.y, 1)) {
+    LOG_ERR("PNG", "Failed to start cache stream, continuing without caching");
+    caching = false;
+  }
+
+  DirectPixelWriter pw;
+  pw.init(renderer);
+
+  bool ok = true;
+  int lastDstY = -1;
+  const unsigned long decodeStart = millis();
+
+  for (int srcY = 0; srcY < srcHeight; srcY++) {
+    const int dstY = (int)(srcY * scale);
+    const bool collapsedRow = dstY == lastDstY;
+    if (!(collapsedRow ? decoder->skipRow() : decoder->nextRow(grayLine.get()))) {
+      LOG_ERR("PNG", "Decode failed at row %d", srcY);
+      ok = false;
+      break;
+    }
+    // Feed the WDT periodically: a large image can take seconds to inflate.
+    if ((srcY & 31) == 0) esp_task_wdt_reset();
+
+    if (collapsedRow) continue;
+    if (dstY >= dstHeight) break;
+    lastDstY = dstY;
+
+    const int outY = config.y + dstY;
+    if (outY >= screenHeight) break;
+
+    pw.beginRow(outY);
+
+    DirectCacheWriter cw;
+    bool rowCaching = caching;
+    if (rowCaching) {
+      if (!cache.advanceTo(dstY)) {
+        caching = false;
+        rowCaching = false;
+      } else {
+        cw.init(cache.buffer, cache.bytesPerRow, cache.originX, config.y + cache.bandStart, cache.width,
+                cache.bandRows);
+        cw.beginRow(outY);
+      }
+    }
+
+    // Bresenham-style horizontal scaling: advance srcX by srcWidth/dstWidth per dst column.
+    int srcX = 0;
+    int error = 0;
+    for (int dstX = 0; dstX < dstWidth; dstX++) {
+      const int outX = config.x + dstX;
+      const uint8_t value = ditherGray(dither, grayLine[srcX], dstX, outX, outY);
+      if (outX >= 0 && outX < screenWidth) {
+        pw.writePixel(outX, value);
+        if (rowCaching) cw.writePixel(outX, value);
+      }
+      error += srcWidth;
+      while (error >= dstWidth) {
+        error -= dstWidth;
+        srcX++;
+      }
+    }
+    advanceDitherRow(dither);
+  }
+
+  decoder->end();
+  file.close();
+
+  if (caching) {
+    if (ok) {
+      cache.finalize();
+    } else {
+      cache.abort();
     }
   }
 
-  unsigned long decodeStart = millis();
-  rc = png->decode(&ctx, 0);
-  unsigned long decodeTime = millis() - decodeStart;
-
-  free(ctx.grayLineBuffer);
-  ctx.grayLineBuffer = nullptr;
-
-  if (rc != PNG_SUCCESS) {
-    LOG_ERR("PNG", "Decode failed: %d", rc);
-    png->close();
-    delete png;
-    return false;
-  }
-
-  png->close();
-  delete png;
-  LOG_DBG("PNG", "PNG decoding complete - render time: %lu ms", decodeTime);
-
-  // Write cache file if caching was enabled and buffer was allocated
-  if (ctx.caching) {
-    ctx.cache.writeToFile(config.cachePath);
-  }
-
-  return true;
+  LOG_DBG("PNG", "PNG decoding complete - render time: %lu ms", millis() - decodeStart);
+  return ok;
 }
 
 bool PngToFramebufferConverter::supportsFormat(const std::string& extension) {

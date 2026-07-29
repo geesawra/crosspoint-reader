@@ -1,204 +1,369 @@
 #include "HttpDownloader.h"
 
-#include <HTTPClient.h>
+#include <Arduino.h>
+#include <CrossPointRoots.h>
+#include <HalClock.h>
 #include <Logging.h>
-#include <NetworkClient.h>
-#include <NetworkClientSecure.h>
-#include <StreamString.h>
+#include <SecureHttpClient.h>
 #include <base64.h>
+#include <esp_heap_caps.h>
 
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <string>
 #include <utility>
 
-#include "util/UrlUtils.h"
+#include "CrossPointSettings.h"
+
+// All HTTPS runs over the wolfSSL-backed SecureNet stack (verified against the
+// curated CrossPointRoots); plain http uses SecureNet's WiFiClient passthrough.
+// The former mbedtls/esp_http_client path (with its per-host cert pins and
+// crt_bundle workarounds) has been removed — TLS 1.3 support and lower heap use
+// were the reasons for the switch. See lib/SecureNet.
 
 namespace {
-class FileWriteStream final : public Stream {
- public:
-  FileWriteStream(FsFile& file, size_t total, HttpDownloader::ProgressCallback progress, bool* cancelFlag)
-      : file_(file), total_(total), progress_(std::move(progress)), cancelFlag_(cancelFlag) {}
 
-  size_t write(uint8_t byte) override { return write(&byte, 1); }
+std::string extractHostFromUrl(const std::string& url) {
+  size_t schemeEnd = url.find("://");
+  size_t hostStart = schemeEnd == std::string::npos ? 0 : schemeEnd + 3;
+  size_t hostEnd = url.find('/', hostStart);
+  if (hostEnd == std::string::npos) hostEnd = url.size();
+  return url.substr(hostStart, hostEnd - hostStart);
+}
 
-  size_t write(const uint8_t* buffer, size_t size) override {
-    // Write-through stream for HTTPClient::writeToStream with progress tracking.
-    if (cancelFlag_ && *cancelFlag_) {
-      writeOk_ = false;
-      return 0;
+// wolfSSL rejects certs whose notBefore lies in the future of the device
+// clock (ASN_BEFORE_DATE_E), and expired ones (ASN_AFTER_DATE_E). The
+// ESP32-C3 has no battery-backed RTC, so cold-boot clocks default to 1970
+// (or, if HalClock restored from NVS, a stale "last known" time that may
+// still predate the cert's notBefore). Fix it once per process before the
+// first https request by running SNTP — WiFi is already up by the time
+// runGet() is called, so this is essentially free. Subsequent calls reuse
+// whatever the first attempt produced.
+constexpr time_t MIN_PLAUSIBLE_EPOCH = 1735689600;  // 2025-01-01 00:00:00 UTC
+// Upper bound: a clock far in the future also fails cert notAfter checks. Our
+// curated roots' latest notAfter is 2038; cap at 2037 so a wildly-wrong future
+// clock still triggers SNTP rather than silently breaking verification.
+constexpr time_t MAX_PLAUSIBLE_EPOCH = 2114380800;  // 2037-01-01 00:00:00 UTC
+bool clockPlausibleForTls() {
+  const time_t now = time(nullptr);
+  return now >= MIN_PLAUSIBLE_EPOCH && now < MAX_PLAUSIBLE_EPOCH;
+}
+
+bool ensureClockForTls() {
+  static bool attempted = false;
+  if (attempted) return clockPlausibleForTls();
+  attempted = true;
+
+  // A plausible epoch is sufficient for TLS cert-date validation even if
+  // HalClock flags it "approximate" (restored from NVS on this RTC-less C3):
+  // wolfSSL's notBefore/notAfter check passes for any time within the certs'
+  // validity window, so an approximate-but-in-range clock verifies fine. This
+  // avoids a 5 s SNTP round-trip (and its intermittent timeouts) on every cold
+  // start when NVS already holds a good-enough time. Only sync when the clock
+  // is genuinely unset or out of the plausible range.
+  if (clockPlausibleForTls()) {
+    if (HalClock::isApproximate()) {
+      LOG_INF("HTTP", "Clock approximate but plausible (epoch %ld); skipping SNTP for TLS",
+              static_cast<long>(time(nullptr)));
     }
-    const size_t written = file_.write(buffer, size);
-    if (written != size) {
-      writeOk_ = false;
-    }
-    downloaded_ += written;
-    if (progress_ && total_ > 0) {
-      progress_(downloaded_, total_);
-    }
-    return written;
+    return true;
+  }
+  LOG_INF("HTTP", "Clock unset/implausible (epoch %ld); running SNTP before TLS", static_cast<long>(time(nullptr)));
+  char err[64] = {0};
+  if (!HalClock::syncNtp(err, sizeof(err), SETTINGS.ntpServer)) {
+    LOG_ERR("HTTP", "SNTP sync failed: %s — TLS verification may fail until clock is set", err);
+    return false;
+  }
+  LOG_INF("HTTP", "SNTP sync complete; epoch now %ld", static_cast<long>(time(nullptr)));
+  return true;
+}
+
+// Per-request timeout handed to SecureHttpClient::setTimeout(). 60s gives slow
+// servers room to send their first headers; SecureHttpClient reuses it as the
+// idle deadline for each body read. The response body streams in
+// SecureHttpClient's own READ_CHUNK-sized pieces.
+constexpr int HTTP_TIMEOUT_MS = 60000;
+
+struct Sink {
+  // Returns false to abort the transfer (e.g. SD write failure or user cancel).
+  std::function<bool(const uint8_t*, size_t)> write;
+  HttpDownloader::ProgressCallback progress;
+  size_t total = 0;
+  size_t downloaded = 0;
+};
+
+bool isRedirect(int status) {
+  return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+}
+
+// Runs once per http call (or once per session for reused sessions): logs
+// heap stats and ensures the wall clock is set so TLS cert-date validation
+// can succeed. Shared by both TLS backends.
+void logPreCallContext(const std::string& url) {
+  LOG_DBG("HTTP", "Heap free: %u, largest block: %u", esp_get_free_heap_size(),
+          heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+  if (url.compare(0, 8, "https://") == 0) {
+    ensureClockForTls();
+  }
+}
+
+// One-shot streaming GET over SecureNet (wolfSSL). Fills the Sink and emits
+// "Phase start"/"Phase open_ok"/"Phase done" heap telemetry. TLS verification
+// uses the curated CrossPoint roots; verified-first with insecure fallback
+// (except where the caller disables it, e.g. OTA).
+HttpDownloader::DownloadError runGetSecure(const std::string& url, const std::string& username,
+                                           const std::string& password, Sink& sink, bool allowInsecureFallback) {
+  logPreCallContext(url);
+  const unsigned long startMs = millis();
+  LOG_DBG("HTTP", "Phase start @%lums heap=%u largest=%u", millis() - startMs, esp_get_free_heap_size(),
+          heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+
+  crosspoint::SecureHttpClient http;
+  http.setCACert(CROSSPOINT_ROOTS_PEM);
+  http.setAllowInsecureFallback(allowInsecureFallback);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.setUserAgent("WitchReader-ESP32-" CROSSPOINT_VERSION);
+  if (!username.empty() && !password.empty()) {
+    http.setBasicAuth(username, password);
   }
 
-  int available() override { return 0; }
-  int read() override { return -1; }
-  int peek() override { return -1; }
-  void flush() override { file_.flush(); }
+  bool openLogged = false;
+  auto bodySink = [&](const uint8_t* data, size_t len) -> bool {
+    if (!openLogged) {
+      openLogged = true;
+      LOG_DBG("HTTP", "Phase open_ok @%lums heap=%u largest=%u", millis() - startMs, esp_get_free_heap_size(),
+              heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    }
+    if (!sink.write(data, len)) return false;  // abort
+    sink.downloaded += len;
+    if (sink.progress && sink.total > 0) {
+      if (!sink.progress(sink.downloaded, sink.total)) return false;
+    }
+    return true;
+  };
+  auto progress = [&](size_t downloaded, size_t total) -> bool {
+    sink.total = total;
+    return true;
+  };
 
-  size_t downloaded() const { return downloaded_; }
-  bool ok() const { return writeOk_; }
+  const int rc = http.get(url, bodySink, progress);
+  // Log the handshake heap trough on EVERY path (incl. early abort via
+  // treatAbortAsSuccess) so the TLS-specific low-water is always captured,
+  // distinct from the all-time ESP.getMinFreeHeap() figure.
+  LOG_DBG("HTTP", "Phase done @%lums rc=%d downloaded=%zu (insecure=%d) handshakeMinFree=%u handshakeMinLargest=%u",
+          millis() - startMs, rc, sink.downloaded, static_cast<int>(http.lastConnectionWasInsecure()),
+          static_cast<unsigned>(http.lastHandshakeMinFree()), static_cast<unsigned>(http.lastHandshakeMinLargest()));
+  if (rc == crosspoint::SecureHttpClient::ERR_ABORTED) {
+    return HttpDownloader::ABORTED;
+  }
+  if (rc < 0) {
+    LOG_ERR("HTTP", "SecureNet GET failed: rc=%d url=%s", rc, url.c_str());
+    return HttpDownloader::HTTP_ERROR;
+  }
+  if (rc != 200) {
+    LOG_ERR("HTTP", "SecureNet unexpected status: %d", rc);
+    return HttpDownloader::HTTP_ERROR;
+  }
+  return HttpDownloader::OK;
+}
 
- private:
-  FsFile& file_;
-  size_t total_;
-  size_t downloaded_ = 0;
-  bool writeOk_ = true;
-  HttpDownloader::ProgressCallback progress_;
-  bool* cancelFlag_;
+// Single funnel for every fetchUrl/downloadToFile overload. allowInsecureFallback
+// defaults true (browsing paths); OTA passes false to fail closed.
+HttpDownloader::DownloadError runGetDispatch(const std::string& url, const std::string& username,
+                                             const std::string& password, Sink& sink,
+                                             bool allowInsecureFallback = true) {
+  return runGetSecure(url, username, password, sink, allowInsecureFallback);
+}
+}  // namespace
+
+// ---- Session implementation ----
+
+struct HttpDownloader::Session::Impl {
+  // SecureNet keeps its own keep-alive connection alive internally (reuses the
+  // open SecureClient when host/port match), so the Session just owns one
+  // persistent SecureHttpClient across downloadToFile(session, ...) calls.
+  std::unique_ptr<crosspoint::SecureHttpClient> http;
+  bool preCallLogged = false;
 };
+
+HttpDownloader::Session::Session() : impl_(std::make_unique<Impl>()) {}
+HttpDownloader::Session::~Session() = default;
+
+namespace {
+
+// SecureNet session GET: reuse one persistent SecureHttpClient. Its internal
+// keep-alive reuses the open TLS connection when the host/port match, so
+// back-to-back files on the same host share a single handshake (the Session
+// heap win). Cross-host requests transparently reopen inside SecureHttpClient.
+HttpDownloader::DownloadError runGetSecureOnSession(HttpDownloader::Session& session, const std::string& url,
+                                                    const std::string& username, const std::string& password,
+                                                    Sink& sink, bool allowInsecureFallback) {
+  auto* impl = session.impl();
+  if (!impl->http) {
+    logPreCallContext(url);
+    impl->http = std::make_unique<crosspoint::SecureHttpClient>();
+    impl->http->setCACert(CROSSPOINT_ROOTS_PEM);
+    impl->http->setTimeout(HTTP_TIMEOUT_MS);
+    impl->http->setUserAgent("WitchReader-ESP32-" CROSSPOINT_VERSION);
+  }
+  impl->http->setAllowInsecureFallback(allowInsecureFallback);
+  impl->http->clearHeaders();
+  if (!username.empty() && !password.empty()) {
+    impl->http->setBasicAuth(username, password);
+  }
+
+  auto bodySink = [&](const uint8_t* data, size_t len) -> bool {
+    if (!sink.write(data, len)) return false;
+    sink.downloaded += len;
+    if (sink.progress && sink.total > 0) {
+      if (!sink.progress(sink.downloaded, sink.total)) return false;
+    }
+    return true;
+  };
+  auto progress = [&](size_t, size_t total) -> bool {
+    sink.total = total;
+    return true;
+  };
+
+  const int rc = impl->http->get(url, bodySink, progress);
+  if (rc == crosspoint::SecureHttpClient::ERR_ABORTED) return HttpDownloader::ABORTED;
+  if (rc != 200) {
+    LOG_ERR("HTTP", "SecureNet session GET failed: rc=%d url=%s", rc, url.c_str());
+    return HttpDownloader::HTTP_ERROR;
+  }
+  return HttpDownloader::OK;
+}
+
+HttpDownloader::DownloadError runGetOnSession(HttpDownloader::Session& session, const std::string& url,
+                                              const std::string& username, const std::string& password, Sink& sink) {
+  return runGetSecureOnSession(session, url, username, password, sink, /*allowInsecureFallback=*/true);
+}
 }  // namespace
 
 bool HttpDownloader::fetchUrl(const std::string& url, Stream& outContent, const std::string& username,
                               const std::string& password) {
-  std::unique_ptr<NetworkClient> client;
-  if (UrlUtils::isHttpsUrl(url)) {
-    auto* secureClient = new NetworkClientSecure();
-    secureClient->setInsecure();
-    client.reset(secureClient);
-  } else {
-    client.reset(new NetworkClient());
-  }
-  HTTPClient http;
-
   LOG_DBG("HTTP", "Fetching: %s", url.c_str());
+  Sink sink;
+  sink.write = [&outContent](const uint8_t* data, size_t len) { return outContent.write(data, len) == len; };
+  return runGetDispatch(url, username, password, sink) == OK;
+}
 
-  http.begin(*client, url.c_str());
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.addHeader("User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
+bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData, const std::string& username,
+                              const std::string& password) {
+  // Preserve historic semantics: callback abort => failure.
+  return fetchUrl(url, onData, false, username, password);
+}
 
-  if (!username.empty() && !password.empty()) {
-    std::string credentials = username + ":" + password;
-    String encoded = base64::encode(credentials.c_str());
-    http.addHeader("Authorization", "Basic " + encoded);
-  }
-
-  const int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
-    LOG_ERR("HTTP", "Fetch failed: %d", httpCode);
-    http.end();
+bool HttpDownloader::fetchUrl(const std::string& url, const DataCallback& onData, bool treatAbortAsSuccess,
+                              const std::string& username, const std::string& password) {
+  LOG_DBG("HTTP", "Fetching (stream): %s", url.c_str());
+  if (!onData) {
     return false;
   }
+  Sink sink;
+  sink.write = [&onData](const uint8_t* data, size_t len) { return onData(data, len); };
+  const DownloadError result = runGetDispatch(url, username, password, sink);
+  if (result == OK) {
+    return true;
+  }
+  // Optional mode for parsers that intentionally stop early once they have
+  // extracted all required fields from the stream.
+  return treatAbortAsSuccess && result == ABORTED;
+}
 
-  http.writeToStream(&outContent);
-
-  http.end();
-
-  LOG_DBG("HTTP", "Fetch success");
-  return true;
+bool HttpDownloader::fetchUrlVerified(const std::string& url, const DataCallback& onData, bool treatAbortAsSuccess,
+                                      const std::string& username, const std::string& password) {
+  LOG_DBG("HTTP", "Fetching (stream, verify-only): %s", url.c_str());
+  if (!onData) {
+    return false;
+  }
+  Sink sink;
+  sink.write = [&onData](const uint8_t* data, size_t len) { return onData(data, len); };
+  // allowInsecureFallback=false: fail closed on cert-verify failure (OTA).
+  const DownloadError result = runGetDispatch(url, username, password, sink, /*allowInsecureFallback=*/false);
+  if (result == OK) {
+    return true;
+  }
+  return treatAbortAsSuccess && result == ABORTED;
 }
 
 bool HttpDownloader::fetchUrl(const std::string& url, std::string& outContent, const std::string& username,
                               const std::string& password) {
-  StreamString stream;
-  if (!fetchUrl(url, stream, username, password)) {
-    return false;
-  }
-  outContent = stream.c_str();
-  return true;
+  LOG_DBG("HTTP", "Fetching: %s", url.c_str());
+  outContent.clear();  // start clean; the sink appends, so don't carry prior content
+  Sink sink;
+  sink.write = [&outContent](const uint8_t* data, size_t len) {
+    outContent.append(reinterpret_cast<const char*>(data), len);
+    return true;
+  };
+  return runGetDispatch(url, username, password, sink) == OK;
 }
 
-HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& url, const std::string& destPath,
-                                                             ProgressCallback progress, bool* cancelFlag,
-                                                             const std::string& username, const std::string& password) {
-  std::unique_ptr<NetworkClient> client;
-  if (UrlUtils::isHttpsUrl(url)) {
-    auto* secureClient = new NetworkClientSecure();
-    secureClient->setInsecure();
-    client.reset(secureClient);
-  } else {
-    client.reset(new NetworkClient());
+namespace {
+// Common file-sink plumbing used by both downloadToFile overloads.
+HttpDownloader::DownloadError finishFileDownload(HttpDownloader::DownloadError result, const std::string& destPath,
+                                                 FsFile& file, size_t downloaded) {
+  // Flush before any remove() on the same path; DESTRUCTOR_CLOSES_FILE would
+  // otherwise close only after the remove.
+  file.flush();
+  file.close();
+  if (result != HttpDownloader::OK) {
+    Storage.remove(destPath.c_str());
+    return result;
   }
-  HTTPClient http;
+  if (downloaded == 0) {
+    LOG_ERR("HTTP", "no data received");
+    Storage.remove(destPath.c_str());
+    return HttpDownloader::HTTP_ERROR;
+  }
+  LOG_DBG("HTTP", "Downloaded %zu bytes", downloaded);
+  return HttpDownloader::OK;
+}
+}  // namespace
 
+HttpDownloader::DownloadError HttpDownloader::downloadToFile(const std::string& url, const std::string& destPath,
+                                                             ProgressCallback progress, const std::string& username,
+                                                             const std::string& password) {
   LOG_DBG("HTTP", "Downloading: %s", url.c_str());
   LOG_DBG("HTTP", "Destination: %s", destPath.c_str());
 
-  http.begin(*client, url.c_str());
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.addHeader("User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
-
-  if (!username.empty() && !password.empty()) {
-    std::string credentials = username + ":" + password;
-    String encoded = base64::encode(credentials.c_str());
-    http.addHeader("Authorization", "Basic " + encoded);
-  }
-
-  const int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
-    LOG_ERR("HTTP", "Download failed: %d", httpCode);
-    http.end();
-    return HTTP_ERROR;
-  }
-
-  const int64_t reportedLength = http.getSize();
-  const size_t contentLength = reportedLength > 0 ? static_cast<size_t>(reportedLength) : 0;
-  if (contentLength > 0) {
-    LOG_DBG("HTTP", "Content-Length: %zu", contentLength);
-  } else {
-    LOG_DBG("HTTP", "Content-Length: unknown");
-  }
-
-  // Remove existing file if present
   if (Storage.exists(destPath.c_str())) {
     Storage.remove(destPath.c_str());
   }
-
-  // Open file for writing
   FsFile file;
   if (!Storage.openFileForWrite("HTTP", destPath.c_str(), file)) {
-    LOG_ERR("HTTP", "Failed to open file for writing");
-    http.end();
+    LOG_ERR("HTTP", "Failed to open file for writing: %s", destPath.c_str());
     return FILE_ERROR;
   }
 
-  // Let HTTPClient handle chunked decoding and stream body bytes into the file.
-  FileWriteStream fileStream(file, contentLength, progress, cancelFlag);
-  const int writeResult = http.writeToStream(&fileStream);
+  Sink sink;
+  sink.progress = std::move(progress);
+  sink.write = [&file](const uint8_t* data, size_t len) { return file.write(data, len) == len; };
 
-  file.close();
-  http.end();
+  const DownloadError result = runGetDispatch(url, username, password, sink);
+  return finishFileDownload(result, destPath, file, sink.downloaded);
+}
 
-  if (cancelFlag && *cancelFlag) {
+HttpDownloader::DownloadError HttpDownloader::downloadToFile(Session& session, const std::string& url,
+                                                             const std::string& destPath, ProgressCallback progress,
+                                                             const std::string& username, const std::string& password) {
+  LOG_DBG("HTTP", "Downloading (session): %s", url.c_str());
+  LOG_DBG("HTTP", "Destination: %s", destPath.c_str());
+
+  if (Storage.exists(destPath.c_str())) {
     Storage.remove(destPath.c_str());
-    return ABORTED;
   }
-
-  if (writeResult < 0) {
-    LOG_ERR("HTTP", "writeToStream error: %d", writeResult);
-    Storage.remove(destPath.c_str());
-    return HTTP_ERROR;
-  }
-
-  const size_t downloaded = fileStream.downloaded();
-  LOG_DBG("HTTP", "Downloaded %zu bytes", downloaded);
-
-  // Guard against partial writes even if HTTPClient completes.
-  if (!fileStream.ok()) {
-    LOG_ERR("HTTP", "Write failed during download");
-    Storage.remove(destPath.c_str());
+  FsFile file;
+  if (!Storage.openFileForWrite("HTTP", destPath.c_str(), file)) {
+    LOG_ERR("HTTP", "Failed to open file for writing: %s", destPath.c_str());
     return FILE_ERROR;
   }
 
-  if (contentLength == 0 && downloaded == 0) {
-    LOG_ERR("HTTP", "Download failed: no data received");
-    Storage.remove(destPath.c_str());
-    return HTTP_ERROR;
-  }
+  Sink sink;
+  sink.progress = std::move(progress);
+  sink.write = [&file](const uint8_t* data, size_t len) { return file.write(data, len) == len; };
 
-  // Verify download size if known
-  if (contentLength > 0 && downloaded != contentLength) {
-    LOG_ERR("HTTP", "Size mismatch: got %zu, expected %zu", downloaded, contentLength);
-    Storage.remove(destPath.c_str());
-    return HTTP_ERROR;
-  }
-
-  return OK;
+  const DownloadError result = runGetOnSession(session, url, username, password, sink);
+  return finishFileDownload(result, destPath, file, sink.downloaded);
 }

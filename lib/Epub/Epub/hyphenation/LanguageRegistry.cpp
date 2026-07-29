@@ -36,8 +36,8 @@ const EntryArray& entries() {
                                        {"russian", "ru", &russianHyphenator},
                                        {"spanish", "es", &spanishHyphenator},
                                        {"italian", "it", &italianHyphenator},
-                                       {"polish", "pl", &polishHyphenator},
                                        {"swedish", "sv", &swedishHyphenator},
+                                       {"polish", "pl", &polishHyphenator},
                                        {"ukrainian", "uk", &ukrainianHyphenator}}};
   return kEntries;
 }

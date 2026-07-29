@@ -4,6 +4,7 @@
 #include <common/FsApiConstants.h>  // for oflag_t
 #include <freertos/semphr.h>
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -44,6 +45,11 @@ class HalStorage {
   bool openFileForWrite(const char* moduleName, const std::string& path, HalFile& file);
   bool openFileForWrite(const char* moduleName, const String& path, HalFile& file);
   bool removeDir(const char* path);
+  bool copyFile(const char* moduleName, const std::string& srcPath, const char* dstPath);
+
+  uint64_t sdTotalBytes() const;
+  uint64_t sdUsedBytes();
+  uint64_t sdFreeBytes();
 
   static HalStorage& getInstance() { return instance; }
 
@@ -76,18 +82,24 @@ class HalFile : public Print {
   size_t getName(char* name, size_t len);
   size_t size();
   size_t fileSize();
-  uint64_t fileSize64();
   bool seek(size_t pos);
-  bool seek64(uint64_t pos);
   bool seekCur(int64_t offset);
   bool seekSet(size_t offset);
   int available() const;
   size_t position() const;
   int read(void* buf, size_t count);
   int read();  // read a single byte
+
+  uint64_t size64();
+  uint64_t fileSize64();
+  bool seek64(uint64_t pos);
+  bool seekSet64(uint64_t offset);
+  uint64_t position64() const;
   size_t write(const void* buf, size_t count);
   size_t write(uint8_t b) override;
   bool rename(const char* newPath);
+  bool getModifyDateTime(uint16_t* pdate, uint16_t* ptime);
+  bool getCreateDateTime(uint16_t* pdate, uint16_t* ptime);
   bool isDirectory() const;
   void rewindDirectory();
   bool close();

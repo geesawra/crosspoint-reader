@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import os
 import platform
 import re
 import signal
@@ -35,42 +36,38 @@ import threading
 from collections import deque
 from datetime import datetime
 
-DEFAULT_BAUDRATE = 115200
+import matplotlib
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="ESP32 Serial Monitor with Memory Graph - Real-time monitoring, graphing, and command interface"
-    )
-    parser.add_argument(
-        "port",
-        nargs="?",
-        default=None,
-        help="Serial port (leave empty for autodetection)",
-    )
-    parser.add_argument(
-        "--baud",
-        type=int,
-        default=DEFAULT_BAUDRATE,
-        help=f"Baud rate (default: {DEFAULT_BAUDRATE})",
-    )
-    parser.add_argument(
-        "--filter",
-        type=str,
-        default="",
-        help="Only display lines containing this keyword (case-insensitive)",
-    )
-    parser.add_argument(
-        "--suppress",
-        type=str,
-        default="",
-        help="Suppress lines containing this keyword (case-insensitive)",
-    )
-    return parser
-
-
-if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
-    build_arg_parser().parse_args()
+def select_matplotlib_backend() -> None:
+    """Ensure an interactive backend is selected before showing the plot."""
+    backend = matplotlib.get_backend()
+    if backend.lower() in ("agg", "svg", "pdf", "ps"):
+        if os.name == "nt" or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            for candidate in ("Qt5Agg", "QtAgg", "TkAgg", "GTK3Agg", "GTK4Agg"):
+                if candidate in matplotlib.rcsetup.interactive_bk:
+                    try:
+                        matplotlib.use(candidate, force=True)
+                        print(
+                            f"\n{Fore.CYAN}--- Switched Matplotlib backend to: {candidate} ---{Style.RESET_ALL}"
+                        )
+                        return
+                    except Exception:
+                        continue
+    backend = matplotlib.get_backend()
+    if backend.lower() in ("agg", "svg", "pdf", "ps"):
+        print(
+            f"\n{Fore.RED}Warning: No interactive Matplotlib backend available. "
+            f"Graph window may not open correctly on this system.{Style.RESET_ALL}"
+        )
+        print(
+            f"{Fore.YELLOW}To enable the graph window, install an interactive backend and restart the script.{Style.RESET_ALL}\n"
+            "  - python3-tk (TkAgg)\n"
+            "  - python3-pyqt5 or python3-pyqt6 (Qt5Agg)\n"
+            "  - python3-pyside2 or python3-pyside6 (QtAgg)\n"
+            "  - python3-gi python3-gi-cairo (GTK3Agg/GTK4Agg)\n"
+            "If you are using a virtualenv, install the package into the same environment."
+        )
 
 # Try to import potentially missing packages
 PACKAGE_MAPPING: dict[str, str] = {
@@ -81,15 +78,17 @@ PACKAGE_MAPPING: dict[str, str] = {
 }
 
 try:
-    import matplotlib.pyplot as plt
     import serial
     from colorama import Fore, Style, init
-    from matplotlib import animation
 
     try:
         from PIL import Image
     except ImportError:
         Image = None
+
+    select_matplotlib_backend()
+    import matplotlib.pyplot as plt
+    from matplotlib import animation
 except ImportError as e:
     ERROR_MSG = str(e).lower()
     missing_packages = [pkg for mod, pkg in PACKAGE_MAPPING.items() if mod in ERROR_MSG]
@@ -216,6 +215,7 @@ def parse_memory_line(line: str) -> tuple[int | None, int | None, int | None]:
     Format: Free: N bytes, Total: N bytes, Min Free: N bytes, MaxAlloc: N bytes
     Returns: (free_bytes, total_bytes, max_alloc_bytes)
     """
+
     def _find(pattern: str) -> int | None:
         m = re.search(pattern, line)
         if m:
@@ -258,6 +258,8 @@ def serial_worker(ser, kwargs: dict[str, str]) -> None:
 
     expecting_screenshot = False
     screenshot_size = 0
+    screenshot_width = 800
+    screenshot_height = 480
     screenshot_data = b""
 
     try:
@@ -269,7 +271,9 @@ def serial_worker(ser, kwargs: dict[str, str]) -> None:
                 screenshot_data += data
                 if len(screenshot_data) == screenshot_size:
                     if Image:
-                        img = Image.frombytes("1", (800, 480), screenshot_data)
+                        img = Image.frombytes(
+                            "1", (screenshot_width, screenshot_height), screenshot_data
+                        )
                         # We need to rotate the image because the raw data is in landscape mode
                         img = img.transpose(Image.ROTATE_270)
                         img.save("screenshot.bmp")
@@ -296,7 +300,15 @@ def serial_worker(ser, kwargs: dict[str, str]) -> None:
                         continue
 
                     if clean_line.startswith("SCREENSHOT_START:"):
-                        screenshot_size = int(clean_line.split(":")[1])
+                        parts = clean_line.split(":")
+                        if len(parts) == 2:
+                            screenshot_size = int(parts[1])
+                        elif len(parts) == 4:
+                            screenshot_width = int(parts[1])
+                            screenshot_height = int(parts[2])
+                            screenshot_size = int(parts[3])
+                        else:
+                            continue
                         expecting_screenshot = True
                         continue
                     elif clean_line == "SCREENSHOT_END":
@@ -308,7 +320,9 @@ def serial_worker(ser, kwargs: dict[str, str]) -> None:
 
                     # Check for Memory Line
                     if "[MEM]" in formatted_line:
-                        free_val, total_val, max_alloc_val = parse_memory_line(formatted_line)
+                        free_val, total_val, max_alloc_val = parse_memory_line(
+                            formatted_line
+                        )
                         if free_val is not None and total_val is not None:
                             with data_lock:
                                 time_data.append(pc_time)
@@ -438,7 +452,34 @@ def main() -> None:
     - Screenshot capture capability
     - Graceful shutdown on Ctrl-C or window close
     """
-    parser = build_arg_parser()
+    parser = argparse.ArgumentParser(
+        description="ESP32 Serial Monitor with Memory Graph - Real-time monitoring, graphing, and command interface"
+    )
+    default_baudrate = 115200
+    parser.add_argument(
+        "port",
+        nargs="?",
+        default=None,
+        help="Serial port (leave empty for autodetection)",
+    )
+    parser.add_argument(
+        "--baud",
+        type=int,
+        default=default_baudrate,
+        help=f"Baud rate (default: {default_baudrate})",
+    )
+    parser.add_argument(
+        "--filter",
+        type=str,
+        default="",
+        help="Only display lines containing this keyword (case-insensitive)",
+    )
+    parser.add_argument(
+        "--suppress",
+        type=str,
+        default="",
+        help="Suppress lines containing this keyword (case-insensitive)",
+    )
     args = parser.parse_args()
     port = args.port
     if port is None:
@@ -499,10 +540,12 @@ def main() -> None:
     except (AttributeError, ValueError):
         pass
 
+    select_matplotlib_backend()
+
     fig = plt.figure(figsize=(10, 6))
 
     # Update graph every 1000ms
-    _ = animation.FuncAnimation(
+    anim = animation.FuncAnimation(
         fig, update_graph, interval=1000, cache_frame_data=False
     )
 

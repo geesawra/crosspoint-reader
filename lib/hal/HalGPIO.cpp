@@ -202,8 +202,139 @@ void HalGPIO::begin() {
   }
 }
 
-void HalGPIO::update() {
+// Push one debounced edge into the loop-drained FIFO. Caller holds inputMux_.
+// Drops the newest edge if the ring is full — a full ring means the loop task
+// has been blocked through 32 distinct transitions, far more than any real burst.
+void HalGPIO::pushEdgeLocked(uint8_t button, bool pressed, uint32_t timeMs) {
+  const int next = (edgeTail_ + 1) % EDGE_BUF;
+  if (next == edgeHead_) {
+    return;
+  }
+  edgeBuf_[edgeTail_] = {button, pressed, timeMs};
+  edgeTail_ = next;
+}
+
+// One sampling pass: read + debounce the buttons, then latch any edges. Runs on
+// the sampler task once started; also called synchronously from update() before
+// the sampler is up. inputMgr.update() does the ADC read and must run OUTSIDE the
+// critical section (analogRead may take the ADC driver mutex). Only the latching
+// of the results into the shared accumulators/queue is done under inputMux_.
+void HalGPIO::sampleOnce() {
   inputMgr.update();
+
+  uint8_t live = 0;
+  uint8_t pressed = 0;
+  uint8_t released = 0;
+  for (uint8_t i = 0; i <= BTN_POWER; i++) {
+    if (inputMgr.isPressed(i)) live |= (1u << i);
+    if (inputMgr.wasPressed(i)) pressed |= (1u << i);
+    if (inputMgr.wasReleased(i)) released |= (1u << i);
+  }
+  const uint32_t now = millis();
+  const unsigned long held = inputMgr.getHeldTime();
+
+  portENTER_CRITICAL(&inputMux_);
+  liveState_ = live;
+  accumPressed_ |= pressed;
+  accumReleased_ |= released;
+  heldTimeSnapshot_ = held;
+  for (uint8_t i = 0; i <= BTN_POWER; i++) {
+    // A debounced button makes at most one transition per pass, so a button can
+    // appear in pressed or released here, never both.
+    if (pressed & (1u << i)) pushEdgeLocked(i, true, now);
+    if (released & (1u << i)) pushEdgeLocked(i, false, now);
+  }
+  portEXIT_CRITICAL(&inputMux_);
+}
+
+void HalGPIO::samplerTask(void* arg) {
+  HalGPIO* self = static_cast<HalGPIO*>(arg);
+  TickType_t last = xTaskGetTickCount();
+  while (self->samplerRunning_) {
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(10));
+    self->sampleOnce();
+  }
+  vTaskDelete(nullptr);  // self-terminate once stopInputSampler() clears the flag
+}
+
+void HalGPIO::startInputSampler() {
+  if (samplerRunning_) {
+    return;
+  }
+  samplerRunning_ = true;
+  sampleOnce();  // prime so the first loop iteration sees current state
+  // Priority above the Arduino loop task (1) so the 10ms cadence holds even while
+  // the loop task is busy in a long build slice. 2 KB stack: the sampler's deepest
+  // path (inputMgr.update → analogRead) was measured at ~380 bytes peak on device,
+  // so this leaves >4x headroom while staying small (this codebase is sensitive to
+  // stack-into-heap spills). Watch the btnSampler high-water [MEM] line if changed.
+  xTaskCreate(&HalGPIO::samplerTask, "btnsample", 2048, this, 2, &samplerTaskHandle_);
+}
+
+void HalGPIO::stopInputSampler() {
+  if (!samplerRunning_) {
+    return;
+  }
+  // Signal the task to exit on its next wake and self-delete. Avoids vTaskDelete()
+  // tearing it down mid-analogRead (which would leak the ADC driver mutex).
+  samplerRunning_ = false;
+  samplerTaskHandle_ = nullptr;
+}
+
+bool HalGPIO::hasPendingInput() const {
+  bool pending = false;
+  portENTER_CRITICAL_SAFE(const_cast<portMUX_TYPE*>(&inputMux_));
+  pending = accumPressed_ != 0;
+  portEXIT_CRITICAL_SAFE(const_cast<portMUX_TYPE*>(&inputMux_));
+  return pending;
+}
+
+bool HalGPIO::popButtonEdge(ButtonEdge& out) {
+  bool got = false;
+  portENTER_CRITICAL(&inputMux_);
+  if (edgeHead_ != edgeTail_) {
+    out = edgeBuf_[edgeHead_];
+    edgeHead_ = (edgeHead_ + 1) % EDGE_BUF;
+    got = true;
+  }
+  portEXIT_CRITICAL(&inputMux_);
+  return got;
+}
+
+void HalGPIO::flushButtonEdges() {
+  portENTER_CRITICAL(&inputMux_);
+  edgeHead_ = 0;
+  edgeTail_ = 0;
+  accumPressed_ = 0;
+  accumReleased_ = 0;
+  portEXIT_CRITICAL(&inputMux_);
+  snapPressed_ = 0;
+  snapReleased_ = 0;
+}
+
+void HalGPIO::update() {
+  if (samplerRunning_) {
+    // Drain the sampler's accumulated edges + latest state into the loop-side
+    // snapshot. No edge seen since the last drain is ever lost, regardless of how
+    // long this loop iteration took.
+    portENTER_CRITICAL(&inputMux_);
+    snapState_ = liveState_;
+    snapPressed_ = accumPressed_;
+    snapReleased_ = accumReleased_;
+    accumPressed_ = 0;
+    accumReleased_ = 0;
+    portEXIT_CRITICAL(&inputMux_);
+  } else {
+    // Pre-sampler (early boot): sample synchronously on the calling task.
+    sampleOnce();
+    portENTER_CRITICAL(&inputMux_);
+    snapState_ = liveState_;
+    snapPressed_ = accumPressed_;
+    snapReleased_ = accumReleased_;
+    accumPressed_ = 0;
+    accumReleased_ = 0;
+    portEXIT_CRITICAL(&inputMux_);
+  }
   const bool connected = isUsbConnected();
   usbStateChanged = (connected != lastUsbConnected);
   lastUsbConnected = connected;
@@ -211,80 +342,130 @@ void HalGPIO::update() {
 
 bool HalGPIO::wasUsbStateChanged() const { return usbStateChanged; }
 
-bool HalGPIO::isPressed(uint8_t buttonIndex) const { return inputMgr.isPressed(buttonIndex); }
+bool HalGPIO::isPressed(uint8_t buttonIndex) const { return (snapState_ & (1u << buttonIndex)) != 0; }
 
-bool HalGPIO::wasPressed(uint8_t buttonIndex) const { return inputMgr.wasPressed(buttonIndex); }
+bool HalGPIO::wasPressed(uint8_t buttonIndex) const { return (snapPressed_ & (1u << buttonIndex)) != 0; }
 
-bool HalGPIO::wasAnyPressed() const { return inputMgr.wasAnyPressed(); }
+bool HalGPIO::wasAnyPressed() const { return snapPressed_ != 0; }
 
-bool HalGPIO::wasReleased(uint8_t buttonIndex) const { return inputMgr.wasReleased(buttonIndex); }
+bool HalGPIO::wasReleased(uint8_t buttonIndex) const { return (snapReleased_ & (1u << buttonIndex)) != 0; }
 
-bool HalGPIO::wasAnyReleased() const { return inputMgr.wasAnyReleased(); }
+bool HalGPIO::wasAnyReleased() const { return snapReleased_ != 0; }
 
-unsigned long HalGPIO::getHeldTime() const { return inputMgr.getHeldTime(); }
+unsigned long HalGPIO::getHeldTime() const { return samplerRunning_ ? heldTimeSnapshot_ : inputMgr.getHeldTime(); }
 
-unsigned long HalGPIO::getPowerButtonHeldTime() const {
-  return inputMgr.getHeldTime();
-}  // TODO: getPowerButtonHeldTime missing in SDK
+void HalGPIO::waitForStablePowerRelease() {
+  // Wait until the raw power-button pin reads HIGH (released) for RELEASE_STABLE_MS
+  // consecutive milliseconds.  The InputManager debounce (5 ms) is too short for
+  // mechanical switch bounce which can last 10-50 ms, so we bypass it entirely here.
+  constexpr unsigned long RELEASE_STABLE_MS = 200;
+  const unsigned long waitStart = millis();
+  unsigned long stableStart = 0;
+  while (true) {
+    if (digitalRead(InputManager::POWER_BUTTON_PIN) == HIGH) {
+      if (stableStart == 0) stableStart = millis();
+      if (millis() - stableStart >= RELEASE_STABLE_MS) break;
+    } else {
+      stableStart = 0;
+    }
+    delay(10);
+  }
+  LOG_DBG("GPIO", "Power button stable-released after %lu ms", millis() - waitStart);
+}
 
 void HalGPIO::startDeepSleep() {
-  // Ensure that the power button has been released to avoid immediately turning back on if you're holding it
-  while (inputMgr.isPressed(BTN_POWER)) {
-    delay(50);
-    inputMgr.update();
-  }
+  LOG_DBG("GPIO", "startDeepSleep: waiting for power button release (isPressed=%d, rawPin=%d)",
+          inputMgr.isPressed(BTN_POWER), digitalRead(InputManager::POWER_BUTTON_PIN) == LOW);
+  waitForStablePowerRelease();
   // Arm the wakeup trigger *after* the button is released
   esp_deep_sleep_enable_gpio_wakeup(1ULL << InputManager::POWER_BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+  LOG_DBG("GPIO", "startDeepSleep: entering deep sleep now");
   // Enter Deep Sleep
   esp_deep_sleep_start();
 }
 
 void HalGPIO::verifyPowerButtonWakeup(uint16_t requiredDurationMs, bool shortPressAllowed) {
+  // The wakeup reason was already confirmed as a power button press before this is called,
+  // so we know a real press occurred. When short presses are allowed, nothing more to verify.
   if (shortPressAllowed) {
-    // Fast path - no duration check needed
+    LOG_DBG("GPIO", "verifyPowerButtonWakeup: shortPressAllowed, skipping hold verification");
     return;
   }
-  // TODO: Intermittent edge case remains: a single tap followed by another single tap
-  // can still power on the device. Tighten wake debounce/state handling here.
 
-  // Calibrate: subtract boot time already elapsed, assuming button held since boot
+  // Calibrate: subtract boot time already elapsed, assuming button held since boot.
+  // Never collapse to less than BOUNCE_TOLERANCE_MS so the hold loop always has time to
+  // sample the button and detect a release (early release = unintentional tap).
+  constexpr unsigned long BOUNCE_TOLERANCE_MS = 100;
   const uint16_t calibration = millis();
-  const uint16_t calibratedDuration = (calibration < requiredDurationMs) ? (requiredDurationMs - calibration) : 1;
+  const uint16_t calibratedDuration =
+      (calibration < requiredDurationMs) ? (requiredDurationMs - calibration) : BOUNCE_TOLERANCE_MS;
+  LOG_DBG("GPIO", "verifyPowerButtonWakeup: requiredMs=%u, calibration=%u, calibratedMs=%u", requiredDurationMs,
+          calibration, calibratedDuration);
 
   const auto start = millis();
   inputMgr.update();
-  // inputMgr.isPressed() may take up to ~500ms to return correct state
+  // inputMgr.isPressed() may take up to ~500ms to return correct state after boot
   while (!inputMgr.isPressed(BTN_POWER) && millis() - start < 1000) {
     delay(10);
     inputMgr.update();
   }
+  LOG_DBG("GPIO", "verifyPowerButtonWakeup: initial detect took %lu ms, isPressed=%d, rawPin=%d", millis() - start,
+          inputMgr.isPressed(BTN_POWER), digitalRead(InputManager::POWER_BUTTON_PIN) == LOW);
+
   if (inputMgr.isPressed(BTN_POWER)) {
-    do {
+    // Monitor the hold for calibratedDuration, tolerating brief bounces up to BOUNCE_TOLERANCE_MS.
+    // Early release beyond the bounce window means an unintentional tap — go back to sleep.
+    unsigned long lastSeenPressed = millis();
+    const auto holdStart = millis();
+    unsigned long bounceCount = 0;
+
+    while (millis() - holdStart < calibratedDuration) {
       delay(10);
       inputMgr.update();
-    } while (inputMgr.isPressed(BTN_POWER) && inputMgr.getHeldTime() < calibratedDuration);
-    if (inputMgr.getHeldTime() < calibratedDuration) {
-      startDeepSleep();
+      if (inputMgr.isPressed(BTN_POWER)) {
+        if (millis() - lastSeenPressed > 20) {
+          bounceCount++;
+        }
+        lastSeenPressed = millis();
+      } else if (millis() - lastSeenPressed >= BOUNCE_TOLERANCE_MS) {
+        LOG_DBG("GPIO", "verifyPowerButtonWakeup: released early after %lu ms (bounces=%lu), going to sleep",
+                millis() - holdStart, bounceCount);
+        startDeepSleep();
+      }
     }
+    LOG_DBG("GPIO", "verifyPowerButtonWakeup: hold verified after %lu ms (bounces=%lu), proceeding with boot",
+            millis() - holdStart, bounceCount);
   } else {
+    LOG_DBG("GPIO", "verifyPowerButtonWakeup: button not pressed after 1s wait, going to sleep");
     startDeepSleep();
   }
 }
 
 bool HalGPIO::isUsbConnected() const {
   if (deviceIsX3()) {
-    // X3: infer USB/charging via BQ27220 Current() register (0x0C, signed mA).
-    // Positive current means charging.
+    // X3: GPIO20 is repurposed as I2C SDA, so the X4 pin-level USB detect is
+    // unusable here — the I2C pull-ups would always report HIGH. Probe the
+    // BQ27220 fuel gauge instead. Using just Current() mis-reports "not
+    // connected" when the battery is full (current ~= 0 mA); combine it with
+    // the Flags() DSG bit so we report true whenever the charger is present
+    // (DSG=0 means charging or fully charged, not discharging).
     for (uint8_t attempt = 0; attempt < 2; ++attempt) {
-      int16_t currentMa = 0;
-      if (X3GPIO::readBQ27220CurrentMA(&currentMa)) {
-        return currentMa > 0;
+      uint16_t flags = 0;
+      if (X3GPIO::readI2CReg16LE(I2C_ADDR_BQ27220, BQ27220_FLAGS_REG, &flags)) {
+        if ((flags & BQ27220_FLAG_DSG) == 0) {
+          return true;
+        }
+        int16_t currentMa = 0;
+        if (X3GPIO::readBQ27220CurrentMA(&currentMa) && currentMa > 0) {
+          return true;
+        }
+        return false;
       }
       delay(2);
     }
     return false;
   }
-  // U0RXD/GPIO20 reads HIGH when USB is connected
+  // X4: U0RXD/GPIO20 reads HIGH when USB is connected
   return digitalRead(UART0_RXD) == HIGH;
 }
 
@@ -292,7 +473,25 @@ HalGPIO::WakeupReason HalGPIO::getWakeupReason() const {
   const auto wakeupCause = esp_sleep_get_wakeup_cause();
   const auto resetReason = esp_reset_reason();
 
+  // X3: a POWERON reset can come from either a power-button press (battery-latch
+  // MOSFET closes) OR from USB VBUS supplying power to the MCU through a path
+  // that bypasses the latch — notably after a Quick Resume sleep, where GPIO13
+  // is driven LOW so the MCU is otherwise unpowered. Disambiguate by reading
+  // the pulled-up power-button pin directly: GPIO3 reads LOW only while the
+  // button is held. If it's not held, treat a USB-connected POWERON as
+  // AfterUSBPower so the early handler in setup() puts the device straight
+  // back to sleep, matching X4. inputMgr.begin() in gpio.begin() has already
+  // configured INPUT_PULLUP on POWER_BUTTON_PIN by the time we're called.
+  if (deviceIsX3() && wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON) {
+    if (digitalRead(InputManager::POWER_BUTTON_PIN) == LOW) {
+      return WakeupReason::PowerButton;
+    }
+    return isUsbConnected() ? WakeupReason::AfterUSBPower : WakeupReason::PowerButton;
+  }
+
   const bool usbConnected = isUsbConnected();
+  LOG_DBG("GPIO", "getWakeupReason: wakeupCause=%d, resetReason=%d, usbConnected=%d", static_cast<int>(wakeupCause),
+          static_cast<int>(resetReason), usbConnected);
 
   if ((wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON && !usbConnected) ||
       (wakeupCause == ESP_SLEEP_WAKEUP_GPIO && resetReason == ESP_RST_DEEPSLEEP && usbConnected)) {

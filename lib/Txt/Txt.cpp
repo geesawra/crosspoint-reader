@@ -1,8 +1,11 @@
 #include "Txt.h"
 
+#include <Bitmap.h>
+#include <BitmapHelpers.h>
 #include <FsHelpers.h>
 #include <JpegToBmpConverter.h>
 #include <Logging.h>
+#include <PngToBmpConverter.h>
 
 Txt::Txt(std::string path, std::string cacheBasePath)
     : filepath(std::move(path)), cacheBasePath(std::move(cacheBasePath)) {
@@ -40,9 +43,11 @@ std::string Txt::getTitle() const {
   size_t lastSlash = filepath.find_last_of('/');
   std::string filename = (lastSlash != std::string::npos) ? filepath.substr(lastSlash + 1) : filepath;
 
-  // Remove .txt extension
+  // Remove .txt or .md extension
   if (FsHelpers::hasTxtExtension(filename)) {
     filename = filename.substr(0, filename.length() - 4);
+  } else if (FsHelpers::hasMarkdownExtension(filename)) {
+    filename = filename.substr(0, filename.length() - 3);
   }
 
   return filename;
@@ -120,6 +125,7 @@ bool Txt::generateCoverBmp() const {
       return false;
     }
     if (!Storage.openFileForWrite("TXT", getCoverBmpPath(), dst)) {
+      src.close();
       return false;
     }
     uint8_t buffer[1024];
@@ -127,6 +133,8 @@ bool Txt::generateCoverBmp() const {
       size_t bytesRead = src.read(buffer, sizeof(buffer));
       dst.write(buffer, bytesRead);
     }
+    src.close();
+    dst.close();
     LOG_DBG("TXT", "Copied BMP cover to cache");
     return true;
   } else if (FsHelpers::hasJpgExtension(coverImagePath)) {
@@ -137,9 +145,12 @@ bool Txt::generateCoverBmp() const {
       return false;
     }
     if (!Storage.openFileForWrite("TXT", getCoverBmpPath(), coverBmp)) {
+      coverJpg.close();
       return false;
     }
     const bool success = JpegToBmpConverter::jpegFileToBmpStream(coverJpg, coverBmp);
+    coverJpg.close();
+    coverBmp.close();
 
     if (!success) {
       LOG_ERR("TXT", "Failed to generate BMP from JPG cover image");
@@ -148,11 +159,123 @@ bool Txt::generateCoverBmp() const {
       LOG_DBG("TXT", "Generated BMP from JPG cover image");
     }
     return success;
+  } else if (FsHelpers::hasPngExtension(coverImagePath)) {
+    LOG_DBG("TXT", "Generating BMP from PNG cover image");
+    FsFile coverPng, coverBmp;
+    if (!Storage.openFileForRead("TXT", coverImagePath, coverPng)) {
+      return false;
+    }
+    if (!Storage.openFileForWrite("TXT", getCoverBmpPath(), coverBmp)) {
+      coverPng.close();
+      return false;
+    }
+    const bool success = PngToBmpConverter::pngFileToBmpStream(coverPng, coverBmp);
+    coverPng.close();
+    coverBmp.close();
+
+    if (!success) {
+      LOG_ERR("TXT", "Failed to generate BMP from PNG cover image");
+      Storage.remove(getCoverBmpPath().c_str());
+    } else {
+      LOG_DBG("TXT", "Generated BMP from PNG cover image");
+    }
+    return success;
   }
 
-  // PNG files are not supported (would need a PNG decoder)
-  LOG_ERR("TXT", "Cover image format not supported (only BMP/JPG/JPEG)");
+  LOG_ERR("TXT", "Cover image format not supported (only BMP/JPG/JPEG/PNG)");
   return false;
+}
+
+std::string Txt::getThumbBmpPath() const { return cachePath + "/thumb_[HEIGHT].bmp"; }
+std::string Txt::getThumbBmpPath(int height) const { return cachePath + "/thumb_" + std::to_string(height) + ".bmp"; }
+std::string Txt::getThumbBmpPath(int width, int height) const {
+  return cachePath + "/thumb_" + std::to_string(width) + "x" + std::to_string(height) + ".bmp";
+}
+
+bool Txt::generateThumbBmp(int height) const {
+  const std::string destPath = getThumbBmpPath(height);
+  if (Storage.exists(destPath.c_str())) return true;
+  const int width = static_cast<int>(height * 0.6f);
+  if (!generateThumbBmp(width, height)) return false;
+  const std::string srcPath = getThumbBmpPath(width, height);
+  Storage.rename(srcPath.c_str(), destPath.c_str());
+  return Storage.exists(destPath.c_str());
+}
+
+bool Txt::generateThumbBmp(int width, int height) const {
+  const std::string thumbPath = getThumbBmpPath(width, height);
+  if (Storage.exists(thumbPath.c_str())) return true;
+
+  setupCacheDir();
+
+  FsFile thumbBmp;
+  if (!Storage.openFileForWrite("TXT", thumbPath, thumbBmp)) return false;
+
+  const uint32_t rowSize = (static_cast<uint32_t>(width) + 31) / 32 * 4;
+  BmpHeader bmpHeader;
+  createBmpHeader(&bmpHeader, width, height, BmpRowOrder::TopDown);
+  thumbBmp.write(reinterpret_cast<const uint8_t*>(&bmpHeader), sizeof(BmpHeader));
+
+  uint8_t* rowBuffer = static_cast<uint8_t*>(malloc(rowSize));
+  if (!rowBuffer) {
+    thumbBmp.close();
+    Storage.remove(thumbPath.c_str());
+    return false;
+  }
+
+  // Matches the Lyra "no cover" placeholder: 1px border, white top third, black bottom two thirds.
+  // Book icon (32x32, 1=white/transparent, 0=black) centered in the white area.
+  // In 1-bit BMP: 1=white, 0=black.
+  static const uint8_t kIcon[] = {
+      0xFF, 0xFF, 0x81, 0xE0, 0xFF, 0xFF, 0x80, 0x3C, 0xFF, 0xFF, 0x80, 0x04, 0xFF, 0xFF, 0x80, 0x04, 0xFF, 0xED, 0x80,
+      0x04, 0x00, 0x19, 0x80, 0x04, 0x00, 0x31, 0x80, 0x04, 0x00, 0xE1, 0x80, 0x04, 0x0F, 0x81, 0x80, 0x04, 0x3C, 0x01,
+      0x80, 0x04, 0x20, 0x01, 0x80, 0x04, 0x20, 0x01, 0x80, 0x04, 0x20, 0x01, 0x80, 0x04, 0x20, 0x01, 0x80, 0x04, 0x20,
+      0x01, 0x80, 0x04, 0x20, 0x01, 0xC0, 0x04, 0x20, 0x01, 0xE0, 0x07, 0x20, 0x01, 0xF0, 0x07, 0x20, 0x01, 0xF8, 0x07,
+      0x20, 0x01, 0xFE, 0x07, 0x20, 0x01, 0xFF, 0x87, 0x20, 0x01, 0xFF, 0xFF, 0x20, 0x01, 0xFF, 0xFF, 0x20, 0x03, 0xFF,
+      0xFF, 0xE0, 0x07, 0xFF, 0xFF, 0xE0, 0x0F, 0xFF, 0xFF, 0xE0, 0x1F, 0xFF, 0xFF, 0xE0, 0x7F, 0xFF, 0xFF, 0xE3, 0xFF,
+      0xDB, 0xFF, 0xFF, 0xFF, 0xCC, 0x00, 0xFF, 0xFF, 0xC6, 0x00, 0xFF, 0xFF, 0xC3, 0x80};
+  static constexpr int kIconSize = 32;
+  static constexpr int kIconStride = 4;  // bytes per icon row (32 bits)
+
+  const int splitY = height / 3;  // white above, black below
+  const int iconX = (width - kIconSize) / 2;
+  const int iconY = (splitY - kIconSize) / 2;
+
+  for (int y = 0; y < height; y++) {
+    const bool blackRegion = (y >= splitY);
+    memset(rowBuffer, blackRegion ? 0x00 : 0xFF, rowSize);
+
+    // 1px border
+    if (y == 0 || y == height - 1) {
+      memset(rowBuffer, 0x00, rowSize);
+    } else {
+      // Left and right border pixels
+      rowBuffer[0] &= 0x7F;                                         // clear MSB (x=0)
+      rowBuffer[(width - 1) / 8] &= ~(0x80u >> ((width - 1) % 8));  // clear x=width-1
+
+      // Overlay icon row if within icon bounds (icon is on white area)
+      const int iconRow = y - iconY;
+      if (!blackRegion && iconRow >= 0 && iconRow < kIconSize && iconX >= 0 && iconX + kIconSize <= width) {
+        // Icon format: 0=dark pixel, 1=white/transparent. In BMP: 0=black, 1=white.
+        // The icon pixels (0=dark) should clear bits in the white BMP region.
+        for (int ix = 0; ix < kIconSize; ix++) {
+          const int iconByte = iconRow * kIconStride + ix / 8;
+          const int iconBit = 7 - (ix % 8);
+          const bool iconDark = !((kIcon[iconByte] >> iconBit) & 1);
+          if (iconDark) {
+            const int bx = iconX + ix;
+            rowBuffer[bx / 8] &= ~(0x80u >> (bx % 8));
+          }
+        }
+      }
+    }
+    thumbBmp.write(rowBuffer, rowSize);
+  }
+
+  free(rowBuffer);
+  thumbBmp.close();
+  LOG_DBG("TXT", "Generated surrogate thumb BMP (%dx%d): %s", width, height, thumbPath.c_str());
+  return true;
 }
 
 bool Txt::readContent(uint8_t* buffer, size_t offset, size_t length) const {
@@ -166,9 +289,12 @@ bool Txt::readContent(uint8_t* buffer, size_t offset, size_t length) const {
   }
 
   if (!file.seek(offset)) {
+    file.close();
     return false;
   }
 
   size_t bytesRead = file.read(buffer, length);
+  file.close();
+
   return bytesRead > 0;
 }

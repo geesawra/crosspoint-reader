@@ -4,6 +4,7 @@
 #include <ESPmDNS.h>
 #include <GfxRenderer.h>
 #include <I18n.h>
+#include <Memory.h>
 #include <WiFi.h>
 #include <esp_task_wdt.h>
 
@@ -11,9 +12,11 @@
 
 #include "MappedInputManager.h"
 #include "NetworkModeSelectionActivity.h"
+#include "SdCardFontGlobals.h"
 #include "SilentRestart.h"
 #include "WifiSelectionActivity.h"
 #include "activities/network/CalibreConnectActivity.h"
+#include "activities/network/SignalStrengthWidget.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/QrUtils.h"
@@ -24,7 +27,11 @@ constexpr const char* AP_SSID = "CrossPoint-Reader";
 constexpr const char* AP_PASSWORD = nullptr;  // Open network for ease of use
 constexpr const char* AP_HOSTNAME = "crosspoint";
 constexpr uint8_t AP_CHANNEL = 1;
-constexpr uint8_t AP_MAX_CONNECTIONS = 4;
+constexpr uint8_t AP_MAX_CONNECTIONS = 2;  // reduce from default 4 to save resources
+// Fixed AP addressing (the esp32 softAP default, pinned explicitly) so the
+// QR/URL screen can be painted before the WiFi stack starts.
+const IPAddress AP_IP(192, 168, 4, 1);
+const IPAddress AP_NETMASK(255, 255, 255, 0);
 constexpr int QR_CODE_WIDTH = 198;
 constexpr int QR_CODE_HEIGHT = 198;
 
@@ -32,14 +39,13 @@ constexpr int QR_CODE_HEIGHT = 198;
 DNSServer* dnsServer = nullptr;
 constexpr uint16_t DNS_PORT = 53;
 
-// 0..4 bars from RSSI (dBm), with 3 dBm hysteresis on currentBars to suppress flicker.
-int barsForRssi(int rssi, int currentBars) {
-  static constexpr int RISE_DBM[] = {-85, -75, -65, -55};
-  static constexpr int FALL_DBM[] = {-88, -78, -68, -58};
-  int bars = std::clamp(currentBars, 0, 4);
-  while (bars < 4 && rssi >= RISE_DBM[bars]) bars++;
-  while (bars > 0 && rssi < FALL_DBM[bars - 1]) bars--;
-  return bars;
+void stopDnsServer() {
+  if (!dnsServer) {
+    return;
+  }
+  dnsServer->stop();
+  delete dnsServer;
+  dnsServer = nullptr;
 }
 }  // namespace
 
@@ -52,6 +58,8 @@ void CrossPointWebServerActivity::onEnter() {
   state = WebServerActivityState::MODE_SELECTION;
   networkMode = NetworkMode::JOIN_NETWORK;
   isApMode = false;
+  webServerStarted = false;
+  buffersReleased = false;
   connectedIP.clear();
   connectedSSID.clear();
   lastHandleClientTime = 0;
@@ -72,9 +80,9 @@ void CrossPointWebServerActivity::onEnter() {
 void CrossPointWebServerActivity::onExit() {
   Activity::onExit();
 
-  LOG_DBG("WEBACT", "Free heap at onExit start: %d bytes", ESP.getFreeHeap());
-
   state = WebServerActivityState::SHUTTING_DOWN;
+  stopDnsServer();
+  MDNS.end();
 
   // Skip reboot if WiFi was never activated (e.g. user backed out of mode selection).
   if (WiFi.getMode() != WIFI_MODE_NULL) {
@@ -86,8 +94,6 @@ void CrossPointWebServerActivity::onExit() {
     delay(30);
     silentRestart();
   }
-
-  LOG_DBG("WEBACT", "Free heap at onExit end: %d bytes", ESP.getFreeHeap());
 }
 
 void CrossPointWebServerActivity::onNetworkModeSelected(const NetworkMode mode) {
@@ -174,6 +180,18 @@ void CrossPointWebServerActivity::onWifiSelectionComplete(const bool connected) 
 
 void CrossPointWebServerActivity::startAccessPoint() {
   LOG_DBG("WEBACT", "Starting Access Point mode...");
+
+  // Everything on the server screen is known before WiFi starts: the SSID is a
+  // constant and the AP IP is pinned via softAPConfig below. Paint and release
+  // the frame buffers (~100KB) first so the WiFi stack + mDNS + DNS server
+  // (~66KB) start against a roomy heap; painting after AP start left the X3
+  // with <5KB free and aborted in the QR render.
+  connectedSSID = AP_SSID;
+  char ipStr[16];
+  snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", AP_IP[0], AP_IP[1], AP_IP[2], AP_IP[3]);
+  connectedIP = ipStr;
+  showServerScreenAndReleaseBuffers();
+
   LOG_DBG("WEBACT", "Free heap before AP start: %d bytes", ESP.getFreeHeap());
 
   // Configure and start the AP
@@ -195,14 +213,12 @@ void CrossPointWebServerActivity::startAccessPoint() {
     return;
   }
 
-  delay(100);  // Wait for AP to fully initialize
+  // Pin the AP address to what the already-painted screen promises.
+  if (!WiFi.softAPConfig(AP_IP, AP_IP, AP_NETMASK)) {
+    LOG_ERR("WEBACT", "ERROR: softAPConfig failed");
+  }
 
-  // Get AP IP address
-  const IPAddress apIP = WiFi.softAPIP();
-  char ipStr[16];
-  snprintf(ipStr, sizeof(ipStr), "%d.%d.%d.%d", apIP[0], apIP[1], apIP[2], apIP[3]);
-  connectedIP = ipStr;
-  connectedSSID = AP_SSID;
+  delay(100);  // Wait for AP to fully initialize
 
   LOG_DBG("WEBACT", "Access Point started!");
   LOG_DBG("WEBACT", "SSID: %s", AP_SSID);
@@ -217,10 +233,17 @@ void CrossPointWebServerActivity::startAccessPoint() {
 
   // Start DNS server for captive portal behavior
   // This redirects all DNS queries to our IP, making any domain typed resolve to us
-  dnsServer = new DNSServer();
-  dnsServer->setErrorReplyCode(DNSReplyCode::NoError);
-  dnsServer->start(DNS_PORT, "*", apIP);
-  LOG_DBG("WEBACT", "DNS server started for captive portal");
+  stopDnsServer();
+  // Raw nothrow new: owned by the module-scope dnsServer pointer, freed in
+  // stopDnsServer(). On OOM the captive portal degrades to direct IP/mDNS access.
+  dnsServer = new (std::nothrow) DNSServer();
+  if (dnsServer) {
+    dnsServer->setErrorReplyCode(DNSReplyCode::NoError);
+    dnsServer->start(DNS_PORT, "*", AP_IP);
+    LOG_DBG("WEBACT", "DNS server started for captive portal");
+  } else {
+    LOG_ERR("WEBACT", "OOM allocating DNS server, captive portal disabled");
+  }
 
   LOG_DBG("WEBACT", "Free heap after AP start: %d bytes", ESP.getFreeHeap());
 
@@ -228,21 +251,57 @@ void CrossPointWebServerActivity::startAccessPoint() {
   startWebServer();
 }
 
+void CrossPointWebServerActivity::showServerScreenAndReleaseBuffers() {
+  // Free SD font heap for the web server session. A loaded SD font
+  // (Literata etc.) holds ~24-60KB of kern/ligature/glyph data that is
+  // completely unused during the web server session. The device restarts
+  // after the web server exits (silentRestart in onExit), so the font
+  // will be reloaded fresh on the next boot anyway.
+  LOG_DBG("WEBACT", "Free heap before SD font unload: %d bytes", ESP.getFreeHeap());
+  sdFontSystem.unload(renderer);
+  LOG_DBG("WEBACT", "Free heap after SD font unload: %d bytes", ESP.getFreeHeap());
+
+  // Set running state now so the paint below uses the correct UI branch.
+  state = WebServerActivityState::SERVER_RUNNING;
+  if (!isApMode) {
+    currentRssi = WiFi.RSSI();
+    lastRssiUpdateTime = millis();
+  }
+
+  // Paint the QR / URL screen while both frame buffers are still available,
+  // then release them. The e-ink controller retains the image in its own RAM —
+  // no framebuffer needed after displayBuffer().
+  LOG_DBG("WEBACT", "Free heap before frame buffer release: %d bytes", ESP.getFreeHeap());
+  renderer.clearScreen();
+  renderServerRunning();
+  renderer.displayBuffer();
+  buffersReleased = true;
+  renderer.releaseFrameBuffers();
+  LOG_DBG("WEBACT", "Free heap after frame buffer release: %d bytes", ESP.getFreeHeap());
+}
+
 void CrossPointWebServerActivity::startWebServer() {
   LOG_DBG("WEBACT", "Starting web server...");
 
+  // AP mode paints and releases the buffers before the WiFi stack starts
+  // (startAccessPoint). The STA path can only do it here, once the join
+  // succeeded and the assigned IP is known.
+  if (!buffersReleased) {
+    showServerScreenAndReleaseBuffers();
+  }
+
   // Create the web server instance
-  webServer.reset(new CrossPointWebServer());
+  webServer = makeUniqueNoThrow<CrossPointWebServer>();
+  if (!webServer) {
+    LOG_ERR("WEBACT", "OOM allocating web server");
+    onGoHome();
+    return;
+  }
   webServer->begin();
 
   if (webServer->isRunning()) {
-    state = WebServerActivityState::SERVER_RUNNING;
+    webServerStarted = true;
     LOG_DBG("WEBACT", "Web server started successfully");
-    lastWifiBars = isApMode ? 0 : barsForRssi(WiFi.RSSI(), 0);
-
-    // Force an immediate render since we're transitioning from a subactivity
-    // that had its own rendering task. We need to make sure our display is shown.
-    requestUpdate();
   } else {
     LOG_ERR("WEBACT", "ERROR: Failed to start web server!");
     webServer.reset();
@@ -265,43 +324,24 @@ void CrossPointWebServerActivity::loop() {
       if (millis() - lastWifiCheck > 2000) {  // Check every 2 seconds
         lastWifiCheck = millis();
         const wl_status_t wifiStatus = WiFi.status();
-        // Driver auto-reconnect handles retries; abandon (via onGoHome) only
-        // after WIFI_ABANDON_MS, otherwise the activity freezes on a blip.
-        bool repaint = false;
         if (wifiStatus != WL_CONNECTED) {
-          if (consecutiveDisconnects == 0) {
-            firstDisconnectAt = millis();
-            repaint = true;
-          }
-          consecutiveDisconnects++;
-          LOG_DBG("WEBACT", "WiFi not connected (status=%d, consecutive=%d, total=%lu ms)", wifiStatus,
-                  consecutiveDisconnects, millis() - firstDisconnectAt);
-          if (millis() - firstDisconnectAt > WIFI_ABANDON_MS) {
-            LOG_DBG("WEBACT", "WiFi unavailable for >%lu s; returning to network selection", WIFI_ABANDON_MS / 1000UL);
-            state = WebServerActivityState::SHUTTING_DOWN;
-            onGoHome();
-            return;
-          }
-        } else {
-          if (consecutiveDisconnects > 0) {
-            LOG_DBG("WEBACT", "WiFi recovered after %d failed checks (%lu ms)", consecutiveDisconnects,
-                    millis() - firstDisconnectAt);
-            repaint = true;
-          }
-          consecutiveDisconnects = 0;
-          firstDisconnectAt = 0;
-          const int rssi = WiFi.RSSI();
-          if (rssi < -75) {
-            LOG_DBG("WEBACT", "Warning: Weak WiFi signal: %d dBm", rssi);
-          }
-          const int bars = barsForRssi(rssi, lastWifiBars);
-          if (bars != lastWifiBars) {
-            lastWifiBars = bars;
-            repaint = true;
-          }
+          LOG_DBG("WEBACT", "WiFi disconnected! Status: %d", wifiStatus);
+          // Show error and exit gracefully
+          state = WebServerActivityState::SHUTTING_DOWN;
+          requestUpdate();
+          return;
         }
-        if (repaint) requestUpdate();
+        // Log weak signal warnings
+        const int rssi = WiFi.RSSI();
+        if (rssi < -75) {
+          LOG_DBG("WEBACT", "Warning: Weak WiFi signal: %d dBm", rssi);
+        }
       }
+
+      // RSSI indicator update intentionally removed: the 640ms e-ink refresh
+      // every 5 seconds blocked handleClient, fragmented heap, and gave no
+      // meaningful benefit since the user is interacting with the browser, not
+      // watching the device screen.
     }
 
     // Handle web server requests - maximize throughput with watchdog safety
@@ -350,42 +390,46 @@ void CrossPointWebServerActivity::loop() {
 }
 
 void CrossPointWebServerActivity::render(RenderLock&&) {
-  // Only render our own UI when server is running
-  // Subactivities handle their own rendering
+  // Frame buffers are released before the web server starts (in startWebServer).
+  // Any render triggered after that point must not touch the null framebuffer.
+  if (buffersReleased) return;
+
+  // Only render our own UI when server is running.
+  // Subactivities handle their own rendering.
   if (state == WebServerActivityState::SERVER_RUNNING || state == WebServerActivityState::AP_STARTING) {
     renderer.clearScreen();
     const auto& metrics = UITheme::getInstance().getMetrics();
-    const auto pageWidth = renderer.getScreenWidth();
-    const auto pageHeight = renderer.getScreenHeight();
+    const Rect contentRect = UITheme::getContentRect(renderer, true, false);
 
-    GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight},
+    GUI.drawHeader(renderer, Rect{contentRect.x, metrics.topPadding, contentRect.width, metrics.headerHeight},
                    isApMode ? tr(STR_HOTSPOT_MODE) : tr(STR_FILE_TRANSFER), nullptr);
 
     if (state == WebServerActivityState::SERVER_RUNNING) {
-      GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight},
-                        connectedSSID.c_str());
+      GUI.drawSubHeader(
+          renderer,
+          Rect{contentRect.x, metrics.topPadding + metrics.headerHeight, contentRect.width, metrics.tabBarHeight},
+          connectedSSID.c_str());
       renderServerRunning();
     } else {
       const auto height = renderer.getLineHeight(UI_10_FONT_ID);
-      const auto top = (pageHeight - height) / 2;
+      const auto top = contentRect.y + (contentRect.height - height) / 2;
       renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_STARTING_HOTSPOT));
     }
     renderer.displayBuffer();
   }
 }
 
+namespace {}  // namespace
+
 void CrossPointWebServerActivity::renderServerRunning() const {
   const auto& metrics = UITheme::getInstance().getMetrics();
-  const auto pageWidth = renderer.getScreenWidth();
+  const Rect contentRect = UITheme::getContentRect(renderer, true, false);
 
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight},
+  GUI.drawHeader(renderer, Rect{contentRect.x, metrics.topPadding, contentRect.width, metrics.headerHeight},
                  isApMode ? tr(STR_HOTSPOT_MODE) : tr(STR_FILE_TRANSFER), nullptr);
-  GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight},
-                    connectedSSID.c_str());
-
-  if (!isApMode) {
-    renderWifiIndicator(metrics.topPadding + metrics.headerHeight);
-  }
+  GUI.drawSubHeader(
+      renderer, Rect{contentRect.x, metrics.topPadding + metrics.headerHeight, contentRect.width, metrics.tabBarHeight},
+      connectedSSID.c_str());
 
   int startY = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing * 2;
   int height10 = renderer.getLineHeight(UI_10_FONT_ID);
@@ -396,7 +440,8 @@ void CrossPointWebServerActivity::renderServerRunning() const {
     startY += height10 + metrics.verticalSpacing * 2;
 
     // Show QR code for Wifi
-    const std::string wifiConfig = std::string("WIFI:S:") + connectedSSID + ";;";
+    // follows spec at https://github.com/zxing/zxing/wiki/Barcode-Contents#wi-fi-network-config-android-ios-11
+    const std::string wifiConfig = std::string("WIFI:T:nopass;S:") + connectedSSID + ";;";
     const Rect qrBoundsWifi(metrics.contentSidePadding, startY, QR_CODE_WIDTH, QR_CODE_HEIGHT);
     QrUtils::drawQrCode(renderer, qrBoundsWifi, wifiConfig);
 
@@ -423,6 +468,12 @@ void CrossPointWebServerActivity::renderServerRunning() const {
                       hostnameUrl.c_str());
     renderer.drawText(SMALL_FONT_ID, metrics.contentSidePadding + QR_CODE_WIDTH + metrics.verticalSpacing, startY + 100,
                       ipUrl.c_str());
+
+    const int signalHeight = 22;
+    const int signalWidth = contentRect.width - metrics.contentSidePadding * 2;
+    const int signalY = startY + 120;
+    drawWifiSignalStrength(renderer, contentRect.x + metrics.contentSidePadding, signalY, signalWidth, signalHeight, 0);
+    renderer.drawCenteredText(SMALL_FONT_ID, signalY + signalHeight + 2, tr(STR_HOTSPOT_MODE));
   } else {
     startY += metrics.verticalSpacing * 2;
 
@@ -435,7 +486,7 @@ void CrossPointWebServerActivity::renderServerRunning() const {
 
     // Show QR code for URL
     std::string webInfo = "http://" + connectedIP + "/";
-    const Rect qrBounds((pageWidth - QR_CODE_WIDTH) / 2, startY, QR_CODE_WIDTH, QR_CODE_HEIGHT);
+    const Rect qrBounds(contentRect.x + (contentRect.width - QR_CODE_WIDTH) / 2, startY, QR_CODE_WIDTH, QR_CODE_HEIGHT);
     QrUtils::drawQrCode(renderer, qrBounds, webInfo);
     startY += QR_CODE_HEIGHT + metrics.verticalSpacing * 2;
 
@@ -446,40 +497,19 @@ void CrossPointWebServerActivity::renderServerRunning() const {
     // Also show hostname URL
     std::string hostnameUrl = std::string(tr(STR_OR_HTTP_PREFIX)) + AP_HOSTNAME + ".local/";
     renderer.drawCenteredText(SMALL_FONT_ID, startY, hostnameUrl.c_str(), true);
+
+    // AP mode: no external RSSI metric available, but keep UI spacing consistent.
   }
 
-  const auto labels = mappedInput.mapLabels(tr(STR_EXIT), "", "", "");
+  if (!isApMode) {
+    const int signalHeight = 22;
+    const int signalWidth = contentRect.width - metrics.contentSidePadding * 2;
+    const int signalY = startY + height10 + metrics.verticalSpacing * 2;
+    drawWifiSignalStrength(renderer, contentRect.x + metrics.contentSidePadding, signalY, signalWidth, signalHeight,
+                           currentRssi);
+    renderer.drawCenteredText(SMALL_FONT_ID, signalY + signalHeight + 2, rssiLabel(currentRssi).c_str(), true);
+  }
+
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-}
-
-void CrossPointWebServerActivity::renderWifiIndicator(int subHeaderTop) const {
-  constexpr int BAR_COUNT = 4;
-  constexpr int BAR_WIDTH = 4;
-  constexpr int BAR_GAP = 2;
-  constexpr int ICON_HEIGHT = 14;
-  const auto& metrics = UITheme::getInstance().getMetrics();
-  const int iconWidth = BAR_COUNT * BAR_WIDTH + (BAR_COUNT - 1) * BAR_GAP;
-  const int iconRight = renderer.getScreenWidth() - metrics.contentSidePadding;
-  const int iconLeft = iconRight - iconWidth;
-  const int iconBottom = subHeaderTop + metrics.tabBarHeight - metrics.verticalSpacing;
-
-  const bool wifiUp = (WiFi.status() == WL_CONNECTED) && (consecutiveDisconnects == 0);
-  if (wifiUp) {
-    for (int i = 0; i < BAR_COUNT; i++) {
-      const int barHeight = (i + 1) * ICON_HEIGHT / BAR_COUNT;
-      const int x = iconLeft + i * (BAR_WIDTH + BAR_GAP);
-      const int y = iconBottom - barHeight;
-      if (i < lastWifiBars) {
-        renderer.fillRect(x, y, BAR_WIDTH, barHeight, true);
-      } else {
-        renderer.drawRect(x, y, BAR_WIDTH, barHeight, true);
-      }
-    }
-  } else {
-    const int xSize = ICON_HEIGHT;
-    const int x0 = iconRight - xSize;
-    const int y0 = iconBottom - xSize;
-    renderer.drawLine(x0, y0, x0 + xSize, y0 + xSize, 2, true);
-    renderer.drawLine(x0, y0 + xSize, x0 + xSize, y0, 2, true);
-  }
 }

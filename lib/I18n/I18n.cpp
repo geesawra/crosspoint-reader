@@ -1,11 +1,18 @@
 #include "I18n.h"
 
-#include <cstddef>
-#include <cstring>
+#include <HalStorage.h>
+#include <Logging.h>
+#include <Serialization.h>
+
+#include <string>
 
 #include "I18nStrings.h"
 
 using namespace i18n_strings;
+
+// Settings file path
+static constexpr const char* SETTINGS_FILE = "/.crosspoint/language.bin";
+static constexpr uint8_t SETTINGS_VERSION = 2;
 
 I18n& I18n::getInstance() {
   static I18n instance;
@@ -20,7 +27,6 @@ const char* I18n::get(StrId id) const {
 
   // Use generated helper function - no hardcoded switch needed!
   const LangStrings lang = getLanguageStrings(_language);
-
   // If bit 15 of the offset is set, apply the offset to the English lookup table
   const uint16_t off = lang.offsets[index];
   if (off & 0x8000) return STRINGS_EN_DATA + (off & 0x7FFF);
@@ -32,6 +38,7 @@ void I18n::setLanguage(Language lang) {
     return;
   }
   _language = lang;
+  saveSettings();
 }
 
 const char* I18n::getLanguageName(Language lang) const {
@@ -42,11 +49,81 @@ const char* I18n::getLanguageName(Language lang) const {
   return LANGUAGE_NAMES[index];
 }
 
-Language I18n::languageFromCode(const char* code) {
-  for (uint8_t i = 0; i < getLanguageCount(); i++) {
-    if (strcmp(code, LANGUAGE_CODES[i]) == 0) return static_cast<Language>(i);
+const char* I18n::getLanguageCode(Language lang) const {
+  const auto index = static_cast<size_t>(lang);
+  if (index >= static_cast<size_t>(Language::_COUNT)) {
+    return LANGUAGE_CODES[0];
   }
-  return Language::EN;
+  return LANGUAGE_CODES[index];
+}
+
+void I18n::saveSettings() {
+  Storage.mkdir("/.crosspoint");
+
+  FsFile file;
+  if (!Storage.openFileForWrite("I18N", SETTINGS_FILE, file)) {
+    LOG_ERR("I18N", "Failed to save settings");
+    return;
+  }
+
+  serialization::writePod(file, SETTINGS_VERSION);
+  serialization::writeString(file, getLanguageCode(_language));
+
+  file.close();
+  LOG_INF("I18N", "Settings saved: language=%d code=%s", static_cast<int>(_language), getLanguageCode(_language));
+}
+
+void I18n::loadSettings() {
+  FsFile file;
+  if (!Storage.openFileForRead("I18N", SETTINGS_FILE, file)) {
+    LOG_INF("I18N", "No settings file, using default (English)");
+    return;
+  }
+
+  uint8_t version;
+  serialization::readPod(file, version);
+
+  if (version == SETTINGS_VERSION) {
+    std::string code;
+    serialization::readString(file, code);
+    bool found = false;
+
+    for (uint8_t i = 0; i < getLanguageCount(); i++) {
+      if (code == LANGUAGE_CODES[i]) {
+        _language = static_cast<Language>(i);
+        found = true;
+        break;
+      }
+    }
+
+    if (found) {
+      LOG_INF("I18N", "Loaded language code: %s (%d)", code.c_str(), static_cast<int>(_language));
+    } else {
+      LOG_ERR("I18N", "Unknown language code in settings: %s", code.c_str());
+    }
+    file.close();
+    return;
+  }
+
+  // Legacy migration path: version 1 stored language enum index directly.
+  if (version == 1) {
+    uint8_t lang;
+    serialization::readPod(file, lang);
+    if (lang < static_cast<size_t>(Language::_COUNT)) {
+      _language = static_cast<Language>(lang);
+      LOG_INF("I18N", "Migrating v1 language index: %d -> %s", static_cast<int>(_language), getLanguageCode(_language));
+      file.close();
+      saveSettings();
+      return;
+    }
+    file.close();
+    LOG_ERR("I18N", "Invalid v1 language index: %d", static_cast<int>(lang));
+    return;
+  }
+
+  LOG_ERR("I18N", "Settings version mismatch: %d\n", static_cast<int>(version));
+
+  file.close();
 }
 
 // Generate character set for a specific language

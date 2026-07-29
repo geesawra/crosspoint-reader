@@ -1,117 +1,198 @@
 #include "SettingsActivity.h"
 
 #include <GfxRenderer.h>
+#include <HalClock.h>
+#include <HalDisplay.h>
+#include <HalGPIO.h>
 #include <Logging.h>
 
-#include "ButtonRemapActivity.h"
-#include "ClearCacheActivity.h"
+#include <cstring>
+
 #include "CrossPointSettings.h"
-#include "DictionarySelectActivity.h"
-#include "FontDownloadActivity.h"
-#include "FontSelectionActivity.h"
-#include "KOReaderSettingsActivity.h"
-#include "LanguageSelectActivity.h"
 #include "MappedInputManager.h"
-#include "OpdsServerListActivity.h"
-#include "OtaUpdateActivity.h"
-#include "SdCardFontSystem.h"
-#include "SdFirmwareUpdateActivity.h"
+#include "SdCardFontGlobals.h"
+#include "SettingActionDispatch.h"
 #include "SettingsList.h"
-#include "StatusBarSettingsActivity.h"
-#include "activities/network/WifiSelectionActivity.h"
+#include "SettingsSubmenuActivity.h"
+#include "activities/SliderPickerActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
-#include "util/Dictionary.h"
 
 const StrId SettingsActivity::categoryNames[categoryCount] = {StrId::STR_CAT_DISPLAY, StrId::STR_CAT_READER,
                                                               StrId::STR_CAT_CONTROLS, StrId::STR_CAT_SYSTEM};
 
-void SettingsActivity::rebuildSettingsLists() {
-  displaySettings.clear();
-  readerSettings.clear();
-  controlsSettings.clear();
-  systemSettings.clear();
-
-  // Pick up any fonts uploaded/deleted over the web server since the last
-  // reader activity ran — otherwise the font-family picker shows stale list.
-  sdFontSystem.refreshIfDirty();
-
-  for (auto& setting : getSettingsList(&sdFontSystem.registry())) {
-    if (setting.category == StrId::STR_NONE_OPT) continue;
-    if (setting.category == StrId::STR_CAT_DISPLAY) {
-      displaySettings.push_back(setting);
-    } else if (setting.category == StrId::STR_CAT_READER) {
-      readerSettings.push_back(setting);
-    } else if (setting.category == StrId::STR_CAT_CONTROLS) {
-      controlsSettings.push_back(setting);
-    } else if (setting.category == StrId::STR_CAT_SYSTEM) {
-      systemSettings.push_back(setting);
-    }
-  }
-
-  // Append device-only ACTION items
-  controlsSettings.insert(controlsSettings.begin(),
-                          SettingInfo::Action(StrId::STR_REMAP_FRONT_BUTTONS, SettingAction::RemapFrontButtons));
-  systemSettings.push_back(SettingInfo::Action(StrId::STR_WIFI_NETWORKS, SettingAction::Network));
-  systemSettings.push_back(SettingInfo::Action(StrId::STR_KOREADER_SYNC, SettingAction::KOReaderSync));
-  systemSettings.push_back(SettingInfo::Action(StrId::STR_OPDS_SERVERS, SettingAction::OPDSBrowser));
-  systemSettings.push_back(SettingInfo::Action(StrId::STR_CLEAR_READING_CACHE, SettingAction::ClearCache));
-  systemSettings.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
-  systemSettings.push_back(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate));
-  systemSettings.push_back(SettingInfo::Action(StrId::STR_LANGUAGE, SettingAction::Language));
-  // Insert "Manage Fonts" right after the font family setting so users discover it naturally
-  readerSettings.insert(readerSettings.begin() + 1,
-                        SettingInfo::Action(StrId::STR_MANAGE_FONTS, SettingAction::DownloadFonts));
-  {
-    auto dictSetting = SettingInfo::Action(StrId::STR_DICTIONARY, SettingAction::Dictionary);
-    dictSetting.stringGetter = [] {
-      std::string path = Dictionary::readDictPath();
-      if (path.empty()) return std::string(tr(STR_DICT_NONE));
-      // Path format: /dictionary/<folder>/<stem> — display the folder name.
-      const size_t lastSlash = path.rfind('/');
-      if (lastSlash == std::string::npos || lastSlash == 0) return path;
-      const size_t prevSlash = path.rfind('/', lastSlash - 1);
-      return (prevSlash != std::string::npos) ? path.substr(prevSlash + 1, lastSlash - prevSlash - 1)
-                                              : path.substr(0, lastSlash);
-    };
-    readerSettings.push_back(std::move(dictSetting));
-  }
-  // These are in SettingsList.h for persistence but with STR_NONE_OPT category,
-  // so we add them here manually to appear after the Dictionary selector.
-  readerSettings.push_back(SettingInfo::Value(
-      StrId::STR_LOOKUP_HIST_CAP, &CrossPointSettings::lookupHistoryCap,
-      {CrossPointSettings::HIST_CAP_MIN, CrossPointSettings::HIST_CAP_MAX, CrossPointSettings::HIST_CAP_STEP},
-      "lookupHistoryCap", StrId::STR_CAT_READER));
-  readerSettings.push_back(SettingInfo::Toggle(StrId::STR_DICT_HOLD_TO_LOOKUP, &CrossPointSettings::holdToLookup,
-                                               "holdToLookup", StrId::STR_CAT_READER));
-  readerSettings.push_back(SettingInfo::Action(StrId::STR_CUSTOMISE_STATUS_BAR, SettingAction::CustomiseStatusBar));
-
-  // Update currentSettings pointer and count for the active category
-  switch (selectedCategoryIndex) {
-    case 0:
-      currentSettings = &displaySettings;
-      break;
-    case 1:
-      currentSettings = &readerSettings;
-      break;
-    case 2:
-      currentSettings = &controlsSettings;
-      break;
-    case 3:
-      currentSettings = &systemSettings;
-      break;
-  }
-  settingsCount = static_cast<int>(currentSettings->size());
+bool SettingsActivity::isListItemSelectable(int settingIdx) const {
+  return settingIdx >= 0 && settingIdx < settingsCount && !(*currentSettings)[settingIdx].isSeparator;
 }
 
 void SettingsActivity::onEnter() {
   Activity::onEnter();
+  needsHalfRefresh = true;
+
+  // Build per-category vectors from the shared settings list.
+  // addTo tracks the last subcategory per vector and automatically inserts a separator
+  // row whenever a setting carries a new subcategory label.
+  displaySettings.clear();
+  readerSettings.clear();
+  controlsSettings.clear();
+  systemSettings.clear();
+  submenuData.clear();
+  displaySettings.reserve(20);
+  readerSettings.reserve(30);
+  controlsSettings.reserve(8);
+  systemSettings.reserve(20);
+  submenuData.reserve(4);
+
+  StrId lastDisplaySub = StrId::STR_NONE_OPT;
+  StrId lastReaderSub = StrId::STR_NONE_OPT;
+  StrId lastControlsSub = StrId::STR_NONE_OPT;
+  StrId lastSystemSub = StrId::STR_NONE_OPT;
+
+  auto addTo = [](std::vector<SettingInfo>& vec, StrId& lastSub, const SettingInfo& s) {
+    if (s.subcategory != StrId::STR_NONE_OPT && s.subcategory != lastSub) {
+      vec.push_back(SettingInfo::Separator(s.subcategory));
+      lastSub = s.subcategory;
+    }
+    vec.push_back(s);
+  };
+  auto addToMoved = [](std::vector<SettingInfo>& vec, StrId& lastSub, SettingInfo s) {
+    if (s.subcategory != StrId::STR_NONE_OPT && s.subcategory != lastSub) {
+      vec.push_back(SettingInfo::Separator(s.subcategory));
+      lastSub = s.subcategory;
+    }
+    vec.push_back(std::move(s));
+  };
+
+  bool sawReaderFontSection = false;
+  bool insertedFontDownload = false;
+  bool sawIncludeBetaUpdates = false;
+  SettingInfo includeBetaUpdatesSetting{};
+
+  auto insertFontDownloadBelowFontSection = [&]() {
+    auto fontDownload = SettingInfo::Action(StrId::STR_FONT_MANAGER, SettingAction::DownloadFonts);
+    fontDownload.withSubcategory(StrId::STR_MENU_READER_FONT);
+    addToMoved(readerSettings, lastReaderSub, std::move(fontDownload));
+    insertedFontDownload = true;
+  };
+
+  for (const auto& setting : getSettingsList()) {
+    if (setting.category == StrId::STR_NONE_OPT) continue;
+    if (setting.category == StrId::STR_CAT_SYSTEM &&
+        (setting.nameId == StrId::STR_USE_CLOCK || setting.nameId == StrId::STR_CLOCK_FORMAT ||
+         setting.nameId == StrId::STR_TIMEZONE)) {
+      continue;
+    }
+    // Enrich font-family entries with SD card families discovered at boot.
+    // The list itself is a namespace-static; we only mutate our local copy here.
+    SettingInfo enriched = setting;
+    if (setting.key &&
+        (std::strcmp(setting.key, "fontFamily") == 0 || std::strcmp(setting.key, "txtFontFamily") == 0)) {
+      const uint8_t n = fontFamilyOptionCount();
+      enriched.enumLabels.clear();
+      enriched.enumLabels.reserve(n);
+      for (uint8_t i = 0; i < n; i++) enriched.enumLabels.push_back(fontFamilyOptionLabel(i));
+    }
+    if (enriched.nameId == StrId::STR_INCLUDE_BETA_UPDATES) {
+      includeBetaUpdatesSetting = enriched;
+      sawIncludeBetaUpdates = true;
+      continue;
+    }
+    const bool isReaderFontEntry =
+        enriched.category == StrId::STR_CAT_READER &&
+        (enriched.submenu == StrId::STR_MENU_READER_FONT || enriched.submenu == StrId::STR_MENU_TXT_FONT);
+
+    if (!insertedFontDownload && sawReaderFontSection && !isReaderFontEntry) {
+      insertFontDownloadBelowFontSection();
+    }
+
+    if (enriched.category == StrId::STR_CAT_DISPLAY) {
+      addTo(displaySettings, lastDisplaySub, enriched);
+    } else if (enriched.category == StrId::STR_CAT_READER) {
+      addTo(readerSettings, lastReaderSub, enriched);
+    } else if (enriched.category == StrId::STR_CAT_CONTROLS) {
+      addTo(controlsSettings, lastControlsSub, enriched);
+    } else if (enriched.category == StrId::STR_CAT_SYSTEM) {
+      addTo(systemSettings, lastSystemSub, enriched);
+    }
+    if (isReaderFontEntry) sawReaderFontSection = true;
+
+    // Web-only categories (KOReader Sync, OPDS Browser) are skipped for device UI
+  }
+
+  if (!insertedFontDownload && sawReaderFontSection) {
+    insertFontDownloadBelowFontSection();
+  }
+
+  // Device-only ACTION items — subcategory drives separator insertion automatically.
+  controlsSettings.insert(controlsSettings.begin(),
+                          SettingInfo::Action(StrId::STR_REMAP_FRONT_BUTTONS, SettingAction::RemapFrontButtons));
+  controlsSettings.insert(controlsSettings.begin(), SettingInfo::Separator(StrId::STR_MENU_BTN_PHYSICAL));
+
+  // Button Actions overview lives at the end of the Button Actions section (same subcategory as
+  // the per-button submenus, so no new separator is inserted).
+  addToMoved(controlsSettings, lastControlsSub,
+             std::move(SettingInfo::Action(StrId::STR_BTN_ACTIONS_OVERVIEW, SettingAction::ButtonActionsOverview)
+                           .withSubcategory(StrId::STR_MENU_BTN_ACTIONS)));
+
+  addToMoved(readerSettings, lastReaderSub,
+             SettingInfo::Action(StrId::STR_CUSTOMISE_STATUS_BAR, SettingAction::CustomiseStatusBar));
+
+  addToMoved(systemSettings, lastSystemSub, SettingInfo::Action(StrId::STR_LANGUAGE, SettingAction::Language));
+  addToMoved(systemSettings, lastSystemSub,
+             std::move(SettingInfo::Action(StrId::STR_WIFI_NETWORKS, SettingAction::Network)
+                           .withSubcategory(StrId::STR_MENU_SYS_NETWORK)));
+  addToMoved(systemSettings, lastSystemSub,
+             std::move(SettingInfo::Action(StrId::STR_KOREADER_SYNC, SettingAction::KOReaderSync)
+                           .withSubcategory(StrId::STR_MENU_SYS_NETWORK)));
+  addToMoved(systemSettings, lastSystemSub,
+             std::move(SettingInfo::Action(StrId::STR_OPDS_BROWSER, SettingAction::OPDSBrowser)
+                           .withSubcategory(StrId::STR_MENU_SYS_NETWORK)));
+  addToMoved(systemSettings, lastSystemSub,
+             std::move(SettingInfo::Action(StrId::STR_CLOCK_SETTINGS, SettingAction::ClockSettings)
+                           .withSubcategory(StrId::STR_MENU_SYS_TOOLS)));
+  addToMoved(systemSettings, lastSystemSub,
+             std::move(SettingInfo::Action(StrId::STR_WEATHER_SETTINGS, SettingAction::Weather)
+                           .withSubcategory(StrId::STR_MENU_SYS_TOOLS)));
+  addToMoved(systemSettings, lastSystemSub,
+             std::move(SettingInfo::Action(StrId::STR_CLEAR_READING_CACHE, SettingAction::ClearCache)
+                           .withSubcategory(StrId::STR_MENU_SYS_SYSTEM)));
+
+  addToMoved(systemSettings, lastSystemSub,
+             std::move(SettingInfo::Separator(StrId::STR_SYSTEM_UPDATE_TYPE1).withSubmenu(StrId::STR_SYSTEM_UPDATE)));
+  addToMoved(systemSettings, lastSystemSub,
+             std::move(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates)
+                           .withSubmenu(StrId::STR_SYSTEM_UPDATE)));
+  if (sawIncludeBetaUpdates) {
+    addToMoved(systemSettings, lastSystemSub,
+               std::move(includeBetaUpdatesSetting.withSubmenu(StrId::STR_SYSTEM_UPDATE)));
+  }
+  addToMoved(systemSettings, lastSystemSub,
+             std::move(SettingInfo::Separator(StrId::STR_SYSTEM_UPDATE_TYPE2).withSubmenu(StrId::STR_SYSTEM_UPDATE)));
+  addToMoved(systemSettings, lastSystemSub,
+             std::move(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate)
+                           .withSubmenu(StrId::STR_SYSTEM_UPDATE)));
+  addToMoved(systemSettings, lastSystemSub,
+             std::move(SettingInfo::Action(StrId::STR_SWITCH_TO_USB_DRIVE, SettingAction::SwitchToUsbDrive)
+                           .withSubmenu(StrId::STR_SYSTEM_UPDATE)));
+  addToMoved(systemSettings, lastSystemSub,
+             std::move(SettingInfo::Action(StrId::STR_SYSTEM_INFO, SettingAction::SystemInfo)
+                           .withSubcategory(StrId::STR_MENU_SYS_SYSTEM)));
+  addToMoved(systemSettings, lastSystemSub,
+             std::move(SettingInfo::Action(StrId::STR_READING_STATS, SettingAction::ReadingStats)
+                           .withSubcategory(StrId::STR_MENU_SYS_SYSTEM)));
+
+  SettingInfo::prepareSubmenus(displaySettings, submenuData);
+  SettingInfo::prepareSubmenus(readerSettings, submenuData);
+  SettingInfo::prepareSubmenus(controlsSettings, submenuData);
+  SettingInfo::prepareSubmenus(systemSettings, submenuData);
 
   // Reset selection to first category
   selectedCategoryIndex = 0;
   selectedSettingIndex = 0;
 
-  rebuildSettingsLists();
+  // Initialize with first category (Display)
+  currentSettings = &displaySettings;
+  settingsCount = static_cast<int>(displaySettings.size());
 
   // Trigger first update
   requestUpdate();
@@ -152,12 +233,14 @@ void SettingsActivity::loop() {
 
   // Handle navigation
   buttonNavigator.onNextRelease([this] {
-    selectedSettingIndex = ButtonNavigator::nextIndex(selectedSettingIndex, settingsCount + 1);
+    selectedSettingIndex = ButtonNavigator::nextIndex(selectedSettingIndex, settingsCount + 1,
+                                                      [this](int i) { return i == 0 || isListItemSelectable(i - 1); });
     requestUpdate();
   });
 
   buttonNavigator.onPreviousRelease([this] {
-    selectedSettingIndex = ButtonNavigator::previousIndex(selectedSettingIndex, settingsCount + 1);
+    selectedSettingIndex = ButtonNavigator::previousIndex(
+        selectedSettingIndex, settingsCount + 1, [this](int i) { return i == 0 || isListItemSelectable(i - 1); });
     requestUpdate();
   });
 
@@ -200,141 +283,123 @@ void SettingsActivity::toggleCurrentSetting() {
   }
 
   const auto& setting = (*currentSettings)[selectedSetting];
+  if (setting.isSeparator) return;
 
-  if (setting.type == SettingType::TOGGLE && setting.valuePtr != nullptr) {
-    // Toggle the boolean value using the member pointer
-    const bool currentValue = SETTINGS.*(setting.valuePtr);
-    SETTINGS.*(setting.valuePtr) = !currentValue;
-  } else if (setting.type == SettingType::ENUM && setting.valuePtr != nullptr) {
-    const uint8_t currentValue = SETTINGS.*(setting.valuePtr);
-    SETTINGS.*(setting.valuePtr) = (currentValue + 1) % static_cast<uint8_t>(setting.enumValues.size());
-  } else if (setting.type == SettingType::ENUM && setting.valueGetter && setting.valueSetter) {
-    if (setting.nameId == StrId::STR_FONT_FAMILY) {
-      // Launch font selection submenu instead of cycling
-      startActivityForResult(std::make_unique<FontSelectionActivity>(renderer, mappedInput, &sdFontSystem.registry()),
-                             [this](const ActivityResult&) {
-                               SETTINGS.saveToFile();
-                               rebuildSettingsLists();
-                             });
-      return;
+  if (setting.usesSelectorActivity) {
+    auto selector = createSelectorActivity(setting, renderer, mappedInput);
+    if (selector) {
+      startActivityForResult(std::move(selector), [this](const ActivityResult&) {
+        CrossPointSettings::normalizeDependentSettings(SETTINGS);
+        SETTINGS.saveToFile();
+        needsHalfRefresh = true;
+      });
     }
-    const uint8_t totalValues = setting.enumStringValues.empty()
-                                    ? static_cast<uint8_t>(setting.enumValues.size())
-                                    : static_cast<uint8_t>(setting.enumStringValues.size());
-    const uint8_t cur = setting.valueGetter();
-    setting.valueSetter((cur + 1) % totalValues);
-  } else if (setting.type == SettingType::VALUE && setting.valuePtr != nullptr) {
-    // uint8_t: int8_t overflows above 127, breaking dictionary history cap rollover
-    const uint8_t currentValue = SETTINGS.*(setting.valuePtr);
-    if (currentValue + setting.valueRange.step > setting.valueRange.max) {
-      SETTINGS.*(setting.valuePtr) = setting.valueRange.min;
-    } else {
-      SETTINGS.*(setting.valuePtr) = currentValue + setting.valueRange.step;
-    }
-  } else if (setting.type == SettingType::ACTION) {
-    auto resultHandler = [this](const ActivityResult&) { SETTINGS.saveToFile(); };
-
-    switch (setting.action) {
-      case SettingAction::RemapFrontButtons:
-        startActivityForResult(std::make_unique<ButtonRemapActivity>(renderer, mappedInput), resultHandler);
-        break;
-      case SettingAction::CustomiseStatusBar:
-        startActivityForResult(std::make_unique<StatusBarSettingsActivity>(renderer, mappedInput), resultHandler);
-        break;
-      case SettingAction::KOReaderSync:
-        startActivityForResult(std::make_unique<KOReaderSettingsActivity>(renderer, mappedInput), resultHandler);
-        break;
-      case SettingAction::OPDSBrowser:
-        startActivityForResult(std::make_unique<OpdsServerListActivity>(renderer, mappedInput), resultHandler);
-        break;
-      case SettingAction::Network:
-        startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput, false), resultHandler);
-        break;
-      case SettingAction::ClearCache:
-        startActivityForResult(std::make_unique<ClearCacheActivity>(renderer, mappedInput), resultHandler);
-        break;
-      case SettingAction::CheckForUpdates:
-        startActivityForResult(std::make_unique<OtaUpdateActivity>(renderer, mappedInput), resultHandler);
-        break;
-      case SettingAction::SdFirmwareUpdate:
-        startActivityForResult(std::make_unique<SdFirmwareUpdateActivity>(renderer, mappedInput), resultHandler);
-        break;
-      case SettingAction::DownloadFonts:
-        startActivityForResult(std::make_unique<FontDownloadActivity>(renderer, mappedInput),
-                               [this](const ActivityResult&) {
-                                 SETTINGS.saveToFile();
-                                 rebuildSettingsLists();
-                               });
-        break;
-      case SettingAction::Language:
-        startActivityForResult(std::make_unique<LanguageSelectActivity>(renderer, mappedInput), resultHandler);
-        break;
-      case SettingAction::Dictionary:
-        startActivityForResult(std::make_unique<DictionarySelectActivity>(renderer, mappedInput), resultHandler);
-        break;
-      case SettingAction::None:
-        // Do nothing
-        break;
-    }
-    return;  // Results will be handled in the result handler, so we can return early here
-  } else {
     return;
   }
 
+  if (setting.type == SettingType::ACTION && (setting.action == SettingAction::SleepTimeoutPicker ||
+                                              setting.action == SettingAction::RefreshFrequencyPicker)) {
+    const bool isSleep = setting.action == SettingAction::SleepTimeoutPicker;
+    SliderPickerActivity::Config cfg;
+    if (isSleep) {
+      cfg = {.titleId = StrId::STR_TIME_TO_SLEEP,
+             .hintId = StrId::STR_SLIDER_STEP_HINT,
+             .minValue = 0,
+             .maxValue = 60,
+             .initialValue = SETTINGS.sleepTimeoutMinutes,
+             .suffix = tr(STR_MIN_SUFFIX),
+             .zeroLabel = tr(STR_NEVER)};
+    } else {
+      cfg = {.titleId = StrId::STR_REFRESH_FREQ,
+             .hintId = StrId::STR_SLIDER_STEP_HINT,
+             .minValue = 0,
+             .maxValue = 60,
+             .initialValue = SETTINGS.refreshFrequencyPages,
+             .suffix = tr(STR_PAGES_SUFFIX),
+             .zeroLabel = tr(STR_NEVER)};
+    }
+    startActivityForResult(std::make_unique<SliderPickerActivity>(renderer, mappedInput, std::move(cfg)),
+                           [this, isSleep](const ActivityResult& result) {
+                             if (!result.isCancelled) {
+                               const auto* pr = std::get_if<PercentResult>(&result.data);
+                               if (pr) {
+                                 if (isSleep)
+                                   SETTINGS.sleepTimeoutMinutes = static_cast<uint8_t>(pr->percent);
+                                 else
+                                   SETTINGS.refreshFrequencyPages = static_cast<uint8_t>(pr->percent);
+                                 SETTINGS.saveToFile();
+                               }
+                             }
+                             needsHalfRefresh = true;
+                           });
+    return;
+  }
+
+  if (setting.type == SettingType::ACTION) {
+    auto resultHandler = [this](const ActivityResult& result) {
+      CrossPointSettings::normalizeDependentSettings(SETTINGS);
+      SETTINGS.saveToFile();
+      needsHalfRefresh = true;
+      const auto* menuResult = std::get_if<MenuResult>(&result.data);
+      if (menuResult && menuResult->action != -1) {
+        auto activity = createActivityForAction(static_cast<SettingAction>(menuResult->action), renderer, mappedInput);
+        if (activity) {
+          startActivityForResult(std::move(activity), [this](const ActivityResult&) {
+            CrossPointSettings::normalizeDependentSettings(SETTINGS);
+            SETTINGS.saveToFile();
+            needsHalfRefresh = true;
+          });
+        }
+      }
+    };
+
+    if (setting.action == SettingAction::Submenu) {
+      auto it = std::find_if(submenuData.begin(), submenuData.end(),
+                             [&setting](const SettingInfo::SubmenuData& d) { return d.id == setting.nameId; });
+      if (it != submenuData.end()) {
+        startActivityForResult(
+            std::make_unique<SettingsSubmenuActivity>(renderer, mappedInput, setting.nameId, it->items),
+            [this](const ActivityResult&) { needsHalfRefresh = true; });
+      }
+    } else {
+      auto activity = createActivityForAction(setting.action, renderer, mappedInput);
+      if (activity) startActivityForResult(std::move(activity), resultHandler);
+    }
+    return;
+  }
+
+  setting.toggleValue();
+  CrossPointSettings::normalizeDependentSettings(SETTINGS);
   SETTINGS.saveToFile();
 }
 
 void SettingsActivity::render(RenderLock&&) {
   renderer.clearScreen();
 
-  const auto pageWidth = renderer.getScreenWidth();
-  const auto pageHeight = renderer.getScreenHeight();
-
   const auto& metrics = UITheme::getInstance().getMetrics();
+  const Rect contentRect = UITheme::getContentRect(renderer, true, false);
 
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_SETTINGS_TITLE),
-                 CROSSPOINT_VERSION);
+  GUI.drawHeader(renderer, Rect{contentRect.x, metrics.topPadding, contentRect.width, metrics.headerHeight},
+                 tr(STR_SETTINGS_TITLE), CROSSPOINT_VERSION);
 
   std::vector<TabInfo> tabs;
   tabs.reserve(categoryCount);
   for (int i = 0; i < categoryCount; i++) {
     tabs.push_back({I18N.get(categoryNames[i]), selectedCategoryIndex == i});
   }
-  GUI.drawTabBar(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight}, tabs,
-                 selectedSettingIndex == 0);
+  GUI.drawTabBar(
+      renderer, Rect{contentRect.x, metrics.topPadding + metrics.headerHeight, contentRect.width, metrics.tabBarHeight},
+      tabs, selectedSettingIndex == 0);
 
+  const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing;
   const auto& settings = *currentSettings;
   GUI.drawList(
       renderer,
-      Rect{0, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing, pageWidth,
-           pageHeight - (metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.buttonHintsHeight +
-                         metrics.verticalSpacing * 2)},
-      settingsCount, selectedSettingIndex - 1,
-      [&settings](int index) { return std::string(I18N.get(settings[index].nameId)); }, nullptr, nullptr,
-      [&settings](int i) {
-        const auto& setting = settings[i];
-        std::string valueText = "";
-        if (setting.type == SettingType::TOGGLE && setting.valuePtr != nullptr) {
-          const bool value = SETTINGS.*(setting.valuePtr);
-          valueText = value ? tr(STR_STATE_ON) : tr(STR_STATE_OFF);
-        } else if (setting.type == SettingType::ENUM && setting.valuePtr != nullptr) {
-          const uint8_t value = SETTINGS.*(setting.valuePtr);
-          valueText = I18N.get(setting.enumValues[value]);
-        } else if (setting.type == SettingType::ENUM && setting.valueGetter) {
-          const uint8_t value = setting.valueGetter();
-          if (!setting.enumStringValues.empty() && value < setting.enumStringValues.size()) {
-            valueText = setting.enumStringValues[value];
-          } else if (value < setting.enumValues.size()) {
-            valueText = I18N.get(setting.enumValues[value]);
-          }
-        } else if (setting.type == SettingType::VALUE && setting.valuePtr != nullptr) {
-          valueText = std::to_string(SETTINGS.*(setting.valuePtr));
-        } else if (setting.type == SettingType::ACTION && setting.stringGetter) {
-          valueText = setting.stringGetter();
-        }
-        return valueText;
-      },
-      true);
+      Rect{contentRect.x, contentTop, contentRect.width,
+           contentRect.height -
+               (metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing * 2)},
+      settingsCount, selectedSettingIndex - 1, [&settings](int index) { return settings[index].getTitle(); }, nullptr,
+      nullptr, [&settings](int i) { return settings[i].getDisplayValue(); }, true);
 
   // Draw help text
   const auto confirmLabel = (selectedSettingIndex == 0)
@@ -343,6 +408,7 @@ void SettingsActivity::render(RenderLock&&) {
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirmLabel, tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
-  // Always use standard refresh for settings screen
-  renderer.displayBuffer();
+  const bool halfRefresh = gpio.deviceIsX3() && needsHalfRefresh;
+  needsHalfRefresh = false;
+  renderer.displayBuffer(halfRefresh ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
 }

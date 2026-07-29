@@ -1,29 +1,56 @@
 #include "ActivityManager.h"
 
+#include <Arduino.h>
+#include <HalClock.h>
 #include <HalPowerManager.h>
+#include <Logging.h>
+#include <esp_heap_caps.h>
+#include <esp_system.h>
 
 #include <algorithm>
 
+#include "CrossPointState.h"
 #include "OpdsServerStore.h"
+#include "SdCardFontGlobals.h"
 #include "boot_sleep/BootActivity.h"
 #include "boot_sleep/SleepActivity.h"
 #include "browser/OpdsBookBrowserActivity.h"
-#include "home/CrashActivity.h"
+#include "home/FileBrowserActivity.h"
+#include "home/GlobalBookmarksActivity.h"
+#include "home/HomeActivity.h"
+#include "home/RecentBooksActivity.h"
 #ifdef READ_IT_LATER_ENABLED
 #include "readitlater/ReadItLaterActivity.h"
 #endif
-#include "home/FileBrowserActivity.h"
-#include "home/HomeActivity.h"
-#include "home/RecentBooksActivity.h"
 #include "network/CrossPointWebServerActivity.h"
+#include "network/SerialTransferActivity.h"
+#include "reader/KOReaderSyncActivity.h"
 #include "reader/ReaderActivity.h"
+#include "settings/ClockSettingsActivity.h"
 #include "settings/OpdsServerListActivity.h"
 #include "settings/SettingsActivity.h"
 #include "util/FullScreenMessageActivity.h"
+#include "weather/WeatherActivity.h"
+
+#ifndef DEBUG_MEMORY_CONSUMPTION
+#define DEBUG_MEMORY_CONSUMPTION 0
+#endif
 
 void ActivityManager::begin() {
+  // Create FreeRTOS objects here rather than in the constructor: ActivityManager
+  // is a global, and its constructor runs before the scheduler starts. Calling
+  // xSemaphoreCreateMutex() that early corrupts the TLSF heap metadata.
+  renderingMutex = xSemaphoreCreateMutex();
+  assert(renderingMutex != nullptr && "Failed to create rendering mutex");
+
+  // 10 KB: the render task runs the firmware's deepest call chains — page build/parse, CSS
+  // resolve, image decode (JPEG/PNG) + dither — and its stack abuts the heap top, so an
+  // overflow spills into the heap and surfaces as a corruption assert elsewhere (see the
+  // documented hazard in EpubReaderActivity). Field high-water dipped to ~1.7 KB free of the
+  // former 8 KB on a parse-on-render-task pass; +2 KB restores a safer margin. renderTaskLoop()
+  // also warns (RENDER_STACK_WARN_BYTES) if the live margin ever gets thin again.
   xTaskCreate(&renderTaskTrampoline, "ActivityManagerRender",
-              8192,              // Stack size
+              10240,             // Stack size (bytes)
               this,              // Parameters
               1,                 // Priority
               &renderTaskHandle  // Task handle
@@ -31,12 +58,36 @@ void ActivityManager::begin() {
   assert(renderTaskHandle != nullptr && "Failed to create render task");
 }
 
+#if DEBUG_MEMORY_CONSUMPTION
+static void logActivityStackState(const char* stage, Activity* currentActivity, size_t stackSize) {
+  const uint32_t freeHeap = esp_get_free_heap_size();
+  const uint32_t contigHeap = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT);
+  LOG_DBG("ACT", "%s: current=%s stackSize=%zu free=%lu contig=%lu", stage,
+          currentActivity ? currentActivity->getName().c_str() : "<none>", stackSize, freeHeap, contigHeap);
+}
+#else
+static inline void logActivityStackState(const char*, Activity*, size_t) {}
+#endif
+
 void ActivityManager::renderTaskTrampoline(void* param) {
   auto* self = static_cast<ActivityManager*>(param);
   self->renderTaskLoop();
 }
 
 void ActivityManager::renderTaskLoop() {
+#ifdef ENABLE_BOOT_HEAP_DIAGNOSTICS
+  // The kernel's CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK is OFF in the precompiled
+  // arduino-esp32 IDF libs and can't be flipped without rebuilding IDF. The canary
+  // (configCHECK_FOR_STACK_OVERFLOW==2) IS on but only fires at a context switch —
+  // too late here, because a deep render excursion spills into the heap and the next
+  // synchronous free trips multi_heap poisoning before any yield. Install the
+  // end-of-stack hardware watchpoint ourselves on THIS task so an overflow faults at
+  // the exact instruction that writes past the stack limit, yielding a backtrace at
+  // the offending frame. Single-core C3: one set persists (the kernel does not re-arm
+  // watchpoints on context switch when the Kconfig option is off), and the watched
+  // address belongs only to this task's stack, so other tasks can't false-trigger it.
+  vPortSetStackWatchpoint(pxTaskGetStackStart(nullptr));
+#endif
   while (true) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     // Acquire the lock before reading currentActivity to avoid a TOCTOU race
@@ -45,6 +96,42 @@ void ActivityManager::renderTaskLoop() {
     if (currentActivity) {
       HalPowerManager::Lock powerLock;  // Ensure we don't go into low-power mode while rendering
       currentActivity->render(std::move(lock));
+      // Always-on guard (cheap; one read): warn once if the render task's stack high-water gets
+      // dangerously thin. The render task's stack abuts the heap top — an overflow spills into
+      // the heap and shows up as an unrelated corruption assert. Tracks the running minimum so
+      // it only logs when a new low crosses the threshold (no per-pass spam). uxTaskGetStack...
+      // returns bytes on the C3 (StackType_t == uint8_t).
+      {
+        static constexpr unsigned RENDER_STACK_WARN_BYTES = 1536;
+        static unsigned lowestRenderStackFree = UINT_MAX;
+        const unsigned stackFree = static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr));
+        if (stackFree < lowestRenderStackFree) {
+          lowestRenderStackFree = stackFree;
+          if (stackFree < RENDER_STACK_WARN_BYTES) {
+            LOG_ERR("MEM", "Render task stack LOW: %u bytes free (new min) — stack-into-heap overflow risk", stackFree);
+          }
+        }
+      }
+#ifdef ENABLE_BOOT_HEAP_DIAGNOSTICS
+      // Render runs the deepest call chains in the firmware (page build + image
+      // decode + dither) on this task's fixed 8 KB stack, which is heap-allocated
+      // at the top of RAM abutting the heap's top block. If a render pass overflows
+      // it spills downward into that block, surfacing later as a lazy multi_heap
+      // poisoning assert on an unrelated free (e.g. a JPEG cleanup). The high-water
+      // mark is the MINIMUM free stack ever seen by this task, so sampling it right
+      // after render() returns captures the deepest excursion of the pass just run.
+      // bytes (StackType_t == uint8_t on the C3). Approaching 0 ⇒ overflow.
+      // Emit the stack high-water on its own line BEFORE the heap walk: if the
+      // corruption is a stack-into-heap spill, heap_caps_check_integrity_all() can
+      // itself fault while chasing trampled TLSF pointers (see the warning on
+      // checkHeapIntegrity in EpubReaderActivity), which would swallow this number.
+      const unsigned stackFreeBytes = static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr));
+      LOG_INF("MEM", "Render pass done [%s]: stack high-water=%u bytes free (min ever)",
+              currentActivity->getName().c_str(), stackFreeBytes);
+      if (!heap_caps_check_integrity_all(/*print_errors=*/true)) {
+        LOG_ERR("MEM", "HEAP CORRUPT immediately after render pass <-- the render task is the writer");
+      }
+#endif
     }
     // Notify any task blocked in requestUpdateAndWait() that the render is done.
     TaskHandle_t waiter = nullptr;
@@ -59,9 +146,42 @@ void ActivityManager::renderTaskLoop() {
 }
 
 void ActivityManager::loop() {
-  if (currentActivity) {
+  // Drain leftover input after an activity transition so that the button press/release
+  // used to leave one activity cannot bleed into the next.  We consume events until
+  // every button is released and no press/release edges remain.
+  if (drainInput) {
+    if (mappedInput.wasAnyPressed() || mappedInput.wasAnyReleased() ||
+        mappedInput.isPressed(MappedInputManager::Button::Back) ||
+        mappedInput.isPressed(MappedInputManager::Button::Confirm) ||
+        mappedInput.isPressed(MappedInputManager::Button::Left) ||
+        mappedInput.isPressed(MappedInputManager::Button::Right) ||
+        mappedInput.isPressed(MappedInputManager::Button::Up) ||
+        mappedInput.isPressed(MappedInputManager::Button::Down)) {
+      // Still have pending input — skip the activity loop but continue with
+      // the rest (pending-action processing, render flushing) so that
+      // transitions and screen updates are not delayed.
+    } else {
+      drainInput = false;
+    }
+  }
+
+  if (!drainInput && currentActivity) {
     // Note: do not hold a lock here, the loop() method must be responsible for acquire one if needed
     currentActivity->loop();
+  }
+
+  if (SETTINGS.useClock && HalClock::isSynced()) {
+    time_t now = HalClock::now();
+    if (now > 0) {
+      static time_t lastMinute = -1;
+      time_t minute = now / 60;
+      if (minute != lastMinute) {
+        lastMinute = minute;
+        if (!currentActivity || !currentActivity->shouldSkipPeriodicUpdate()) {
+          requestUpdate();
+        }
+      }
+    }
   }
 
   while (pendingAction != PendingAction::None) {
@@ -75,6 +195,7 @@ void ActivityManager::loop() {
         continue;
       }
 
+      const bool exitingReader = currentActivity->isReaderActivity();
       ActivityResult pendingResult = std::move(currentActivity->result);
 
       // Destroy the current activity
@@ -82,14 +203,20 @@ void ActivityManager::loop() {
       pendingAction = PendingAction::None;
 
       if (stackActivities.empty()) {
-        LOG_DBG("ACT", "No more activities on stack, going home");
-        lock.unlock();  // goHome may acquire its own lock
-        goHome();
-        continue;  // Will launch goHome immediately
+        LOG_DBG("ACT", "No more activities on stack, returning from child");
+        if (exitingReader) {
+          unloadSdFontIfLoaded();
+        }
+        lock.unlock();  // returnFromChild may acquire its own lock via replaceActivity
+        returnFromChild();
+        continue;  // Will launch the target activity immediately
 
       } else {
         currentActivity = std::move(stackActivities.back());
         stackActivities.pop_back();
+        if (exitingReader && !currentActivity->isReaderActivity()) {
+          unloadSdFontIfLoaded();
+        }
         LOG_DBG("ACT", "Popped from activity stack, new size = %zu", stackActivities.size());
         // Handle result if necessary
         if (currentActivity->resultHandler) {
@@ -102,6 +229,11 @@ void ActivityManager::loop() {
           handler(pendingResult);
         }
 
+        // Arm input drain so the button that triggered the pop doesn't bleed into the
+        // restored activity (or into a new activity the handler just pushed).
+        drainInput = true;
+        buttonEvents.drain();
+
         // Request an update to ensure the popped activity gets re-rendered
         if (pendingAction == PendingAction::None) {
           requestUpdate();
@@ -113,27 +245,52 @@ void ActivityManager::loop() {
 
     } else if (pendingActivity) {
       // Current activity has requested a new activity to be launched
+      RenderLock lock;
+
+      const bool enteringReader = pendingActivity->isReaderActivity();
+      const bool exitingReader = currentActivity && currentActivity->isReaderActivity();
+      const bool shouldUnloadSdFont = exitingReader && !enteringReader;
+
       if (pendingAction == PendingAction::Replace) {
-        // Replace needs lock because it calls onExit() which may render
-        RenderLock lock;
+#if DEBUG_MEMORY_CONSUMPTION
+        logActivityStackState("replace_before", currentActivity.get(), stackActivities.size());
+#endif
+        // Destroy the current activity
         exitActivity(lock);
+        // Clear the stack
         while (!stackActivities.empty()) {
           stackActivities.back()->onExit();
           stackActivities.pop_back();
         }
-        pendingAction = PendingAction::None;
-        currentActivity = std::move(pendingActivity);
-        lock.unlock();  // onEnter may acquire its own lock
-        currentActivity->onEnter();
+        if (shouldUnloadSdFont) {
+          unloadSdFontIfLoaded();
+        }
+#if DEBUG_MEMORY_CONSUMPTION
+        logActivityStackState("replace_after_clear", nullptr, stackActivities.size());
+#endif
       } else if (pendingAction == PendingAction::Push) {
-        // Push doesn't need RenderLock - just moves pointers, no rendering.
-        // Avoiding the lock prevents blocking on any in-progress e-ink refresh (~1s).
+#if DEBUG_MEMORY_CONSUMPTION
+        logActivityStackState("push_before", currentActivity.get(), stackActivities.size());
+#endif
+        // Move current activity to stack
         stackActivities.push_back(std::move(currentActivity));
+#if DEBUG_MEMORY_CONSUMPTION
         LOG_DBG("ACT", "Pushed to activity stack, new size = %zu", stackActivities.size());
-        pendingAction = PendingAction::None;
-        currentActivity = std::move(pendingActivity);
-        currentActivity->onEnter();
+        logActivityStackState("push_after", currentActivity.get(), stackActivities.size());
+#else
+        LOG_DBG("ACT", "Pushed to activity stack, new size = %zu", stackActivities.size());
+#endif
       }
+      pendingAction = PendingAction::None;
+      currentActivity = std::move(pendingActivity);
+
+      lock.unlock();  // onEnter may acquire its own lock
+      currentActivity->onEnter();
+
+      // Arm input drain so the button that triggered the transition doesn't bleed
+      // into the new activity.
+      drainInput = true;
+      buttonEvents.drain();
 
       // onEnter may request another pending action, we will handle it in the next loop iteration
       continue;
@@ -141,7 +298,9 @@ void ActivityManager::loop() {
   }
 
   if (requestedUpdate) {
+    taskENTER_CRITICAL(nullptr);
     requestedUpdate = false;
+    taskEXIT_CRITICAL(nullptr);
     // Using direct notification to signal the render task to update
     // Increment counter so multiple rapid calls won't be lost
     if (renderTaskHandle) {
@@ -163,6 +322,10 @@ void ActivityManager::replaceActivity(std::unique_ptr<Activity>&& newActivity) {
   if (currentActivity) {
     // Defer launch if we're currently in an activity, to avoid deleting the current activity
     // leading to the "delete this" problem
+#if DEBUG_MEMORY_CONSUMPTION
+    LOG_DBG("ACT", "replaceActivity requested: current=%s stackSize=%zu", currentActivity->getName().c_str(),
+            stackActivities.size());
+#endif
     pendingActivity = std::move(newActivity);
     pendingAction = PendingAction::Replace;
   } else {
@@ -176,14 +339,29 @@ void ActivityManager::goToFileTransfer() {
   replaceActivity(std::make_unique<CrossPointWebServerActivity>(renderer, mappedInput));
 }
 
-void ActivityManager::goToSettings() { replaceActivity(std::make_unique<SettingsActivity>(renderer, mappedInput)); }
-
-void ActivityManager::goToFileBrowser(std::string path) {
-  replaceActivity(std::make_unique<FileBrowserActivity>(renderer, mappedInput, std::move(path)));
+void ActivityManager::goToSerialTransfer() {
+  replaceActivity(std::make_unique<SerialTransferActivity>(renderer, mappedInput));
 }
 
-void ActivityManager::goToRecentBooks() {
-  replaceActivity(std::make_unique<RecentBooksActivity>(renderer, mappedInput));
+void ActivityManager::goToSettings() { replaceActivity(std::make_unique<SettingsActivity>(renderer, mappedInput)); }
+
+void ActivityManager::goToClockSettings() {
+  replaceActivity(std::make_unique<ClockSettingsActivity>(renderer, mappedInput));
+}
+
+void ActivityManager::goToFileBrowser(std::string path, std::string focusName) {
+  replaceActivity(std::make_unique<FileBrowserActivity>(renderer, mappedInput, std::move(path), std::move(focusName)));
+}
+
+void ActivityManager::goToRecentBooks(int focusIndex) {
+  replaceActivity(std::make_unique<RecentBooksActivity>(renderer, mappedInput, focusIndex));
+}
+
+void ActivityManager::goToGlobalBookmarks() { goToGlobalBookmarks({}); }
+
+void ActivityManager::goToGlobalBookmarks(ReturnHint hint) {
+  hasReturnHint = false;
+  replaceActivity(std::make_unique<GlobalBookmarksActivity>(renderer, mappedInput, std::move(hint)));
 }
 
 void ActivityManager::goToBrowser() {
@@ -196,6 +374,21 @@ void ActivityManager::goToBrowser() {
   }
 }
 
+void ActivityManager::goToBrowserWithSearch(std::string query) {
+  const auto& servers = OPDS_STORE.getServers();
+  if (servers.size() == 1) {
+    replaceActivity(std::make_unique<OpdsBookBrowserActivity>(renderer, mappedInput, servers[0], std::move(query)));
+  } else {
+    replaceActivity(std::make_unique<OpdsServerListActivity>(renderer, mappedInput, true, std::move(query)));
+  }
+}
+
+void ActivityManager::goToReader(std::string path) {
+  RenderLock lock;
+  ensureSdFontLoadedForPath(path.c_str());
+  replaceActivity(std::make_unique<ReaderActivity>(renderer, mappedInput, std::move(path)));
+}
+
 void ActivityManager::goToReadItLater() {
 #ifdef READ_IT_LATER_ENABLED
   replaceActivity(std::make_unique<ReadItLaterActivity>(renderer, mappedInput));
@@ -204,8 +397,63 @@ void ActivityManager::goToReadItLater() {
 #endif
 }
 
-void ActivityManager::goToReader(std::string path) {
+void ActivityManager::goToKOReaderSync() {
+  const auto& sync = APP_STATE.koReaderSyncSession;
+  if (!sync.active || sync.epubPath.empty()) {
+    LOG_ERR("ACT", "Cannot launch KOReader sync without an active EPUB handoff");
+    goHome();
+    return;
+  }
+
+  replaceActivity(std::make_unique<KOReaderSyncActivity>(renderer, mappedInput, sync.epubPath, sync.spineIndex,
+                                                         sync.page, sync.totalPagesInSpine, sync.paragraphIndex,
+                                                         sync.hasParagraphIndex, sync.xhtmlSeekHint, sync.intent));
+}
+
+void ActivityManager::replaceWithReader(std::string path, ReturnHint hint) {
+  returnHint = std::move(hint);
+  hasReturnHint = true;
+  RenderLock lock;
+  ensureSdFontLoadedForPath(path.c_str());
   replaceActivity(std::make_unique<ReaderActivity>(renderer, mappedInput, std::move(path)));
+}
+
+void ActivityManager::replaceWithFileBrowser(std::string path, ReturnHint hint, std::string focusName) {
+  returnHint = std::move(hint);
+  hasReturnHint = true;
+  replaceActivity(std::make_unique<FileBrowserActivity>(renderer, mappedInput, std::move(path), std::move(focusName)));
+}
+
+void ActivityManager::replaceWithRecentBooks(ReturnHint hint) {
+  returnHint = std::move(hint);
+  hasReturnHint = true;
+  replaceActivity(std::make_unique<RecentBooksActivity>(renderer, mappedInput, -1));
+}
+
+void ActivityManager::returnFromChild() {
+  if (!hasReturnHint) {
+    goHome();
+    return;
+  }
+  ReturnHint hint = std::move(returnHint);
+  returnHint = {};
+  hasReturnHint = false;
+
+  switch (hint.target) {
+    case ReturnTo::FileBrowser:
+      goToFileBrowser(std::move(hint.path), std::move(hint.selectName));
+      break;
+    case ReturnTo::RecentBooks:
+      goToRecentBooks(hint.selectIndex);
+      break;
+    case ReturnTo::GlobalBookmarks:
+      goToGlobalBookmarks(std::move(hint));
+      break;
+    case ReturnTo::Home:
+    default:
+      goHome(std::move(hint.selectName), hint.selectIndex);
+      break;
+  }
 }
 
 void ActivityManager::goToSleep(bool fromTimeout) {
@@ -219,24 +467,12 @@ void ActivityManager::goToFullScreenMessage(std::string message, EpdFontFamily::
   replaceActivity(std::make_unique<FullScreenMessageActivity>(renderer, mappedInput, std::move(message), style));
 }
 
-void ActivityManager::goHome(HomeMenuItem initialMenuItem) {
-  if (initialMenuItem == HomeMenuItem::NONE && currentActivity) {
-    const auto& activityName = currentActivity->name;
-    if (activityName == "FileBrowser") {
-      initialMenuItem = HomeMenuItem::FILE_BROWSER;
-    } else if (activityName == "RecentBooks") {
-      initialMenuItem = HomeMenuItem::RECENTS;
-    } else if (activityName == "OpdsBookBrowser") {
-      initialMenuItem = HomeMenuItem::OPDS_BROWSER;
-    } else if (activityName == "CrossPointWebServer") {
-      initialMenuItem = HomeMenuItem::FILE_TRANSFER;
-    } else if (activityName == "Settings") {
-      initialMenuItem = HomeMenuItem::SETTINGS_MENU;
-    }
-  }
-  replaceActivity(std::make_unique<HomeActivity>(renderer, mappedInput, initialMenuItem));
+void ActivityManager::goToWeather() { replaceActivity(std::make_unique<WeatherActivity>(renderer, mappedInput)); }
+
+void ActivityManager::goHome(std::string focusBookPath, int focusSelectorIndex) {
+  hasReturnHint = false;
+  replaceActivity(std::make_unique<HomeActivity>(renderer, mappedInput, std::move(focusBookPath), focusSelectorIndex));
 }
-void ActivityManager::goToCrashReport() { replaceActivity(std::make_unique<CrashActivity>(renderer, mappedInput)); }
 
 void ActivityManager::pushActivity(std::unique_ptr<Activity>&& activity) {
   if (pendingActivity) {
@@ -244,6 +480,10 @@ void ActivityManager::pushActivity(std::unique_ptr<Activity>&& activity) {
     LOG_ERR("ACT", "pendingActivity while pushActivity is not expected");
     pendingActivity.reset();
   }
+#if DEBUG_MEMORY_CONSUMPTION
+  LOG_DBG("ACT", "pushActivity requested: current=%s stackSize=%zu",
+          currentActivity ? currentActivity->getName().c_str() : "<none>", stackActivities.size());
+#endif
   pendingActivity = std::move(activity);
   pendingAction = PendingAction::Push;
 }
@@ -259,26 +499,25 @@ void ActivityManager::popActivity() {
 
 bool ActivityManager::preventAutoSleep() const { return currentActivity && currentActivity->preventAutoSleep(); }
 
-bool ActivityManager::isInReaderContext() const {
-  if (currentActivity && currentActivity->isReaderActivity()) {
-    return true;
-  }
+bool ActivityManager::isReaderActivity() const {
+  if (currentActivity && currentActivity->isReaderActivity()) return true;
   return std::any_of(stackActivities.begin(), stackActivities.end(),
-                     [](const auto& activity) { return activity && activity->isReaderActivity(); });
+                     [](const auto& activity) { return activity->isReaderActivity(); });
 }
 
 bool ActivityManager::skipLoopDelay() const { return currentActivity && currentActivity->skipLoopDelay(); }
 
-ScreenshotInfo ActivityManager::getScreenshotInfo() const {
+bool ActivityManager::currentOwnsSerialInput() const { return currentActivity && currentActivity->ownsSerialInput(); }
+
+void ActivityManager::prepareFramebufferForCapture() {
   if (currentActivity) {
-    return currentActivity->getScreenshotInfo();
+    currentActivity->prepareFramebufferForCapture();
   }
-  return {};
 }
 
-void ActivityManager::notifyOrientationChanged(uint8_t orientation) {
-  if (currentActivity) {
-    currentActivity->onOrientationChanged(orientation);
+void ActivityManager::dispatchButtonAction(const CrossPointSettings::BUTTON_ACTION action) {
+  if (currentActivity && currentActivity->isReaderActivity()) {
+    currentActivity->onButtonAction(action);
   }
 }
 
@@ -290,7 +529,9 @@ void ActivityManager::requestUpdate(bool immediate) {
   } else {
     // Deferring the update until current loop is finished
     // This is to avoid multiple updates being requested in the same loop
+    taskENTER_CRITICAL(nullptr);
     requestedUpdate = true;
+    taskEXIT_CRITICAL(nullptr);
   }
 }
 void ActivityManager::requestUpdateAndWait() {

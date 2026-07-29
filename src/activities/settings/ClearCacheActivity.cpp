@@ -20,19 +20,31 @@ void ClearCacheActivity::onExit() { Activity::onExit(); }
 
 void ClearCacheActivity::render(RenderLock&&) {
   const auto& metrics = UITheme::getInstance().getMetrics();
-  const auto pageWidth = renderer.getScreenWidth();
-  const auto pageHeight = renderer.getScreenHeight();
+  const Rect contentRect = UITheme::getContentRect(renderer, true, false);
 
   renderer.clearScreen();
 
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_CLEAR_READING_CACHE));
+  GUI.drawHeader(renderer, Rect{contentRect.x, metrics.topPadding, contentRect.width, metrics.headerHeight},
+                 tr(STR_CLEAR_READING_CACHE));
 
+  const int midY = contentRect.y + contentRect.height / 2;
+  const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
+  const int warnWidth = contentRect.width - 2 * metrics.contentSidePadding;
   if (state == WARNING) {
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 60, tr(STR_CLEAR_CACHE_WARNING_1), true);
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 30, tr(STR_CLEAR_CACHE_WARNING_2), true,
-                              EpdFontFamily::BOLD);
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 10, tr(STR_CLEAR_CACHE_WARNING_3), true);
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 30, tr(STR_CLEAR_CACHE_WARNING_4), true);
+    const auto warn1Lines = renderer.wrappedText(UI_10_FONT_ID, tr(STR_CLEAR_CACHE_WARNING_1), warnWidth, 3);
+    int y = midY - 60;
+    for (const auto& line : warn1Lines) {
+      renderer.drawCenteredText(UI_10_FONT_ID, y, line.c_str());
+      y += lineHeight;
+    }
+    renderer.drawCenteredText(UI_10_FONT_ID, midY - 30, tr(STR_CLEAR_CACHE_WARNING_2), true, EpdFontFamily::BOLD);
+    const std::string warn34 = std::string(tr(STR_CLEAR_CACHE_WARNING_3)) + " " + tr(STR_CLEAR_CACHE_WARNING_4);
+    const auto warn34Lines = renderer.wrappedText(UI_10_FONT_ID, warn34.c_str(), warnWidth, 3);
+    y = midY + 10;
+    for (const auto& line : warn34Lines) {
+      renderer.drawCenteredText(UI_10_FONT_ID, y, line.c_str());
+      y += lineHeight;
+    }
 
     const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), tr(STR_CLEAR_BUTTON), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -41,18 +53,18 @@ void ClearCacheActivity::render(RenderLock&&) {
   }
 
   if (state == CLEARING) {
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, tr(STR_CLEARING_CACHE));
+    renderer.drawCenteredText(UI_10_FONT_ID, midY, tr(STR_CLEARING_CACHE));
     renderer.displayBuffer();
     return;
   }
 
   if (state == SUCCESS) {
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 20, tr(STR_CACHE_CLEARED), true, EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_10_FONT_ID, midY - 20, tr(STR_CACHE_CLEARED), true, EpdFontFamily::BOLD);
     std::string resultText = std::to_string(clearedCount) + " " + std::string(tr(STR_ITEMS_REMOVED));
     if (failedCount > 0) {
       resultText += ", " + std::to_string(failedCount) + " " + std::string(tr(STR_FAILED_LOWER));
     }
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 10, resultText.c_str());
+    renderer.drawCenteredText(UI_10_FONT_ID, midY + 10, resultText.c_str());
 
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -61,9 +73,8 @@ void ClearCacheActivity::render(RenderLock&&) {
   }
 
   if (state == FAILED) {
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 - 20, tr(STR_CLEAR_CACHE_FAILED), true,
-                              EpdFontFamily::BOLD);
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2 + 10, tr(STR_CHECK_SERIAL_OUTPUT));
+    renderer.drawCenteredText(UI_10_FONT_ID, midY - 20, tr(STR_CLEAR_CACHE_FAILED), true, EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_10_FONT_ID, midY + 10, tr(STR_CHECK_SERIAL_OUTPUT));
 
     const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
@@ -94,8 +105,8 @@ void ClearCacheActivity::clearCache() {
     file.getName(name, sizeof(name));
     String itemName(name);
 
-    // Only delete directories starting with epub_ or xtc_
-    if (file.isDirectory() && (itemName.startsWith("epub_") || itemName.startsWith("xtc_"))) {
+    if (file.isDirectory() &&
+        (itemName.startsWith("epub_") || itemName.startsWith("xtc_") || itemName.startsWith("txt_"))) {
       String fullPath = "/.crosspoint/" + itemName;
       LOG_DBG("CLEAR_CACHE", "Removing cache: %s", fullPath.c_str());
 

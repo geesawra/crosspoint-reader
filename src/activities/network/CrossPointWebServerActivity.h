@@ -34,29 +34,34 @@ class CrossPointWebServerActivity final : public Activity {
   NetworkMode networkMode = NetworkMode::JOIN_NETWORK;
   bool isApMode = false;
 
+  // Track whether the web server was started during this activity.
+  bool webServerStarted = false;
+
   // Web server - owned by this activity
   std::unique_ptr<CrossPointWebServer> webServer;
 
   // Server status
   std::string connectedIP;
   std::string connectedSSID;  // For STA mode: network name, For AP mode: AP name
+  int currentRssi = 0;
+  unsigned long lastRssiUpdateTime = 0;
 
   // Performance monitoring
   unsigned long lastHandleClientTime = 0;
 
-  // Sustained WiFi-loss tracking; abandon only after WIFI_ABANDON_MS.
-  int consecutiveDisconnects = 0;
-  unsigned long firstDisconnectAt = 0;
-  static constexpr unsigned long WIFI_ABANDON_MS = 5UL * 60UL * 1000UL;
-
-  // Cached signal-strength bracket (0..4) for the WiFi indicator.
-  int lastWifiBars = 0;
+  // Set after the first render completes and frame buffers are released.
+  // Subsequent render() calls return immediately — no display operations
+  // are possible after releaseFrameBuffers().
+  bool buffersReleased = false;
 
   void renderServerRunning() const;
-  void renderWifiIndicator(int subHeaderTop) const;
 
   void onNetworkModeSelected(NetworkMode mode);
   void onWifiSelectionComplete(bool connected);
+  // Unload SD fonts, paint the QR/URL screen, and release both frame buffers.
+  // AP mode calls this before the WiFi stack starts so it gets the ~100KB of
+  // headroom; STA mode calls it from startWebServer once the IP is known.
+  void showServerScreenAndReleaseBuffers();
   void startAccessPoint();
   void startWebServer();
 
@@ -69,4 +74,7 @@ class CrossPointWebServerActivity final : public Activity {
   void render(RenderLock&&) override;
   bool skipLoopDelay() override { return webServer && webServer->isRunning(); }
   bool preventAutoSleep() override { return webServer && webServer->isRunning(); }
+  // Suppress the minute-tick e-ink refresh while the web server is running.
+  // That 640ms display cycle holds the render mutex and blocks handleClient.
+  bool shouldSkipPeriodicUpdate() const override { return webServer && webServer->isRunning(); }
 };

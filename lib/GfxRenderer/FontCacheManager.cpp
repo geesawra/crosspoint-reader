@@ -4,7 +4,10 @@
 #include <Logging.h>
 #include <SdCardFont.h>
 
+#include <algorithm>
 #include <cstring>
+#include <utility>
+#include <vector>
 
 FontCacheManager::FontCacheManager(const std::map<int, EpdFontFamily>& fontMap,
                                    const std::map<int, SdCardFont*>& sdCardFonts)
@@ -15,16 +18,33 @@ void FontCacheManager::setFontDecompressor(FontDecompressor* d) { fontDecompress
 void FontCacheManager::clearCache() {
   if (fontDecompressor_) fontDecompressor_->clearCache();
   for (auto& [id, font] : sdCardFonts_) {
+    if (!font) {
+      LOG_ERR("FCM", "clearCache: null SdCardFont pointer for fontId=%d", id);
+      continue;
+    }
     font->clearCache();
   }
 }
 
 void FontCacheManager::prewarmCache(int fontId, const char* utf8Text, uint8_t styleMask) {
+  // Deliberately does NOT clear existing page slots: a page that mixes fonts (body +
+  // heading) is prewarmed with one call per font, and clearing here would wipe the
+  // previous font's slots — the render would then transiently re-decompress a glyph
+  // group per body glyph (~10 ms each, multi-second page turns). The batch clear
+  // happens once in endScanAndPrewarm() before the per-font loop.
+
   // SD card font prewarm path: prewarm all requested styles in one call
-  auto it = sdCardFonts_.find(fontId);
-  if (it != sdCardFonts_.end()) {
-    int missed = it->second->prewarm(utf8Text, styleMask);
-    if (missed > 0) {
+  auto sdIt = sdCardFonts_.find(fontId);
+  if (sdIt != sdCardFonts_.end()) {
+    SdCardFont* sdFont = sdIt->second;
+    if (!sdFont) {
+      LOG_ERR("FCM", "prewarmCache(SD): null SdCardFont pointer for fontId=%d", fontId);
+      return;
+    }
+    int missed = sdFont->prewarm(utf8Text, styleMask);
+    if (missed < 0) {
+      LOG_ERR("FCM", "prewarmCache(SD): prewarm failed for fontId=%d (styleMask=0x%02X)", fontId, styleMask);
+    } else if (missed > 0) {
       LOG_DBG("FCM", "prewarmCache(SD): %d glyph(s) not found (styleMask=0x%02X)", missed, styleMask);
     }
     return;
@@ -39,7 +59,9 @@ void FontCacheManager::prewarmCache(int fontId, const char* utf8Text, uint8_t st
     const EpdFontData* data = fontMap_.at(fontId).getData(style);
     if (!data || !data->groups) continue;
     int missed = fontDecompressor_->prewarmCache(data, utf8Text);
-    if (missed > 0) {
+    if (missed < 0) {
+      LOG_DBG("FCM", "prewarmCache: Decompressor slots full during style %d!", i);
+    } else if (missed > 0) {
       LOG_DBG("FCM", "prewarmCache: %d glyph(s) not cached for style %d", missed, i);
     }
   }
@@ -48,66 +70,72 @@ void FontCacheManager::prewarmCache(int fontId, const char* utf8Text, uint8_t st
 void FontCacheManager::logStats(const char* label) {
   if (fontDecompressor_) fontDecompressor_->logStats(label);
   for (auto& [id, font] : sdCardFonts_) {
-    font->logStats(label);
+    if (font) font->logStats(label);
   }
 }
 
 void FontCacheManager::resetStats() {
   if (fontDecompressor_) fontDecompressor_->resetStats();
   for (auto& [id, font] : sdCardFonts_) {
-    font->resetStats();
+    if (font) font->resetStats();
   }
 }
 
 bool FontCacheManager::isScanning() const { return scanMode_ == ScanMode::Scanning; }
 
 void FontCacheManager::recordText(const char* text, int fontId, EpdFontFamily::Style style) {
-  scanText_ += text;
-  if (scanFontId_ < 0) scanFontId_ = fontId;
-  const uint8_t baseStyle = static_cast<uint8_t>(style) & 0x03;
-  const unsigned char* p = reinterpret_cast<const unsigned char*>(text);
-  uint32_t cpCount = 0;
-  while (*p) {
-    if ((*p & 0xC0) != 0x80) cpCount++;
-    p++;
-  }
-  scanStyleCounts_[baseStyle] += cpCount;
+  // Accumulate per fontId AND per base style so a page that mixes fonts (heading + body)
+  // prewarms each, and each style is later warmed with only its own glyphs.
+  scanByFont_[fontId].textByStyle[static_cast<uint8_t>(style) & 0x03] += text;
 }
 
 // --- PrewarmScope implementation ---
 
 FontCacheManager::PrewarmScope::PrewarmScope(FontCacheManager& manager) : manager_(&manager) {
   manager_->scanMode_ = ScanMode::Scanning;
-  manager_->clearCache();
   manager_->resetStats();
-  manager_->scanText_.clear();
-  manager_->scanText_.reserve(2048);  // Pre-allocate to avoid heap fragmentation from repeated concat
-  memset(manager_->scanStyleCounts_, 0, sizeof(manager_->scanStyleCounts_));
-  manager_->scanFontId_ = -1;
+  manager_->scanByFont_.clear();
 }
 
 void FontCacheManager::PrewarmScope::endScanAndPrewarm() {
   manager_->scanMode_ = ScanMode::None;
-  if (manager_->scanText_.empty()) return;
+  if (manager_->scanByFont_.empty()) return;
 
-  // Build style bitmask from all styles that appeared during the scan
-  uint8_t styleMask = 0;
-  for (uint8_t i = 0; i < 4; i++) {
-    if (manager_->scanStyleCounts_[i] > 0) styleMask |= (1 << i);
+  // One batch clear for the whole page; the per-(font,style) prewarmCache calls below
+  // append into the freed slots (FontDecompressor dedupes across slots between calls).
+  manager_->clearCache();
+
+  // Prewarm every (font, style) pair that appeared during the scan, each with only the text
+  // drawn in that style. The page slots are limited (MAX_PAGE_SLOTS), so warm the pair with
+  // the MOST text first: the body font's dominant style (~hundreds of glyphs) must win the
+  // slots over a short heading or a few styled words. Losers fall back cheaply per glyph —
+  // far better than the body thrashing.
+  struct PrewarmItem {
+    int fontId;
+    uint8_t style;
+    const std::string* text;
+  };
+  std::vector<PrewarmItem> order;
+  order.reserve(manager_->scanByFont_.size() * 4);  // worst case: every style seen in every font
+  for (const auto& kv : manager_->scanByFont_) {
+    for (uint8_t i = 0; i < 4; i++) {
+      const std::string& text = kv.second.textByStyle[i];
+      if (!text.empty()) order.push_back({kv.first, i, &text});
+    }
   }
-  if (styleMask == 0) styleMask = 1;  // default to regular
+  std::sort(order.begin(), order.end(),
+            [](const PrewarmItem& a, const PrewarmItem& b) { return a.text->size() > b.text->size(); });
 
-  manager_->prewarmCache(manager_->scanFontId_, manager_->scanText_.c_str(), styleMask);
+  for (const auto& item : order) {
+    manager_->prewarmCache(item.fontId, item.text->c_str(), static_cast<uint8_t>(1u << item.style));
+  }
 
-  // Free scan string memory
-  manager_->scanText_.clear();
-  manager_->scanText_.shrink_to_fit();
+  manager_->scanByFont_.clear();
 }
 
 FontCacheManager::PrewarmScope::~PrewarmScope() {
   if (active_) {
-    endScanAndPrewarm();  // no-op if already called (scanText_ is empty)
-    manager_->clearCache();
+    endScanAndPrewarm();  // no-op if already called (scanByFont_ is empty)
   }
 }
 

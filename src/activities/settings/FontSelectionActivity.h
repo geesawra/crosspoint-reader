@@ -1,17 +1,20 @@
 #pragma once
 
-#include <SdCardFontRegistry.h>
+#include <GfxRenderer.h>
 
-#include <string>
-#include <vector>
-
-#include "activities/Activity.h"
+#include "../Activity.h"
 #include "util/ButtonNavigator.h"
 
+class MappedInputManager;
+
+/// Full-screen list of all reader fonts (built-in + SD card families).
+/// Replaces in-place enum cycling for the Reader Font Family setting.
 class FontSelectionActivity final : public Activity {
  public:
-  explicit FontSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
-                                 const SdCardFontRegistry* registry);
+  enum class Target { EPUB, TXT };
+
+  explicit FontSelectionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, Target target = Target::EPUB)
+      : Activity("FontSelect", renderer, mappedInput), target(target) {}
 
   void onEnter() override;
   void onExit() override;
@@ -21,14 +24,8 @@ class FontSelectionActivity final : public Activity {
  private:
   void handleSelection();
 
-  struct FontEntry {
-    std::string name;
-    bool isBuiltin;
-    uint8_t settingIndex;  // index used by valueSetter
-  };
-
-  const SdCardFontRegistry* registry_;
-  ButtonNavigator buttonNavigator_;
-  std::vector<FontEntry> fonts_;
-  int selectedIndex_ = 0;
+  ButtonNavigator buttonNavigator;
+  int selectedIndex = 0;
+  uint8_t fontCount = 0;
+  Target target;
 };

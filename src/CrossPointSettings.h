@@ -24,14 +24,22 @@ class CrossPointSettings {
     COVER = 3,
     BLANK = 4,
     COVER_CUSTOM = 5,
+    OVERLAY = 6,
+    QUICK_RESUME = 7,
     SLEEP_SCREEN_MODE_COUNT
   };
   enum SLEEP_SCREEN_COVER_MODE { FIT = 0, CROP = 1, SLEEP_SCREEN_COVER_MODE_COUNT };
+  enum SLEEP_IMAGE_PICK_MODE { PICK_RANDOM = 0, PICK_SEQUENTIAL = 1, SLEEP_IMAGE_PICK_MODE_COUNT };
   enum SLEEP_SCREEN_COVER_FILTER {
     NO_FILTER = 0,
     BLACK_AND_WHITE = 1,
     INVERTED_BLACK_AND_WHITE = 2,
     SLEEP_SCREEN_COVER_FILTER_COUNT
+  };
+  enum QUICK_RESUME_SLEEP_SCREEN {
+    QUICK_RESUME_NEVER = 0,
+    QUICK_RESUME_AFTER_TIMEOUT = 1,
+    QUICK_RESUME_SLEEP_SCREEN_COUNT
   };
 
   // Status bar enum - legacy
@@ -57,11 +65,10 @@ class CrossPointSettings {
     STATUS_BAR_PROGRESS_BAR_THICKNESS_COUNT
   };
   enum STATUS_BAR_TITLE { BOOK_TITLE = 0, CHAPTER_TITLE = 1, HIDE_TITLE = 2, STATUS_BAR_TITLE_COUNT };
-  enum XTC_STATUS_BAR_MODE {
-    XTC_STATUS_BAR_HIDE = 0,
-    XTC_STATUS_BAR_BOTTOM = 1,
-    XTC_STATUS_BAR_TOP = 2,
-    XTC_STATUS_BAR_MODE_COUNT
+  enum STATUS_BAR_ITEMS_POSITION {
+    STATUS_BAR_ITEMS_TOP = 0,
+    STATUS_BAR_ITEMS_BOTTOM = 1,
+    STATUS_BAR_ITEMS_POSITION_COUNT
   };
 
   enum ORIENTATION {
@@ -92,32 +99,11 @@ class CrossPointSettings {
     FRONT_BUTTON_HARDWARE_COUNT
   };
 
-  // Side button layout options
-  // Default: Previous, Next
-  // Swapped: Next, Previous
-  enum SIDE_BUTTON_LAYOUT { PREV_NEXT = 0, NEXT_PREV = 1, BOTH_FORWARD = 2, SIDE_BUTTON_LAYOUT_COUNT };
-
   // Font family options (built-in fonts only; SD card fonts use sdFontFamilyName)
-  enum FONT_FAMILY { BOOKERLY = 0, NOTOSERIF = 1, NOTOSANS = 2, FONT_FAMILY_COUNT };
+  enum FONT_FAMILY { BOOKERLY = 0, NOTOSANS = 1, FONT_FAMILY_COUNT };
   static constexpr uint8_t BUILTIN_FONT_COUNT = FONT_FAMILY_COUNT;
   // Font size options
-  enum FONT_SIZE { EXTRA_SMALL = 0, SMALL = 1, MEDIUM = 2, LARGE = 3, FONT_SIZE_COUNT };
-  // Definition viewer font overrides (GLOBAL = follow reader setting)
-  enum DICT_FONT_FAMILY {
-    DICT_FONT_GLOBAL = 0,
-    DICT_BOOKERLY = 1,
-    DICT_NOTOSERIF = 2,
-    DICT_NOTOSANS = 3,
-    DICT_FONT_FAMILY_COUNT
-  };
-  enum DICT_FONT_SIZE {
-    DICT_SIZE_GLOBAL = 0,
-    DICT_EXTRA_SMALL = 1,
-    DICT_SMALL = 2,
-    DICT_MEDIUM = 3,
-    DICT_LARGE = 4,
-    DICT_FONT_SIZE_COUNT
-  };
+  enum FONT_SIZE { SMALL = 0, MEDIUM = 1, LARGE = 2, EXTRA_LARGE = 3, TINY = 4, FONT_SIZE_COUNT };
   enum LINE_COMPRESSION { TIGHT = 0, NORMAL = 1, WIDE = 2, LINE_COMPRESSION_COUNT };
   enum PARAGRAPH_ALIGNMENT {
     JUSTIFIED = 0,
@@ -135,7 +121,6 @@ class CrossPointSettings {
     SLEEP_10_MIN = 2,
     SLEEP_15_MIN = 3,
     SLEEP_30_MIN = 4,
-    SLEEP_3_MIN = 5,
     SLEEP_TIMEOUT_COUNT
   };
 
@@ -149,33 +134,70 @@ class CrossPointSettings {
     REFRESH_FREQUENCY_COUNT
   };
 
-  // Short power button press actions
-  enum SHORT_PWRBTN { IGNORE = 0, SLEEP = 1, PAGE_TURN = 2, FORCE_REFRESH = 3, SHORT_PWRBTN_COUNT };
-
   // Hide battery percentage
   enum HIDE_BATTERY_PERCENTAGE { HIDE_NEVER = 0, HIDE_READER = 1, HIDE_ALWAYS = 2, HIDE_BATTERY_PERCENTAGE_COUNT };
 
-  // Page turn button long press behavior
-  enum LONG_PRESS_BUTTON_BEHAVIOR {
-    OFF = 0,
-    CHAPTER_SKIP = 1,
-    ORIENTATION_CHANGE = 2,
-    LONG_PRESS_BUTTON_BEHAVIOR_COUNT
-  };
-
   // UI Theme
-  enum UI_THEME { CLASSIC = 0, LYRA = 1, LYRA_3_COVERS = 2, ROUNDEDRAFF = 3 };
+  enum UI_THEME { CLASSIC = 0, LYRA = 1, LYRA_3_COVERS = 2, LYRA_CAROUSEL = 3 };
 
   // Image rendering in EPUB reader
   enum IMAGE_RENDERING { IMAGES_DISPLAY = 0, IMAGES_PLACEHOLDER = 1, IMAGES_SUPPRESS = 2, IMAGE_RENDERING_COUNT };
 
-  enum TILT_PAGE_TURN { TILT_OFF = 0, TILT_NORMAL = 1, TILT_NVERTED = 2, TILT_PAGE_TURN_COUNT };
+  // File browser sort mode (per-session, not persisted)
+  enum FILE_SORT_MODE { SORT_BY_NAME = 0, SORT_BY_DATE = 1, SORT_BY_SIZE = 2, SORT_BY_TYPE = 3, FILE_SORT_MODE_COUNT };
 
-  enum SEAMLESS_SLEEP_SCREEN {
-    SEAMLESS_NEVER = 0,
-    SEAMLESS_AFTER_TIMEOUT = 1,
-    SEAMLESS_ALWAYS = 2,
-    SEAMLESS_SLEEP_SCREEN_COUNT
+  // File browser sort direction (per-session, not persisted)
+  enum FILE_SORT_DIRECTION { SORT_ASCENDING = 0, SORT_DESCENDING = 1, FILE_SORT_DIRECTION_COUNT };
+
+  // Action mapped to each tilt gesture direction.
+  enum TILT_GESTURE_ACTION {
+    TILT_ACT_NONE = 0,
+    TILT_ACT_NEXT_PAGE = 1,
+    TILT_ACT_PREV_PAGE = 2,
+    TILT_GESTURE_ACTION_COUNT
+  };
+
+  // Text darkness for AA glyph rendering (forwarded to GfxRenderer::setTextDarkness)
+  enum TEXT_DARKNESS {
+    DARKNESS_NORMAL = 0,      // true 4-level AA
+    DARKNESS_DARK = 1,        // historical default — bolder dark-gray AA
+    DARKNESS_EXTRA_DARK = 2,  // both AA shades pushed to darkest gray state
+    DARKNESS_MAXIMUM = 3,     // skip grayscale passes — AA pixels stay solid black from BW pass
+    TEXT_DARKNESS_COUNT
+  };
+#ifdef ENABLE_IMAGE_DITHERING_EXTENSION
+  enum IMAGE_DITHERING {
+    IMAGE_DITHER_BAYER = 0,
+    IMAGE_DITHER_ATKINSON = 1,
+    IMAGE_DITHER_DIFFUSED_BAYER = 2,
+    IMAGE_DITHERING_COUNT
+  };
+#else
+  enum IMAGE_DITHERING { IMAGE_DITHER_BAYER = 0, IMAGE_DITHERING_COUNT };
+#endif
+
+  // Timezone options (POSIX TZ rules for DST support)
+  enum TIMEZONE {
+    TZ_UTC = 0,
+    TZ_CET = 1,
+    TZ_EET = 2,
+    TZ_MSK = 3,
+    TZ_UTC_PLUS4 = 4,
+    TZ_IST = 5,
+    TZ_UTC_PLUS7 = 6,
+    TZ_UTC_PLUS8 = 7,
+    TZ_UTC_PLUS9 = 8,
+    TZ_AEST = 9,
+    TZ_NZST = 10,
+    TZ_UTC_MINUS3 = 11,
+    TZ_EST = 12,
+    TZ_CST = 13,
+    TZ_MST = 14,
+    TZ_PST = 15,
+    TZ_AST_ADT = 16,
+    TZ_ACST_ACDT = 17,
+    TZ_AKST_AKDT = 18,
+    TIMEZONE_COUNT
   };
 
   // Sleep screen settings
@@ -184,56 +206,76 @@ class CrossPointSettings {
   uint8_t sleepScreenCoverMode = FIT;
   // Sleep screen cover filter
   uint8_t sleepScreenCoverFilter = NO_FILTER;
-  // Status bar settings (statusBar retained for migration only)
+  // Apply information overlay with reading progress on sleep cover
+  uint8_t sleepCoverOverlay = 0;
+  // Sleep image pick mode (random vs sequential walk-through)
+  uint8_t sleepImagePickMode = PICK_RANDOM;
+  // Quick Resume on Timeout: keep current page on display with a moon icon when sleeping by timeout,
+  // and on wake restore the page directly (skipping the boot screen).
+  uint8_t quickResumeSleepScreen = QUICK_RESUME_NEVER;
+  // Status bar settings (statusBar, statusBarProgressBar, statusBarProgressBarThickness retained for migration only)
   uint8_t statusBar = FULL;
   uint8_t statusBarChapterPageCount = 1;
+  // Printed ("physical") page number from the book's page-list. Drawn in parentheses to the left of
+  // the device page counter when both share a location; otherwise on its own. Default on.
+  uint8_t statusBarPrintedPage = 1;
   uint8_t statusBarBookProgressPercentage = 1;
   uint8_t statusBarProgressBar = HIDE_PROGRESS;
   uint8_t statusBarProgressBarThickness = PROGRESS_BAR_NORMAL;
+  uint8_t statusBarUpperProgressBar = HIDE_PROGRESS;
+  uint8_t statusBarUpperProgressBarThickness = PROGRESS_BAR_NORMAL;
+  uint8_t statusBarLowerProgressBar = HIDE_PROGRESS;
+  uint8_t statusBarLowerProgressBarThickness = PROGRESS_BAR_NORMAL;
+  uint8_t statusBarItemsPosition = STATUS_BAR_ITEMS_BOTTOM;
   uint8_t statusBarTitle = CHAPTER_TITLE;
   uint8_t statusBarBattery = 1;
-  uint8_t xtcStatusBarMode = XTC_STATUS_BAR_HIDE;
-  // Clock display in status bar (X3 only, requires DS3231 RTC)
-  uint8_t statusBarClock = 0;
-  // Clock UTC offset in quarter-hour steps, biased by 48 so it fits in uint8_t.
-  // Value 48 = UTC+0, 0 = UTC-12:00, 104 = UTC+14:00.
-  // Quarter-hour granularity supports oddball zones like Nepal (+5:45) and Chatham (+12:45).
-  uint8_t clockUtcOffsetQ = 48;
-  // Clock display format: 0 = 24-hour, 1 = 12-hour
-  uint8_t clockFormat = 0;
-  // Set once an NTP sync succeeds. Used to skip re-syncing on every WiFi connect.
-  // Resetting to 0 (e.g. via the web UI) forces a re-sync on next WiFi connect.
-  uint8_t clockHasBeenSynced = 0;
   // Text rendering settings
   uint8_t extraParagraphSpacing = 1;
   uint8_t textAntiAliasing = 1;
-  // Short power button click behaviour
-  uint8_t shortPwrBtn = IGNORE;
+  // X3-only: when on, the AA refresh uses the 7-frame community grayscale LUT
+  // (~130 ms panel time) instead of the OEM 53-frame LUT (~2.4 s). Mid-tones
+  // run slightly darker than X4. Matches what papyrix-reader has shipped since
+  // 2025-11. Default on — the 2.2 s/page win dwarfs the subtle mid-tone shift.
+  // No effect on X4.
+  //
+  // JSON key was bumped from "fastAntiAliasing" to "fastAntiAliasingV2" when
+  // the default flipped to 1: existing settings files with the old key are
+  // ignored, so every device picks up the new C++ default on next load.
+  uint8_t fastAntiAliasing = 1;
+  // Text darkness (0 = normal, 1 = dark, 2 = extra dark). Default 1 preserves
+  // historical AA rendering (both grayscale shades drawn in the MSB pass).
+  uint8_t textDarkness = DARKNESS_DARK;
   // EPUB reading orientation settings
   // 0 = portrait (default), 1 = landscape clockwise, 2 = inverted, 3 = landscape counter-clockwise
   uint8_t orientation = PORTRAIT;
   // Button layouts (front layout retained for migration only)
   uint8_t frontButtonLayout = BACK_CONFIRM_LEFT_RIGHT;
-  uint8_t sideButtonLayout = PREV_NEXT;
-  uint8_t frontButtonFollowOrientation = 0;
   // Front button remap (logical -> hardware)
   // Used by MappedInputManager to translate logical buttons into physical front buttons.
   uint8_t frontButtonBack = FRONT_HW_BACK;
   uint8_t frontButtonConfirm = FRONT_HW_CONFIRM;
   uint8_t frontButtonLeft = FRONT_HW_LEFT;
   uint8_t frontButtonRight = FRONT_HW_RIGHT;
-  // Reader font settings
+  // Reader font settings (EPUB)
   uint8_t fontFamily = BOOKERLY;
+  // SD card font family name (empty = use built-in fontFamily)
+  char sdFontFamilyName[32] = "";
   uint8_t fontSize = MEDIUM;
+  // Reader font settings (TXT / MD) — defaults to EPUB settings when not explicitly set
+  uint8_t txtFontFamily = NOTOSANS;
+  char txtSdFontFamilyName[32] = "";
+  uint8_t txtFontSize = MEDIUM;
   uint8_t lineSpacing = NORMAL;
   uint8_t paragraphAlignment = JUSTIFIED;
-  // Definition viewer font overrides (0 = follow reader setting)
-  uint8_t dictionaryFontFamily = DICT_FONT_GLOBAL;
-  uint8_t dictionaryFontSize = DICT_SIZE_GLOBAL;
-  // Auto-sleep timeout setting (default 10 minutes)
+  // Legacy enum fields — kept for JSON migration only; not used at runtime.
   uint8_t sleepTimeout = SLEEP_10_MIN;
-  // E-ink refresh frequency (default 15 pages)
   uint8_t refreshFrequency = REFRESH_15;
+  // Auto-sleep timeout in minutes (0 = never sleep, 1–60). Replaces sleepTimeout enum.
+  uint8_t sleepTimeoutMinutes = 10;
+  // Full-refresh frequency in pages (0 = never full-refresh, 1–60). Replaces refreshFrequency enum.
+  uint8_t refreshFrequencyPages = 15;
+  // Perform a half refresh on the page immediately following an EPUB page that displayed images.
+  uint8_t halfRefreshAfterImagePage = 1;
   uint8_t hyphenationEnabled = 0;
 
   // Reader screen margin settings
@@ -242,78 +284,171 @@ class CrossPointSettings {
   char opdsServerUrl[128] = "";
   char opdsUsername[64] = "";
   char opdsPassword[64] = "";
+  // OPDS download destination folder ("" = SD root). Global; edited from the
+  // OPDS server list. Persisted via a category-less SettingInfo::String in
+  // SettingsList.h, so it stays out of the on-device Settings screen.
+  char opdsDownloadFolder[64] = "";
+  // On-disk filename format for OPDS downloads (0=Author-Title default, 1=Title-Author,
+  // 2=Title). See OpdsFilenameFormat. Persisted via a category-less SettingInfo::Enum,
+  // edited from the OPDS server list; hidden from the on-device Settings screen.
+  uint8_t opdsFilenameFormat = 0;
   // Hide battery percentage
   uint8_t hideBatteryPercentage = HIDE_NEVER;
-  // Long-press page turn button behavior
-  uint8_t longPressButtonBehavior = OFF;
   // UI Theme
   uint8_t uiTheme = LYRA;
   // Sunlight fading compensation
   uint8_t fadingFix = 0;
   // Use book's embedded CSS styles for EPUB rendering (1 = enabled, 0 = disabled)
   uint8_t embeddedStyle = 1;
-  // Focus Reading - emphasizes the first part of words with bold
-  uint8_t focusReadingEnabled = 0;
-  // SD card font family name (empty = use built-in fontFamily)
-  char sdFontFamilyName[32] = "";
   // Show hidden files/directories (starting with '.') in the file browser (0 = hidden, 1 = show)
   uint8_t showHiddenFiles = 0;
-  // Remove a book from the Recent Books list when its End-of-Book screen is reached (0 = off, 1 = on)
-  uint8_t removeReadBooksFromRecents = 0;
-  // Move epub to /Read/ folder on SD card when finished (0 = disabled, 1 = enabled)
-  uint8_t moveFinishedToReadFolder = 0;
+  // Show file extensions in the file browser (0 = hidden, 1 = show)
+  uint8_t showFileExtensions = 0;
   // Image rendering mode in EPUB reader
   uint8_t imageRendering = IMAGES_DISPLAY;
-  // Download images during Read-it-Later article fetching (1 = enabled, 0 = disabled)
-  uint8_t readItLaterImages = 1;
-  // Lookup history entry cap (direct value)
-  static constexpr uint8_t HIST_CAP_MIN = 25;
-  static constexpr uint8_t HIST_CAP_MAX = 225;
-  static constexpr uint8_t HIST_CAP_STEP = 25;
-  static constexpr uint8_t HIST_CAP_DEFAULT = 100;
-  uint8_t lookupHistoryCap = HIST_CAP_DEFAULT;
-  uint8_t holdToLookup = 0;
+  // Show a placeholder for large images (>800×600 source pixels) instead of decoding immediately.
+  // The user can press OK on the placeholder page to decode the image on demand.
+  uint8_t largeImagePlaceholder = 1;
+  // Dithering mode for decoded images (EPUB/JPG/PNG)
+  uint8_t imageDithering = IMAGE_DITHER_BAYER;
   // Tilt-based page turning (X3 only — requires QMI8658 IMU)
-  uint8_t tiltPageTurn = TILT_OFF;
-  // Auto-rotate screen based on device orientation via accelerometer (X3 only)
-  uint8_t autoRotate = 0;
-  // Language setting (Language enum index, default 0 = EN)
-  uint8_t language = 0;
-  // Seamless sleep: keep current content visible with moon icon instead of showing sleep screen
-  uint8_t seamlessSleepScreen = SEAMLESS_NEVER;
+  uint8_t tiltPageTurn = 0;
+  // Action when the computed tilt value crosses the positive threshold.
+  uint8_t tiltPositiveAction = TILT_ACT_NEXT_PAGE;
+  // Action when the computed tilt value crosses the negative threshold.
+  uint8_t tiltNegativeAction = TILT_ACT_PREV_PAGE;
+  // Enable synthetic TOC fallback for malformed/sparse TOC books (1 = enabled, 0 = disabled)
+  uint8_t syntheticTocFallback = 1;
+  // Default bionic reading in EPUB pages when no per-book override is set (1 = enabled, 0 = disabled)
+  uint8_t bionicReading = 0;
+  // Guide dots reading aid in EPUB pages: a small dot centered in each inter-word gap
+  // (1 = enabled, 0 = disabled). Idea from CrossInk (https://github.com/uxjulia/CrossInk).
+  uint8_t guideDots = 0;
+  // Expand semantic EPUB footnote references with a short inline preview.
+  uint8_t inlineFootnotePreviews = 0;
+  // Automatically push reading progress to the KOReader sync server when leaving the reader
+  // (1 = enabled, 0 = disabled). The push only fires when credentials are configured and the
+  // reader session advanced at least 3 pages, and is skipped when remote progress is already ahead.
+  uint8_t koSyncOnBookClose = 0;
+  // Move finished book to /COMPLETED when the end-of-book screen action is selected.
+  uint8_t moveFinishedBooksToCompleted = 0;
+  // Remove finished book from Recent Books when the end-of-book screen action is selected.
+  uint8_t removeFinishedBooksFromRecents = 0;
+  // Show clock in the reader status bar
+  uint8_t statusBarClock = 0;
+  // Clock format: 0 = 24h (14:00), 1 = 12h (2:00pm)
+  uint8_t clockFormat12h = 0;
+  // Timezone selection (applies POSIX TZ rules for DST)
+  uint8_t timeZone = TZ_UTC;
+  // Preferred NTP server (host or IP). Empty = use built-in servers only
+  // (Cloudflare anycast IP + pool.ntp.org). When set, it is polled first, with
+  // the built-ins kept as fallbacks. Passed into HalClock::syncNtp() by callers.
+  char ntpServer[64] = "";
+  // Use clock and keep the LP timer running during deep sleep (GPIO13 HIGH)
+  // so time can be accurately restored on wake. Increases sleep current by ~3-4 mA.
+  uint8_t useClock = 0;
+  // Show the Weather home screen menu item (1 = enabled, 0 = hidden)
+  uint8_t useWeather = 1;
+  // Include release candidate builds when checking for OTA updates.
+  uint8_t includeBetaUpdates = 0;
+  // Download article images when fetching Read-it-Later articles.
+  uint8_t readItLaterImages = 1;
+
+  // Configurable actions for short / double / long press on each logical button.
+  //
+  // BTN_DEFAULT means "do the activity's natural behaviour for this button" — it
+  // is context-sensitive on purpose (e.g. Confirm-short opens the reader menu but
+  // selects an entry in a list), which is why it can't be replaced by baking a
+  // fixed action into the defaults. BTN_IGNORE is the opposite: explicitly do
+  // nothing and suppress the built-in behaviour for that press.
+  //
+  // New values MUST be appended before BUTTON_ACTION_COUNT — the settings option
+  // list (SettingsList.h btnActionOptions) and persisted JSON map by numeric value.
+  enum BUTTON_ACTION {
+    BTN_DEFAULT = 0,
+    BTN_PAGE_FORWARD,
+    BTN_PAGE_BACK,
+    BTN_PAGE_FORWARD_10,
+    BTN_PAGE_BACK_10,
+    BTN_GO_HOME,
+    BTN_SLEEP,
+    BTN_FORCE_REFRESH,
+    BTN_FORCE_FAST_REFRESH,
+    BTN_OPEN_TOC,
+    BTN_OPEN_BOOKMARKS,
+    BTN_STAR_PAGE,
+    BTN_FOOTNOTES,
+    BTN_NEXT_SECTION,
+    BTN_PREV_SECTION,
+    BTN_EXIT_READER,
+    BTN_READER_MENU,
+    BTN_TOGGLE_BIONIC_READING,
+    BTN_KOREADER_SYNC,
+    BTN_CYCLE_FONT_SIZE,
+    BTN_CYCLE_ORIENTATION,
+    BTN_QUICK_OVERRIDES,
+    BTN_IGNORE,
+    BUTTON_ACTION_COUNT
+  };
+
+  // Short-press actions (default: built-in)
+  uint8_t btnShortBack = BTN_DEFAULT;
+  uint8_t btnShortConfirm = BTN_DEFAULT;
+  uint8_t btnShortLeft = BTN_DEFAULT;
+  uint8_t btnShortRight = BTN_DEFAULT;
+  uint8_t btnShortPageBack = BTN_DEFAULT;
+  uint8_t btnShortPageForward = BTN_DEFAULT;
+  uint8_t btnShortPower = BTN_DEFAULT;
+
+  // Double-press actions (default: BTN_DEFAULT = disabled, no disambiguation wait)
+  uint8_t btnDoubleBack = BTN_DEFAULT;
+  uint8_t btnDoubleConfirm = BTN_DEFAULT;
+  uint8_t btnDoubleLeft = BTN_PAGE_BACK_10;
+  uint8_t btnDoubleRight = BTN_PAGE_FORWARD_10;
+  uint8_t btnDoublePageBack = BTN_DEFAULT;
+  uint8_t btnDoublePageForward = BTN_DEFAULT;
+  uint8_t btnDoublePower = BTN_DEFAULT;
+
+  // Long-press actions (default: built-in)
+  uint8_t btnLongBack = BTN_DEFAULT;
+  uint8_t btnLongConfirm = BTN_DEFAULT;
+  uint8_t btnLongLeft = BTN_PREV_SECTION;
+  uint8_t btnLongRight = BTN_NEXT_SECTION;
+  uint8_t btnLongPageBack = BTN_DEFAULT;
+  uint8_t btnLongPageForward = BTN_DEFAULT;
+  uint8_t btnLongPower = BTN_DEFAULT;
 
   ~CrossPointSettings() = default;
 
   // Get singleton instance
   static CrossPointSettings& getInstance() { return instance; }
 
-  // Callback to resolve SD card font IDs. Set by SdCardFontSystem::begin().
-  // Returns font ID or 0 if not found.
-  using SdFontIdResolver = int (*)(void* ctx, const char* familyName, uint8_t fontSize);
-  SdFontIdResolver sdFontIdResolver = nullptr;
-  void* sdFontResolverCtx = nullptr;
-
-  uint16_t getPowerButtonDuration() const {
-    return (shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::SLEEP) ? 10 : 400;
-  }
+  static constexpr uint16_t getPowerButtonDuration() { return 400; }
   int getReaderFontId() const;
-  int getDefinitionFontId() const;
-  float getDefinitionLineCompression() const;
-  int getLookupHistoryCapValue() const { return lookupHistoryCap; }
-
-  // If count_only is true, returns the number of settings items that would be written.
-  uint8_t writeSettings(FsFile& file, bool count_only = false) const;
+  int getTxtReaderFontId() const;
+  // Pure built-in lookup (size enum + family enum -> font ID). Independent of
+  // SD-card font selection. Used by the per-book fontFamilyOverride path so
+  // an override forces back to a known built-in even when an SD font is the
+  // global default.
+  static int getBuiltinReaderFontId(uint8_t family, uint8_t size);
+  // Heading sizing: return the built-in fontId `stepUp` sizes taller than `size` for
+  // `family`, clamped at the largest size. Steps walk the ascending-pixel ladder
+  // (TINY<SMALL<MEDIUM<LARGE<EXTRA_LARGE), not the FONT_SIZE enum order. `actualStep`
+  // (out) receives how many steps were actually taken before the cap (so the caller can
+  // compute a residual multiplier when clamped). Returns 0 for unknown families.
+  static int getTallerBuiltinReaderFontId(uint8_t family, uint8_t size, uint8_t stepUp, uint8_t* actualStep = nullptr);
 
   bool saveToFile() const;
   bool loadFromFile();
+  void loadStartupFromNvs();
+  void saveStartupToNvs() const;
 
   static void validateFrontButtonMapping(CrossPointSettings& settings);
 
- private:
-  bool loadFromBinaryFile();
-  bool migrateLanguageBinaryFile();
+  // Enforce settings whose values depend on others (e.g. sleepScreen=QUICK_RESUME implies
+  // quickResumeSleepScreen=ON). Call after any setting mutation that could invalidate the pair.
+  static void normalizeDependentSettings(CrossPointSettings& settings);
 
- public:
   float getReaderLineCompression() const;
   unsigned long getSleepTimeoutMs() const;
   int getRefreshFrequency() const;

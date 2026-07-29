@@ -8,7 +8,7 @@ At a high level, it is firmware that uses an activity-driven application archite
 
 ```mermaid
 graph TD
-    A[Hardware: ESP32-C3 + SD + E-ink + Buttons] --> B[open-x4-sdk HAL]
+    A[Hardware: ESP32-C3 + SD + E-ink + Buttons] --> B[freeink-sdk HAL]
     B --> C[src/main.cpp runtime loop]
     C --> D[Activities layer]
     C --> E[State and settings]
@@ -125,12 +125,29 @@ Notes:
 - rendering favors reusing precomputed layout data to keep page turns responsive on constrained hardware
 - progress/session state is persisted so the reader can reopen at the last position after reboot/sleep
 
+## KOReader sync position mapping
+
+KOReader sync integration is implemented under `lib/KOReaderSync/` and is used by
+`src/activities/reader/KOReaderSyncActivity.*`.
+
+Position translation currently follows a dual-path strategy:
+
+- CrossPoint -> KOReader: prefer element-level XPath extracted from the current
+  spine XHTML; fallback to chapter-level `DocFragment` path when needed.
+- KOReader -> CrossPoint: prefer incoming XPath resolution; fallback to
+  percentage-based estimation if XPath is invalid or cannot be resolved.
+
+Detailed algorithm and constraints (including low-memory rationale for ESP32-C3)
+are documented in:
+
+- [KOReader Sync XPath Mapping](koreader-sync-xpath-mapping.md)
+
 ## State and persistence
 
 Two singletons are central:
 
 - `src/CrossPointSettings.h` (`SETTINGS`): user preferences and behavior flags
-- `src/CrossPointState.h` (`APP_STATE`): runtime/session state such as current book and sleep context
+- `src/CrossPointState.h` (`APP_STATE`): runtime/session state such as current book, sleep context, and standalone KOReader sync handoff/outcome state
 
 Typical persisted areas on SD:
 
@@ -141,8 +158,8 @@ Typical persisted areas on SD:
     progress.bin
     cover.bmp
     sections/*.bin
-  settings.bin
-  state.bin
+  settings.json
+  state.json
 ```
 
 For binary cache formats, see `docs/file-formats.md`.
@@ -181,7 +198,7 @@ When editing related source assets, regenerate via normal build steps/scripts.
 - `src/components/`: theming and shared UI components
 - `lib/Epub/`: EPUB parser, layout, CSS handling, and hyphenation
 - `lib/`: supporting libraries (fonts, text, filesystem helpers, etc.)
-- `open-x4-sdk/`: hardware SDK submodule (display, input, storage, battery)
+- `freeink-sdk/`: hardware SDK submodule (display, input, storage, battery)
 - `docs/`: user and technical documentation
 
 ## Embedded constraints that shape design
@@ -190,6 +207,14 @@ When editing related source assets, regenerate via normal build steps/scripts.
 - e-ink refresh cost drives render/update batching choices
 - main loop responsiveness matters for input, power handling, and watchdog safety
 - background/network flows must cooperate with sleep and loop timing logic
+
+For deeper design documentation on the memory-critical subsystems:
+
+- [Heap and Data Structure Design](./heap-and-data-structures.md) — allocation rules, ZipFile streaming, CSS index flat array
+- [Temporary Memory Increase Logic](./temporary-memory-increase.md) — secondary buffer release/realloc, degraded mode, pre-reboot scratch path
+- [Section Indexing Workflow](./section-indexing.md) — property hash, cache file structure, warm image pass, silent next-chapter indexing
+- [Flash Font Partition](./flash-font-partition.md) — raw partition layout, write/mmap API, kern matrix fast path
+- [Font Cache Structures](./font-cache-structures.md) — PerStyle tiers, ownership flags, mini prewarm lifecycle
 
 ## Scope guardrails
 

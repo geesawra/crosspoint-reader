@@ -2,6 +2,7 @@
 #include <HalStorage.h>
 
 #include <algorithm>
+#include <array>
 #include <string>
 #include <utility>
 #include <vector>
@@ -10,9 +11,20 @@
 #include "blocks/ImageBlock.h"
 #include "blocks/TextBlock.h"
 
+static constexpr uint8_t MAX_TABLE_COLS = 8;
+static constexpr uint16_t MAX_TABLE_ROWS = 48;
+static constexpr uint8_t TABLE_CELL_PADDING = 5;
+static constexpr uint16_t MIN_COL_INNER_WIDTH = 24;
+static constexpr uint8_t MAX_CELL_LINES = 64;
+// Cap on the rendered height of an in-cell graphic, so a single image never blows
+// a row past the viewport (which would force the paragraph fallback and drop it).
+static constexpr uint16_t MAX_CELL_IMAGE_HEIGHT = 240;
+
 enum PageElementTag : uint8_t {
   TAG_PageLine = 1,
-  TAG_PageImage = 2,  // New tag
+  TAG_PageImage = 2,
+  TAG_PageTable = 3,
+  TAG_PageHR = 4,
 };
 
 // represents something that has been added to a page
@@ -49,10 +61,67 @@ class PageImage final : public PageElement {
   PageImage(std::shared_ptr<ImageBlock> block, const int16_t xPos, const int16_t yPos)
       : PageElement(xPos, yPos), imageBlock(std::move(block)) {}
   void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) override;
+  void renderWithForceLoad(GfxRenderer& renderer, int xOffset, int yOffset, bool forceLoad,
+                           bool monochromeOutput = true);
   bool serialize(FsFile& file) override;
   PageElementTag getTag() const override { return TAG_PageImage; }
   static std::unique_ptr<PageImage> deserialize(FsFile& file);
   const ImageBlock& getImageBlock() const { return *imageBlock; }
+};
+
+class PageHR final : public PageElement {
+  int16_t width;
+
+ public:
+  PageHR(const int16_t xPos, const int16_t yPos, const int16_t width) : PageElement(xPos, yPos), width(width) {}
+  void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) override;
+  bool serialize(FsFile& file) override;
+  PageElementTag getTag() const override { return TAG_PageHR; }
+  static std::unique_ptr<PageHR> deserialize(FsFile& file);
+};
+
+struct TableCell {
+  std::vector<std::shared_ptr<TextBlock>> lines;
+  std::shared_ptr<ImageBlock> image;  // optional in-cell graphic, drawn below any cell text
+  bool isHeader = false;
+};
+
+struct TableRow {
+  std::vector<TableCell> cells;
+  uint16_t height = 0;       // pixel height including 2×CELL_PADDING
+  bool isHeaderRow = false;  // drives 2px separator below this row
+};
+
+class PageTableFragment final : public PageElement {
+  uint8_t columnCount = 0;
+  uint16_t totalWidth = 0;
+  uint16_t totalHeight = 0;
+  std::vector<TableRow> rows;
+  bool hasBorder = true;
+
+ public:
+  PageTableFragment(uint8_t colCount, uint16_t totalWidth, uint16_t totalHeight, std::vector<TableRow> rows,
+                    int16_t xPos, int16_t yPos, bool hasBorder = true)
+      : PageElement(xPos, yPos),
+        columnCount(colCount),
+        totalWidth(totalWidth),
+        totalHeight(totalHeight),
+        rows(std::move(rows)),
+        hasBorder(hasBorder) {}
+
+  void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) override;
+  bool serialize(FsFile& file) override;
+  static std::unique_ptr<PageTableFragment> deserialize(FsFile& file);
+  PageElementTag getTag() const override { return TAG_PageTable; }
+  uint16_t getTotalHeight() const { return totalHeight; }
+
+  // In-cell graphics participate in the Page-level image passes below.
+  bool hasImages() const;
+  bool hasUncachedImages(bool forceLoad, bool monochromeOutput) const;
+  // Decode any missing cell-image pixel caches. Position is irrelevant to the cache
+  // (it is position-independent); images are warmed at the origin and the framebuffer
+  // garbage is discarded by the caller's clearScreen(), mirroring the Page warm pass.
+  void warmCellImages(GfxRenderer& renderer, bool forceLoad, bool monochromeOutput) const;
 };
 
 class Page {
@@ -72,14 +141,47 @@ class Page {
     footnotes.push_back(entry);
   }
 
-  void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) const;
+  // monochromeOutput=true: 1-bit Atkinson BW cache (AA off); false: 4-level Bayer cache (AA on)
+  void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset, bool forceLoadLargeImages = true,
+              bool monochromeOutput = true) const;
+  void renderTextOnly(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) const;
+  // Replay the 4-level grayscale image cache into the current renderer mode (GRAYSCALE_LSB / MSB).
+  // Called by AA grayscale passes after renderTextOnly() so images get proper gray tones.
+  // No-op for images without a grayscale cache (they degrade gracefully to BW-only).
+  void renderImagesFromGrayscaleCache(GfxRenderer& renderer, int xOffset, int yOffset) const;
+  // Decode any missing .pxc pixel caches for images on this page. Called before the
+  // BW render so the large (~60 KB contiguous) PNG decoder allocation runs while heap
+  // contig is at its peak — before font prewarm and BW backup chunks fragment it.
+  // Writes pixels to the framebuffer as a side effect (decoder requirement); callers
+  // must clearScreen() afterward if the framebuffer needs to be clean.
+  // monochromeOutput selects which cache variant to warm (BW or grayscale).
+  void warmImageCaches(GfxRenderer& renderer, int xOffset, int yOffset, bool forceLoadLargeImages,
+                       bool monochromeOutput = true) const;
+  bool hasPlaceholderImages(bool forceLoadLargeImages, bool monochromeOutput) const;
+  bool allImagesArePlaceholders(bool forceLoadLargeImages, bool monochromeOutput) const;
   bool serialize(FsFile& file) const;
   static std::unique_ptr<Page> deserialize(FsFile& file);
 
   // Check if page contains any images (used to force full refresh)
   bool hasImages() const {
-    return std::any_of(elements.begin(), elements.end(),
-                       [](const std::shared_ptr<PageElement>& el) { return el->getTag() == TAG_PageImage; });
+    return std::any_of(elements.begin(), elements.end(), [](const std::shared_ptr<PageElement>& el) {
+      if (el->getTag() == TAG_PageImage) return true;
+      return el->getTag() == TAG_PageTable && static_cast<const PageTableFragment&>(*el).hasImages();
+    });
+  }
+
+  // Returns true if any image on this page would require a decoder allocation —
+  // i.e. is not a placeholder AND does not already have a pixel cache on disk.
+  // Used to decide whether to release the secondary frame buffer before warm.
+  bool hasUncachedImages(bool forceLoadLargeImages, bool monochromeOutput) const {
+    return std::any_of(elements.begin(), elements.end(), [&](const std::shared_ptr<PageElement>& el) {
+      if (el->getTag() == TAG_PageTable)
+        return static_cast<const PageTableFragment&>(*el).hasUncachedImages(forceLoadLargeImages, monochromeOutput);
+      if (el->getTag() != TAG_PageImage) return false;
+      const auto& ib = static_cast<const PageImage&>(*el).getImageBlock();
+      if (ib.wouldShowPlaceholder(forceLoadLargeImages, monochromeOutput)) return false;
+      return !(monochromeOutput ? ib.hasPixelCache() : ib.hasGrayscaleCache());
+    });
   }
 
   // Get bounding box of all images on the page (union of image rects)
@@ -93,7 +195,7 @@ class Page {
         int16_t x = img.xPos;
         int16_t y = img.yPos;
         int16_t right = x + img.getImageBlock().getWidth();
-        int16_t bottom = y + img.getImageBlock().getHeight();
+        int16_t bottom = y + img.getImageBlock().getRenderedHeight();
         minX = std::min(minX, x);
         minY = std::min(minY, y);
         maxX = std::max(maxX, right);

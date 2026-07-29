@@ -3,7 +3,7 @@
 
 #include <memory>
 
-#include "activities/Activity.h"
+#include "../Activity.h"
 #include "util/ButtonNavigator.h"
 
 class XtcReaderChapterSelectionActivity final : public Activity {

@@ -59,33 +59,48 @@ curl http://crosspoint.local/files
 
 ### GET `/api/status` - Device Status
 
-Returns JSON with device status information.
+Returns JSON with device status information. The plain endpoint never touches
+the SD card and responds immediately; pass `phase=full` to additionally
+collect SD usage stats (`sdTotal`/`sdUsed`/`sdFree`), which scans the FAT and
+can take tens of seconds on large cards.
 
 **Request:**
 ```bash
 curl http://crosspoint.local/api/status
+# Include SD usage stats (slow):
+curl "http://crosspoint.local/api/status?phase=full"
 ```
+
+**Query Parameters:**
+
+| Parameter | Required | Default | Description                                        |
+| --------- | -------- | ------- | -------------------------------------------------- |
+| `phase`   | No       | (fast)  | `full` = also collect SD usage stats (slow)        |
 
 **Response (200 OK):**
 ```json
 {
   "version": "1.0.0",
+  "device": "X4",
   "ip": "192.168.1.100",
   "mode": "STA",
   "rssi": -45,
   "freeHeap": 123456,
-  "uptime": 3600
+  "uptime": 3600,
+  "sdReady": false
 }
 ```
 
-| Field      | Type   | Description                                               |
-| ---------- | ------ | --------------------------------------------------------- |
-| `version`  | string | CrossPoint firmware version                               |
-| `ip`       | string | Device IP address                                         |
-| `mode`     | string | `"STA"` (connected to WiFi) or `"AP"` (access point mode) |
-| `rssi`     | number | WiFi signal strength in dBm (0 in AP mode)                |
-| `freeHeap` | number | Free heap memory in bytes                                 |
-| `uptime`   | number | Seconds since device boot                                 |
+| Field      | Type   | Description                                                     |
+| ---------- | ------ | --------------------------------------------------------------- |
+| `version`  | string | CrossPoint firmware version                                     |
+| `device`   | string | Device model, `"X3"` or `"X4"` (also exposed as `deviceType`)   |
+| `ip`       | string | Device IP address                                               |
+| `mode`     | string | `"STA"` (connected to WiFi) or `"AP"` (access point mode)       |
+| `rssi`     | number | WiFi signal strength in dBm (0 in AP mode)                      |
+| `freeHeap` | number | Free heap memory in bytes                                       |
+| `uptime`   | number | Seconds since device boot                                       |
+| `sdReady`  | bool   | `true` only with `phase=full`; SD stats are valid only then     |
 
 ---
 
@@ -204,41 +219,40 @@ Folder created: NewFolder
 
 ### POST `/delete` - Delete File or Folder
 
-Deletes one or more files or empty folders from the SD card.
+Deletes a file or folder from the SD card.
 
 **Request:**
 ```bash
 # Delete a file
-curl -X POST -d "path=/Books/mybook.epub" http://crosspoint.local/delete
+curl -X POST -d "path=/Books/mybook.epub&type=file" http://crosspoint.local/delete
 
 # Delete an empty folder
-curl -X POST -d "path=/OldFolder" http://crosspoint.local/delete
-
-# Delete multiple items
-curl -X POST -d 'paths=["/Books/old.epub","/OldFolder"]' http://crosspoint.local/delete
+curl -X POST -d "path=/OldFolder&type=folder" http://crosspoint.local/delete
 ```
 
 **Form Parameters:**
 
-| Parameter | Required | Default | Description |
-| --------- | -------- | ------- | ----------- |
-| `path`    | Yes, unless `paths` is provided | - | Path to one item to delete |
-| `paths`   | Yes, unless `path` is provided | - | JSON array of paths to delete |
+| Parameter | Required | Default | Description                      |
+| --------- | -------- | ------- | -------------------------------- |
+| `path`    | Yes      | -       | Path to the item to delete       |
+| `type`    | No       | `file`  | Type of item: `file` or `folder` |
 
 **Response (200 OK):**
-```text
-All items deleted successfully
+```
+Deleted successfully
 ```
 
 **Error Responses:**
 
-| Status | Body                                        | Cause                              |
-| ------ | ------------------------------------------- | ---------------------------------- |
-| 400    | `Missing "path" or "paths" argument`        | Neither parameter was provided     |
-| 400    | `Provide either 'path' or 'paths', not both` | Both delete parameters were sent   |
-| 400    | `Invalid paths format`                      | `paths` was not valid JSON         |
-| 400    | `No paths provided`                         | `paths` was an empty JSON array    |
-| 500    | `Failed to delete some items: ...`          | One or more paths could not be deleted |
+| Status | Body                                          | Cause                         |
+| ------ | --------------------------------------------- | ----------------------------- |
+| 400    | `Missing path`                                | `path` parameter not provided |
+| 400    | `Cannot delete root directory`                | Attempted to delete `/`       |
+| 400    | `Folder is not empty. Delete contents first.` | Non-empty folder              |
+| 403    | `Cannot delete system files`                  | Hidden file (starts with `.`) |
+| 403    | `Cannot delete protected items`               | Protected system folder       |
+| 404    | `Item not found`                              | Path does not exist           |
+| 500    | `Failed to delete item`                       | SD card error                 |
 
 **Protected Items:**
 - Files/folders starting with `.`

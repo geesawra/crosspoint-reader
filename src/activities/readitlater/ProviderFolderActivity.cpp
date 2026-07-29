@@ -62,7 +62,7 @@ void ProviderFolderActivity::render(RenderLock&&) {
   GUI.drawList(
       renderer, Rect{0, contentTop, pageWidth, contentHeight}, static_cast<int>(folders.size()), selectedIndex,
       [this](int index) { return std::string(folders[index].label); }, nullptr,
-      [](int index) { return UIIcon::Instapaper; });
+      [](int index) { return UIIcon::ReadItLater; });
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);

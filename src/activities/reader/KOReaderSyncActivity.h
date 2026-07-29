@@ -1,10 +1,10 @@
 #pragma once
 #include <Epub.h>
 
-#include <functional>
 #include <memory>
-#include <optional>
 
+#include "ChapterXPathIndexer.h"
+#include "CrossPointState.h"
 #include "KOReaderSyncClient.h"
 #include "ProgressMapper.h"
 #include "activities/Activity.h"
@@ -12,29 +12,42 @@
 /**
  * Activity for syncing reading progress with KOReader sync server.
  *
- * Flow:
+ * This activity is launched as a standalone replacement screen, not as a
+ * child activity of the reader. The reader persists a compact handoff record,
+ * is destroyed to reclaim memory before WiFi/TLS work begins, and a fresh
+ * reader instance is reopened after sync completes or is cancelled.
+ *
+ * Shared pipeline:
  * 1. Connect to WiFi (if not connected)
- * 2. Calculate document hash
- * 3. Fetch remote progress
- * 4. Show comparison and options (Apply/Upload)
- * 5. Apply or upload progress
+ * 2. Optionally sync NTP (if stale)
+ * 3. Calculate document hash
+ *
+ * Intent-specific behavior:
+ * - COMPARE: fetch remote progress, show full comparison screen, let user
+ *   choose Apply or Upload.
+ * - PULL_REMOTE: fetch and map remote progress, show success feedback, then
+ *   persist an applied SyncResult for the reopened reader.
+ * - PUSH_LOCAL: compute local mapping, warm session with GET, then upload via
+ *   reused connection to avoid a second full TLS handshake.
  */
 class KOReaderSyncActivity final : public Activity {
  public:
   explicit KOReaderSyncActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const std::string& epubPath,
                                 int currentSpineIndex, int currentPage, int totalPagesInSpine,
-                                KOReaderPosition localKoPos, std::string localChapterName,
-                                std::optional<uint16_t> currentParagraphIndex = std::nullopt)
+                                uint16_t paragraphIndex = 0, bool hasParagraphIndex = false, uint32_t xhtmlSeekHint = 0,
+                                KOReaderSyncIntentState syncIntent = KOReaderSyncIntentState::COMPARE)
       : Activity("KOReaderSync", renderer, mappedInput),
         epubPath(epubPath),
         currentSpineIndex(currentSpineIndex),
         currentPage(currentPage),
         totalPagesInSpine(totalPagesInSpine),
-        currentParagraphIndex(currentParagraphIndex),
-        localChapterName(std::move(localChapterName)),
+        localParagraphIndex(paragraphIndex),
+        hasLocalParagraphIndex(hasParagraphIndex),
+        localXhtmlSeekHint(xhtmlSeekHint),
+        syncIntent(syncIntent),
         remoteProgress{},
         remotePosition{},
-        localProgress(std::move(localKoPos)) {}
+        localProgress{} {}
 
   void onEnter() override;
   void onExit() override;
@@ -50,18 +63,21 @@ class KOReaderSyncActivity final : public Activity {
     SHOWING_RESULT,
     UPLOADING,
     UPLOAD_COMPLETE,
+    APPLY_COMPLETE,
     NO_REMOTE_PROGRESS,
     SYNC_FAILED,
     NO_CREDENTIALS
   };
 
-  std::shared_ptr<Epub> epub;  // null until lazy-loaded after TLS in performSync()
+  std::shared_ptr<Epub> epub;
   std::string epubPath;
-  std::string localChapterName;
   int currentSpineIndex;
   int currentPage;
   int totalPagesInSpine;
-  std::optional<uint16_t> currentParagraphIndex;
+  uint16_t localParagraphIndex;
+  bool hasLocalParagraphIndex;
+  uint32_t localXhtmlSeekHint;
+  KOReaderSyncIntentState syncIntent = KOReaderSyncIntentState::COMPARE;
 
   State state = WIFI_SELECTION;
   std::string statusMessage;
@@ -69,25 +85,44 @@ class KOReaderSyncActivity final : public Activity {
 
   // Remote progress data
   bool hasRemoteProgress = false;
+  bool remotePositionMapped = false;
   KOReaderProgress remoteProgress;
   CrossPointPosition remotePosition;
 
-  // Local progress as KOReader format (pre-computed before Epub was released)
+  // Local progress as KOReader format (for display)
   KOReaderPosition localProgress;
+  std::string remoteChapterLabel;
+  std::string localChapterLabel;
+  std::optional<KOReaderMetadata> localDocumentMetadata;
 
   // Selection in result screen (0=Apply, 1=Upload)
   int selectedOption = 0;
 
+  // Timestamp when completion state was entered (for auto-close)
+  unsigned long uploadCompleteTime = 0;
+  bool closeRequested = false;
+
   // Tracks whether this session activated WiFi. Set in onEnter past the credentials
   // check; checked in onExit to decide whether to silent-reboot. Can't rely on
-  // WiFi.getMode() because performUpload() calls esp_wifi_stop() on the way out,
-  // which makes WiFi.getMode() return WIFI_MODE_NULL.
+  // WiFi.getMode() because intermediate paths call esp_wifi_stop() to drop the
+  // radio while user reads the result, which makes WiFi.getMode() return WIFI_MODE_NULL.
   bool wifiActivated = false;
+
+  // Captured from sync.exitToHomeAfterSync in resumeReader() so onExit can route the
+  // silent reboot to home instead of the reader when reader-close auto-sync triggered.
+  bool exitToHomeAfterSync = false;
 
   void onWifiSelectionComplete(bool success);
   void performSync();
+  bool calculateDocumentHash();
+  bool handleAutoPushPreflight();
+  void performFetchAndCompare();
   void performUpload();
-  void ensureEpubLoaded();
-  void saveProgressAndReturn(int spineIndex, int page);
-  void returnToReader();
+  void closeCancelled();
+  void resumeReader(KOReaderSyncOutcomeState outcome, const SyncResult* appliedResult = nullptr);
+  bool ensureEpubLoadedForMapping();
+  void releaseEpubForMapping();
+  bool computeLocalProgressAndChapter();
+  void computeRemoteChapter();
+  bool ensureRemotePositionMapped(bool closeSessionBeforeMapping = true);
 };

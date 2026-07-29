@@ -11,7 +11,7 @@
  *  1) onEnter -> push FileBrowserActivity in PickFirmware mode (only .bin files visible).
  *  2) On result: validate the .bin (header magic, size fits OTA partition).
  *  3) Push ConfirmationActivity ("Update firmware?").
- *  4) On confirm: stream the file into the OTA partition via the Arduino Update API,
+ *  4) On confirm: stream the file into the OTA partition via raw esp_partition APIs,
  *     drawing a progress bar; on success ESP.restart().
  *
  * Used both from Settings -> System -> "SD Card Firmware Update", and as the only
@@ -30,6 +30,12 @@ class SdFirmwareUpdateActivity : public Activity {
 
   explicit SdFirmwareUpdateActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, bool recoveryMode = false)
       : Activity("SdFirmwareUpdate", renderer, mappedInput), recoveryMode(recoveryMode) {}
+
+  // Start with a pre-selected firmware path — skips the file picker.
+  explicit SdFirmwareUpdateActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string preSelectedPath)
+      : Activity("SdFirmwareUpdate", renderer, mappedInput),
+        recoveryMode(false),
+        firmwarePath(std::move(preSelectedPath)) {}
 
   void onEnter() override;
   void loop() override;

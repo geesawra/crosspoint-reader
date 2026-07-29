@@ -1,104 +1,124 @@
 #include "OtaUpdater.h"
 
+#include <Arduino.h>
 #include <Logging.h>
 #include <ReleaseJsonParser.h>
-#include <esp_crt_bundle.h>
-#include <esp_http_client.h>
-#include <esp_https_ota.h>
+
+#include <cstdio>
+#include <cstring>
+
+// clang-format off
+// HttpDownloader.h pulls Arduino/SdFat, whose macros collide with lwip's
+// ip4_addr.h unless seen before the ESP-IDF headers below (esp_wifi.h and
+// friends transitively include lwip). Pin this order; clang-format would
+// otherwise sort the local headers last and break the build.
+#include "CrossPointSettings.h"
+#include "HttpDownloader.h"
+#include <bootloader_common.h>
+#include <esp_flash_partitions.h>
+#include <esp_heap_caps.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
 #include <esp_wifi.h>
+// clang-format on
 
 namespace {
-constexpr char latestReleaseUrl[] = "https://api.github.com/repos/geesawra/crosspoint-reader/releases/latest";
+constexpr char latestReleaseUrl[] = "https://api.github.com/repos/" CROSSPOINT_GIT_REPOSITORY "/releases/latest";
+constexpr char releaseListUrl[] = "https://api.github.com/repos/" CROSSPOINT_GIT_REPOSITORY "/releases?per_page=1";
+constexpr int otaHttpMaxAttempts = 3;
+constexpr unsigned long otaInitialRetryDelayMs = 1000;
+constexpr size_t releaseMetadataMaxBytes = 128 * 1024;
 
-// Skip an optional leading 'v'/'V' so tags like "v1.3.0" parse cleanly via sscanf("%d.%d.%d").
-constexpr const char* stripVPrefix(const char* s) { return (s && (*s == 'v' || *s == 'V')) ? s + 1 : s; }
+const char* getReleaseApiUrl() { return SETTINGS.includeBetaUpdates ? releaseListUrl : latestReleaseUrl; }
 
-esp_err_t http_client_set_header_cb(esp_http_client_handle_t http_client) {
-  return esp_http_client_set_header(http_client, "User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
+void delayBeforeRetry(const char* operation, int attempt) {
+  const unsigned long delayMs = otaInitialRetryDelayMs << static_cast<unsigned int>(attempt - 1);
+  LOG_ERR("OTA", "%s failed on attempt %d/%d, retrying in %lu ms", operation, attempt, otaHttpMaxAttempts, delayMs);
+  delay(delayMs);
 }
 
-size_t totalBytesReceived = 0;
+struct WifiPowerSaveGuard {
+  WifiPowerSaveGuard() { esp_wifi_set_ps(WIFI_PS_NONE); }
+  ~WifiPowerSaveGuard() { esp_wifi_set_ps(WIFI_PS_MIN_MODEM); }
+};
 
-esp_err_t event_handler(esp_http_client_event_t* event) {
-  if (event->event_id != HTTP_EVENT_ON_DATA) return ESP_OK;
-  totalBytesReceived += event->data_len;
-  LOG_DBG("OTA", "HTTP chunk: %d bytes (total: %zu)", event->data_len, totalBytesReceived);
-  auto* parser = static_cast<ReleaseJsonParser*>(event->user_data);
-  parser->feed(static_cast<const char*>(event->data), event->data_len);
-  return ESP_OK;
-}
-}  // namespace
+} /* namespace */
 
 OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
-  esp_err_t esp_err;
-  ReleaseJsonParser releaseParser;
+  updateAvailable = false;
+  latestVersion.clear();
+  otaUrl.clear();
+  otaSize = 0;
+  processedSize = 0;
+  totalSize = 0;
+  render = false;
 
-  esp_http_client_config_t client_config = {
-      .url = latestReleaseUrl,
-      .event_handler = event_handler,
-      // 4096 holds the API response headers; the 32KB body streams through the
-      // parser in chunks so RX needn't be larger. TX only carries our GET.
-      // Both free before installUpdate, so smaller leaves it less fragmentation.
-      .buffer_size = 4096,
-      .buffer_size_tx = 1024,
-      .user_data = &releaseParser,
-      .skip_cert_common_name_check = true,
-      .crt_bundle_attach = esp_crt_bundle_attach,
-      .keep_alive_enable = true,
-  };
+  const char* releaseApiUrl = getReleaseApiUrl();
 
-  totalBytesReceived = 0;
-  LOG_DBG("OTA", "Checking for update (current: %s)", CROSSPOINT_VERSION);
+  // Keep WiFi out of modem-sleep while doing release metadata HTTPS I/O.
+  // This mirrors installUpdate() and reduces intermittent TLS read stalls.
+  WifiPowerSaveGuard wifiPowerSaveGuard;
 
-  esp_http_client_handle_t client_handle = esp_http_client_init(&client_config);
-  if (!client_handle) {
-    LOG_ERR("OTA", "HTTP Client Handle Failed");
-    return INTERNAL_UPDATE_ERROR;
+  // Use one streaming parser path for both stable and beta update checks to
+  // avoid holding full GitHub release JSON in memory.
+  // Adapted from crosspoint-reader/crosspoint-reader (MIT),
+  // PR #1810 by znelson and contributors.
+  LOG_DBG("OTA", "Checking for %s update at %s", SETTINGS.includeBetaUpdates ? "beta" : "stable", releaseApiUrl);
+  for (int attempt = 1; attempt <= otaHttpMaxAttempts; ++attempt) {
+    ReleaseJsonParser releaseParser;
+    size_t bytesSeen = 0;
+    const bool ok = HttpDownloader::fetchUrl(
+        releaseApiUrl,
+        [&releaseParser, &bytesSeen](const uint8_t* data, size_t len) {
+          bytesSeen += len;
+          if (bytesSeen > releaseMetadataMaxBytes) {
+            return false;
+          }
+          releaseParser.feed(reinterpret_cast<const char*>(data), len);
+          // For OTA metadata we only need tag_name and firmware.bin fields.
+          // Stop early once both are found to avoid fragile tail reads.
+          if (releaseParser.foundTag() && releaseParser.foundFirmware()) {
+            return false;
+          }
+          return true;
+        },
+        true);
+
+    if (!ok) {
+      if (bytesSeen > releaseMetadataMaxBytes) {
+        LOG_ERR("OTA", "Release metadata too large after %zu bytes", bytesSeen);
+        return METADATA_TOO_LARGE_ERROR;
+      }
+
+      LOG_ERR("OTA", "Release metadata stream failed on attempt %d/%d", attempt, otaHttpMaxAttempts);
+      if (attempt < otaHttpMaxAttempts) {
+        delayBeforeRetry("Release metadata stream", attempt);
+        continue;
+      }
+      return HTTP_ERROR;
+    }
+
+    if (!releaseParser.foundTag()) {
+      LOG_ERR("OTA", "No tag_name found in release metadata");
+      return JSON_PARSE_ERROR;
+    }
+
+    if (!releaseParser.foundFirmware()) {
+      LOG_ERR("OTA", "No firmware.bin asset found");
+      return NO_UPDATE;
+    }
+
+    latestVersion = releaseParser.getTagName();
+    otaUrl = releaseParser.getFirmwareUrl();
+    otaSize = releaseParser.getFirmwareSize();
+    totalSize = otaSize;
+    updateAvailable = true;
+
+    LOG_DBG("OTA", "Found %s update: %s", SETTINGS.includeBetaUpdates ? "beta" : "stable", latestVersion.c_str());
+    return OK;
   }
 
-  esp_err = esp_http_client_set_header(client_handle, "User-Agent", "CrossPoint-ESP32-" CROSSPOINT_VERSION);
-  if (esp_err != ESP_OK) {
-    LOG_ERR("OTA", "esp_http_client_set_header Failed : %s", esp_err_to_name(esp_err));
-    esp_http_client_cleanup(client_handle);
-    return INTERNAL_UPDATE_ERROR;
-  }
-
-  esp_err = esp_http_client_perform(client_handle);
-  if (esp_err != ESP_OK) {
-    LOG_ERR("OTA", "esp_http_client_perform Failed : %s", esp_err_to_name(esp_err));
-    esp_http_client_cleanup(client_handle);
-    return HTTP_ERROR;
-  }
-
-  esp_err = esp_http_client_cleanup(client_handle);
-  if (esp_err != ESP_OK) {
-    LOG_ERR("OTA", "esp_http_client_cleanup Failed : %s", esp_err_to_name(esp_err));
-    return INTERNAL_UPDATE_ERROR;
-  }
-
-  LOG_DBG("OTA", "Response received: %zu bytes total", totalBytesReceived);
-  LOG_DBG("OTA", "Parser results: tag=%s firmware=%s", releaseParser.foundTag() ? "yes" : "no",
-          releaseParser.foundFirmware() ? "yes" : "no");
-
-  if (!releaseParser.foundTag()) {
-    LOG_ERR("OTA", "No tag_name in release JSON");
-    return JSON_PARSE_ERROR;
-  }
-
-  if (!releaseParser.foundFirmware()) {
-    LOG_ERR("OTA", "No firmware.bin asset found");
-    return NO_UPDATE;
-  }
-
-  latestVersion = releaseParser.getTagName();
-  otaUrl = releaseParser.getFirmwareUrl();
-  otaSize = releaseParser.getFirmwareSize();
-  totalSize = otaSize;
-  updateAvailable = true;
-
-  LOG_DBG("OTA", "Found update: tag=%s size=%zu", latestVersion.c_str(), otaSize);
-  LOG_DBG("OTA", "Firmware URL: %s", otaUrl.c_str());
-  return OK;
+  return HTTP_ERROR;
 }
 
 bool OtaUpdater::isUpdateNewer() const {
@@ -106,14 +126,24 @@ bool OtaUpdater::isUpdateNewer() const {
     return false;
   }
 
-  int currentMajor, currentMinor, currentPatch;
-  int latestMajor, latestMinor, latestPatch;
+  int currentMajor = 0, currentMinor = 0, currentPatch = 0, currentBetaRelease = 0, currentBetaBuild = 0;
+  int latestMajor = 0, latestMinor = 0, latestPatch = 0, latestBetaRelease = 0, latestBetaBuild = 0;
 
   const auto currentVersion = CROSSPOINT_VERSION;
+  const bool currentIsBeta = strstr(currentVersion, "-rc.") != nullptr;
+  const bool latestIsBeta = latestVersion.find("-rc.") != std::string::npos;
 
-  // semantic version check (only match on 3 segments)
-  sscanf(stripVPrefix(latestVersion.c_str()), "%d.%d.%d", &latestMajor, &latestMinor, &latestPatch);
-  sscanf(stripVPrefix(currentVersion), "%d.%d.%d", &currentMajor, &currentMinor, &currentPatch);
+  // Semantic version check with optional RC suffix. `sscanf()` will stop when
+  // it reaches part of the input string that doesn't match the format, so this
+  // format string works for versions like "1.31", "1.34.2", "1.35.0-rc.1", and
+  // "1.36.0-rc.2.5".
+  // This does not handle versions using the old "rc.<hash>" format, but
+  // considering that people will need to manually install this release or later
+  // to get this functionality anyway that should be fine.
+  sscanf(latestVersion.c_str(), "%d.%d.%d-rc.%d.%d", &latestMajor, &latestMinor, &latestPatch, &latestBetaRelease,
+         &latestBetaBuild);
+  sscanf(currentVersion, "%d.%d.%d-rc.%d.%d", &currentMajor, &currentMinor, &currentPatch, &currentBetaRelease,
+         &currentBetaBuild);
 
   /*
    * Compare major versions.
@@ -134,11 +164,28 @@ bool OtaUpdater::isUpdateNewer() const {
    */
   if (latestPatch != currentPatch) return latestPatch > currentPatch;
 
-  // If we reach here, it means all segments are equal.
-  // One final check, if we're on an RC build (contains "-rc"), we should consider the latest version as newer even if
-  // the segments are equal, since RC builds are pre-release versions.
-  if (strstr(currentVersion, "-rc") != nullptr) {
+  /*
+   * If we reach here, the stable version segments are equal. A stable release
+   * is newer than an RC with the same version.
+   */
+  if (!latestIsBeta && currentIsBeta) {
     return true;
+  }
+
+  if (latestIsBeta && !currentIsBeta) {
+    return false;
+  }
+
+  /*
+   * If both versions are RCs, compare their RC release and build numbers.
+   */
+  if (latestIsBeta && currentIsBeta) {
+    if (latestBetaRelease != currentBetaRelease) {
+      return latestBetaRelease > currentBetaRelease;
+    }
+    if (latestBetaBuild != currentBetaBuild) {
+      return latestBetaBuild > currentBetaBuild;
+    }
   }
 
   return false;
@@ -146,80 +193,235 @@ bool OtaUpdater::isUpdateNewer() const {
 
 const std::string& OtaUpdater::getLatestVersion() const { return latestVersion; }
 
-OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgress, void* ctx) {
+void OtaUpdater::cleanupUpdate() {
+  if (otaWriteHandle) {
+    const esp_err_t err = esp_ota_abort(reinterpret_cast<esp_ota_handle_t>(otaWriteHandle));
+    if (err != ESP_OK) {
+      LOG_ERR("OTA", "esp_ota_abort on cleanup: %s", esp_err_to_name(err));
+    }
+    otaWriteHandle = nullptr;
+  }
+  cancelRequested = false;
+  esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+}
+
+void OtaUpdater::cancelUpdate() {
+  // If a streaming install is mid-flight, the DataCallback observes
+  // cancelRequested and aborts; the step then cleans up. If not started yet,
+  // just set the flag so the next step returns UPDATE_CANCELLED.
+  cancelRequested = true;
+}
+
+OtaUpdater::OtaUpdaterError OtaUpdater::beginInstallUpdate() {
   if (!isUpdateNewer()) {
     return UPDATE_OLDER_ERROR;
   }
 
-  esp_https_ota_handle_t ota_handle = NULL;
-  esp_err_t esp_err;
+  cleanupUpdate();
+  render = false;
+  cancelRequested = false;
+  installDone = false;
+  installResult = OK;
+  processedSize = 0;
 
-  esp_http_client_config_t client_config = {
-      .url = otaUrl.c_str(),
-      .timeout_ms = 15000,
-      // 4096 holds the github->CDN redirect headers (the 512 default truncates
-      // them); TX only carries our GET. Both are contiguous blocks contending
-      // with the TLS handshake on a tight internal arena, so keep them minimal.
-      .buffer_size = 4096,
-      .buffer_size_tx = 1024,
-      .skip_cert_common_name_check = true,
-      .crt_bundle_attach = esp_crt_bundle_attach,
-      .keep_alive_enable = true,
-  };
+  // Open the next OTA partition for streaming writes. The actual firmware
+  // download runs in performInstallUpdateStep() via the wolfSSL HttpDownloader,
+  // so no mbedtls esp_https_ota is involved.
+  const esp_partition_t* updatePartition = esp_ota_get_next_update_partition(nullptr);
+  if (updatePartition == nullptr) {
+    LOG_ERR("OTA", "no next OTA partition");
+    return INTERNAL_UPDATE_ERROR;
+  }
 
-  esp_https_ota_config_t ota_config = {
-      .http_config = &client_config,
-      .http_client_init_cb = http_client_set_header_cb,
-  };
-
-  /* For better timing and connectivity, we disable power saving for WiFi */
   esp_wifi_set_ps(WIFI_PS_NONE);
-
-  esp_err = esp_https_ota_begin(&ota_config, &ota_handle);
-  if (esp_err != ESP_OK) {
-    LOG_DBG("OTA", "HTTP OTA Begin Failed: %s", esp_err_to_name(esp_err));
+  esp_ota_handle_t handle = 0;
+  const esp_err_t err = esp_ota_begin(updatePartition, OTA_SIZE_UNKNOWN, &handle);
+  if (err != ESP_OK) {
+    LOG_ERR("OTA", "esp_ota_begin failed: %s", esp_err_to_name(err));
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     return INTERNAL_UPDATE_ERROR;
   }
+  otaWriteHandle = reinterpret_cast<void*>(handle);
+  LOG_INF("OTA", "esp_ota_begin OK on %s; streaming from %s", updatePartition->label, otaUrl.c_str());
+  return UPDATE_IN_PROGRESS;
+}
 
-  int lastReportedPct = -1;
-  do {
-    esp_err = esp_https_ota_perform(ota_handle);
-    processedSize = esp_https_ota_get_image_len_read(ota_handle);
-    // Fire the callback only on whole-percent change. Without this it fired
-    // every ~100ms perform iteration, waking the render task whose framebuffer
-    // work contends with TLS on the same internal arena. E-ink can't repaint
-    // faster than a percent tick anyway.
-    if (onProgress && totalSize > 0) {
-      const int pct = static_cast<int>(static_cast<uint64_t>(processedSize) * 100 / totalSize);
-      if (pct != lastReportedPct) {
-        lastReportedPct = pct;
-        onProgress(ctx);
-      }
+/* Writes the otadata entry to boot from the most recently flashed OTA partition,
+ * bypassing esp_ota_set_boot_partition()'s image_validate() call.
+ * Used when esp_ota_end()/esp_ota_set_boot_partition() returns
+ * ESP_ERR_OTA_VALIDATE_FAILED on unsigned Arduino builds (boot_comm efuse
+ * revision check false-positive). */
+int OtaUpdater::forceSetOtaBootPartition() {
+  const esp_partition_t* newPartition = esp_ota_get_next_update_partition(nullptr);
+  if (newPartition == nullptr) {
+    LOG_ERR("OTA", "force boot partition: next update partition not found");
+    return ESP_ERR_NOT_FOUND;
+  }
+  LOG_INF("OTA", "force boot next partition=%s subtype=0x%x offset=0x%lx size=0x%lx", newPartition->label,
+          newPartition->subtype, static_cast<unsigned long>(newPartition->address),
+          static_cast<unsigned long>(newPartition->size));
+
+  const esp_partition_t* otaDataPartition =
+      esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, nullptr);
+  if (otaDataPartition == nullptr) {
+    LOG_ERR("OTA", "force boot partition: otadata partition not found");
+    return ESP_ERR_NOT_FOUND;
+  }
+  esp_ota_select_entry_t otadata[2];
+  esp_err_t err = esp_partition_read(otaDataPartition, 0, &otadata[0], sizeof(esp_ota_select_entry_t));
+  if (err != ESP_OK) {
+    LOG_ERR("OTA", "force boot: read otadata[0] failed: %s", esp_err_to_name(err));
+    return err;
+  }
+  err = esp_partition_read(otaDataPartition, otaDataPartition->erase_size, &otadata[1], sizeof(esp_ota_select_entry_t));
+  if (err != ESP_OK) {
+    LOG_ERR("OTA", "force boot: read otadata[1] failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  int activeSlot = bootloader_common_get_active_otadata(otadata);
+  int nextSlot = (activeSlot == -1) ? 0 : (~activeSlot & 1);
+
+  uint8_t otaAppCount = 0;
+  while (esp_partition_find_first(ESP_PARTITION_TYPE_APP,
+                                  static_cast<esp_partition_subtype_t>(ESP_PARTITION_SUBTYPE_APP_OTA_MIN + otaAppCount),
+                                  nullptr) != nullptr) {
+    otaAppCount++;
+  }
+  if (otaAppCount == 0) {
+    LOG_ERR("OTA", "force boot select: no OTA app partitions found");
+    return ESP_ERR_NOT_FOUND;
+  }
+
+  const uint8_t subTypeId = newPartition->subtype & 0x0F;
+  uint32_t newSeq;
+  if (activeSlot == -1) {
+    newSeq = subTypeId + 1;
+  } else {
+    uint32_t currentSeq = otadata[activeSlot].ota_seq;
+    newSeq = currentSeq;
+    // ESP-IDF's bootloader maps ota_seq to an OTA app slot with
+    // (ota_seq - 1) % ota_app_count. Match that mapping here so the forced
+    // otadata entry selects the partition the streaming install just wrote.
+    while ((newSeq - 1) % otaAppCount != static_cast<uint32_t>(subTypeId)) {
+      newSeq++;
     }
-    delay(100);  // TODO: should we replace this with something better?
-  } while (esp_err == ESP_ERR_HTTPS_OTA_IN_PROGRESS);
+    if (newSeq == currentSeq) newSeq += otaAppCount;
+  }
 
-  /* Return back to default power saving for WiFi in case of failing */
+  otadata[nextSlot].ota_seq = newSeq;
+  otadata[nextSlot].ota_state = ESP_OTA_IMG_VALID;
+  otadata[nextSlot].crc = bootloader_common_ota_select_crc(&otadata[nextSlot]);
+
+  err = esp_partition_erase_range(otaDataPartition, otaDataPartition->erase_size * static_cast<uint32_t>(nextSlot),
+                                  otaDataPartition->erase_size);
+  if (err != ESP_OK) {
+    LOG_ERR("OTA", "force boot: erase otadata[%d] failed: %s", nextSlot, esp_err_to_name(err));
+    return err;
+  }
+
+  err = esp_partition_write(otaDataPartition, otaDataPartition->erase_size * static_cast<uint32_t>(nextSlot),
+                            &otadata[nextSlot], sizeof(esp_ota_select_entry_t));
+  if (err != ESP_OK) {
+    LOG_ERR("OTA", "force boot: write otadata[%d] failed: %s", nextSlot, esp_err_to_name(err));
+  }
+  return err;
+}
+
+OtaUpdater::OtaUpdaterError OtaUpdater::performInstallUpdateStep() {
+  if (cancelRequested) {
+    cleanupUpdate();
+    return UPDATE_CANCELLED;
+  }
+  if (!otaWriteHandle) {
+    return INTERNAL_UPDATE_ERROR;
+  }
+  // The whole streaming download happens in this single call; the DataCallback
+  // drives progress/cancel via installProgressCb so the UI stays responsive.
+  // Idempotent guard: once done, don't re-enter.
+  if (installDone) {
+    return installResult;
+  }
+
+  const esp_ota_handle_t handle = reinterpret_cast<esp_ota_handle_t>(otaWriteHandle);
+  bool writeOk = true;
+  bool userCancelled = false;
+
+  // Verify-only (fail closed): a MITM must not be able to downgrade the firmware
+  // download to an unverified connection by presenting a bad cert.
+  const bool fetchOk = HttpDownloader::fetchUrlVerified(
+      otaUrl,
+      [&](const uint8_t* data, size_t len) -> bool {
+        if (cancelRequested) {
+          userCancelled = true;
+          return false;
+        }
+        if (esp_ota_write(handle, data, len) != ESP_OK) {
+          writeOk = false;
+          return false;  // abort
+        }
+        processedSize += len;
+        render = true;
+        // Let the host redraw progress and poll for Back; abort if it returns false.
+        if (installProgressCb && !installProgressCb(processedSize, totalSize)) {
+          userCancelled = true;
+          return false;
+        }
+        return true;
+      },
+      /*treatAbortAsSuccess=*/false);
+
   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  installDone = true;
 
-  if (esp_err != ESP_OK) {
-    LOG_ERR("OTA", "esp_https_ota_perform Failed: %s", esp_err_to_name(esp_err));
-    esp_https_ota_finish(ota_handle);
-    return HTTP_ERROR;
+  if (userCancelled || cancelRequested) {
+    LOG_INF("OTA", "Install cancelled by user");
+    cleanupUpdate();
+    installResult = UPDATE_CANCELLED;
+    return installResult;
+  }
+  if (!writeOk) {
+    LOG_ERR("OTA", "esp_ota_write failed");
+    cleanupUpdate();
+    installResult = INTERNAL_UPDATE_ERROR;
+    return installResult;
+  }
+  if (!fetchOk) {
+    LOG_ERR("OTA", "firmware download failed");
+    cleanupUpdate();
+    installResult = HTTP_ERROR;
+    return installResult;
   }
 
-  if (!esp_https_ota_is_complete_data_received(ota_handle)) {
-    LOG_ERR("OTA", "esp_https_ota_is_complete_data_received Failed: %s", esp_err_to_name(esp_err));
-    esp_https_ota_finish(ota_handle);
-    return INTERNAL_UPDATE_ERROR;
+  esp_err_t finish_err = esp_ota_end(handle);
+  otaWriteHandle = nullptr;
+  if (finish_err != ESP_OK && finish_err != ESP_ERR_OTA_VALIDATE_FAILED) {
+    LOG_ERR("OTA", "esp_ota_end failed: %s", esp_err_to_name(finish_err));
+    installResult = INTERNAL_UPDATE_ERROR;
+    return installResult;
   }
 
-  esp_err = esp_https_ota_finish(ota_handle);
-  if (esp_err != ESP_OK) {
-    LOG_ERR("OTA", "esp_https_ota_finish Failed: %s", esp_err_to_name(esp_err));
-    return INTERNAL_UPDATE_ERROR;
+  // Set the new partition as boot. Arduino unsigned builds fail image_validate()
+  // in esp_ota_set_boot_partition (and esp_ota_end returns VALIDATE_FAILED), so
+  // fall back to writing otadata directly — same bypass as before.
+  const esp_partition_t* updatePartition = esp_ota_get_next_update_partition(nullptr);
+  esp_err_t boot_err = (finish_err == ESP_ERR_OTA_VALIDATE_FAILED) ? ESP_ERR_OTA_VALIDATE_FAILED
+                                                                   : esp_ota_set_boot_partition(updatePartition);
+  if (boot_err == ESP_ERR_OTA_VALIDATE_FAILED) {
+    LOG_INF("OTA", "Validation failed (expected for unsigned Arduino builds) - forcing boot partition");
+    boot_err = static_cast<esp_err_t>(forceSetOtaBootPartition());
+    if (boot_err != ESP_OK) {
+      LOG_ERR("OTA", "forceSetOtaBootPartition failed: %s", esp_err_to_name(boot_err));
+      installResult = VALIDATE_FAILED;
+      return installResult;
+    }
+  } else if (boot_err != ESP_OK) {
+    LOG_ERR("OTA", "esp_ota_set_boot_partition failed: %s", esp_err_to_name(boot_err));
+    installResult = INTERNAL_UPDATE_ERROR;
+    return installResult;
   }
 
-  LOG_INF("OTA", "Update completed");
-  return OK;
+  LOG_INF("OTA", "Update completed (%zu bytes)", processedSize);
+  installResult = OK;
+  return installResult;
 }

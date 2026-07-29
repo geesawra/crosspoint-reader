@@ -1,43 +1,461 @@
 #pragma once
+
+// On-device render-benchmark harness (reader menu "Render benchmark" entry). Off by default —
+// enable with -DENABLE_BENCHMARKS=1 in a platformio.ini environment for perf investigation
+// builds only; the harness and its report-building code have no value for end users and are
+// worth keeping out of release flash budgets.
+#ifndef ENABLE_BENCHMARKS
+#define ENABLE_BENCHMARKS 0
+#endif
+
+#include <BuildArena.h>
 #include <Epub.h>
 #include <Epub/FootnoteEntry.h>
 #include <Epub/Section.h>
 
-#include <optional>
+#include <atomic>
 
+#include "BookmarkStore.h"
 #include "EpubReaderMenuActivity.h"
+#include "ReaderUtils.h"
 #include "activities/Activity.h"
 
 class EpubReaderActivity final : public Activity {
+  // Reader can launch sync in several UX modes:
+  // - COMPARE: legacy chooser (apply/upload) for power users.
+  // - PULL_REMOTE / PUSH_LOCAL: direct one-step actions from menu entries.
+  // - AUTO_PUSH: silent push on reader exit; skips when remote is already ahead.
+  // Keeping this split in the caller avoids branching on menu semantics deep
+  // inside generic reader state handling.
+  enum class SyncLaunchMode {
+    COMPARE,
+    PULL_REMOTE,
+    PUSH_LOCAL,
+    AUTO_PUSH,
+  };
+
+  // Encodes pending navigation intent — where to land once the target section is loaded.
+  // Replaces the scattered nextPageNumber / pendingTocIndex / pendingAnchor /
+  // cachedSpineIndex / cachedChapterTotalPageCount / pendingPercent* / pendingParagraph* fields.
+  struct NavigationTarget {
+    enum class Kind : uint8_t {
+      Page,       // go to page n (0-based)
+      LastPage,   // go to last page of section (was UINT16_MAX sentinel)
+      Anchor,     // href fragment (e.g. "note1")
+      TocIndex,   // TOC entry index
+      Percent,    // normalised 0.0–1.0 within spine
+      Paragraph,  // KOReader paragraph LUT index
+      ListItem,   // KOReader li-anchored LUT index
+    };
+    Kind kind = Kind::Page;
+    union {
+      int page;             // Kind::Page
+      int tocIndex;         // Kind::TocIndex
+      float spineProgress;  // Kind::Percent
+      uint16_t lutIndex;    // Kind::Paragraph / Kind::ListItem
+    };
+    std::string anchorStr;  // Kind::Anchor; empty for all others
+    // Cross-font rescaling: page count of this spine at save time.
+    // Non-zero for Kind::Page when loaded from progress.bin or written during reflow.
+    // Also set for Kind::Paragraph / Kind::ListItem / Kind::Anchor so a LUT miss
+    // still rescales the estimated fallbackPage instead of stranding at 0.
+    int cachedPageCount = 0;
+    int cachedSpineIdx = 0;
+    // Estimated page used as a baseline before LUT/anchor lookup, and as a fallback
+    // when the lookup misses. Only meaningful for Kind::Paragraph / Kind::ListItem /
+    // Kind::Anchor — for Kind::Page the `page` field is the baseline.
+    int fallbackPage = 0;
+
+    NavigationTarget() : kind(Kind::Page), page(0) {}
+
+    static NavigationTarget makePage(int n) {
+      NavigationTarget t;
+      t.kind = Kind::Page;
+      t.page = n;
+      return t;
+    }
+    static NavigationTarget makeLastPage() {
+      NavigationTarget t;
+      t.kind = Kind::LastPage;
+      t.page = 0;
+      return t;
+    }
+    static NavigationTarget makeAnchor(std::string a, int fallback = 0) {
+      NavigationTarget t;
+      t.kind = Kind::Anchor;
+      t.page = 0;
+      t.anchorStr = std::move(a);
+      t.fallbackPage = fallback;
+      return t;
+    }
+    static NavigationTarget makeTocIndex(int idx) {
+      NavigationTarget t;
+      t.kind = Kind::TocIndex;
+      t.tocIndex = idx;
+      return t;
+    }
+    static NavigationTarget makePercent(float sp) {
+      NavigationTarget t;
+      t.kind = Kind::Percent;
+      t.spineProgress = sp;
+      return t;
+    }
+    static NavigationTarget makeParagraph(uint16_t i, int fallback = 0) {
+      NavigationTarget t;
+      t.kind = Kind::Paragraph;
+      t.lutIndex = i;
+      t.fallbackPage = fallback;
+      return t;
+    }
+    static NavigationTarget makeListItem(uint16_t i, int fallback = 0) {
+      NavigationTarget t;
+      t.kind = Kind::ListItem;
+      t.lutIndex = i;
+      t.fallbackPage = fallback;
+      return t;
+    }
+
+    // Resolves the target into section.currentPage. Must be called on the render task
+    // after the section has been loaded (pageCount is known).
+    void resolveInto(Section& section, int spineIndex) const;
+  };
+
+  // Phase lifecycle for memory management at chapter boundaries.
+  // READING:      normal state — section loaded, SD font metadata resident
+  // PRECOMPILING: createSectionFile running — SD font metadata temporarily dropped
+  enum class ReaderPhase : uint8_t { READING, PRECOMPILING };
+  ReaderPhase readerPhase_ = ReaderPhase::READING;
+
+  // One render() invocation services exactly one of these passes. The pass is
+  // selected from the pending flags + reader state at entry by classifyRenderPass();
+  // render() then dispatches to the matching helper. Replaces the former in-line
+  // ladder of isPreRenderPass / isBufferDisplayPass / !section bool checks.
+  enum class RenderPass : uint8_t {
+    FinishedBook,     // currentSpineIndex == spineCount: hand off to FinishedBookActivity
+    PreRender,        // Background A: render next page content into the framebuffer only
+    BufferDisplay,    // fast page-turn: framebuffer already holds content; add status bar + flush
+    BuildSection,     // no section loaded → build/load the cache, then render normally
+    SectionBuilding,  // current section is being built incrementally (Background-C): draw the
+                      // requested page from the in-progress LUT, or an "Indexing" popup if it
+                      // isn't built yet. The build itself runs on the loop task, not here.
+    Normal,           // section present → load page, render, display
+  };
+
+  // Resolved screen geometry for one render pass: oriented + padded margins and the
+  // derived viewport. Computed once at the top of render() and threaded into the pass
+  // helpers so each helper takes one struct instead of six loose ints.
+  struct RenderLayout {
+    int marginTop = 0;
+    int marginRight = 0;
+    int marginBottom = 0;
+    int marginLeft = 0;
+    uint16_t viewportWidth = 0;
+    uint16_t viewportHeight = 0;
+  };
+
   std::shared_ptr<Epub> epub;
+  // Build scratch backed by the borrowed secondary framebuffer (see the Background-C
+  // release site). Handed to section->setExternalBuildScratch() so build allocations
+  // land inside the lent block instead of the heap — nothing can allocate in the region,
+  // so the return can never fail on a fragmented hole. Declared BEFORE `section`: the
+  // section (whose in-flight build releases into this arena) must destroy first.
+  std::unique_ptr<BuildArena> buildScratch_;
+  // True while the secondary framebuffer is lent to buildScratch_ (borrowed, not freed).
+  // Gates the returnSecondaryBuffer() path in recoverSecondaryBufferIfNeeded()/onExit.
+  bool secondaryBorrowed_ = false;
   std::unique_ptr<Section> section = nullptr;
   int currentSpineIndex = 0;
-  int nextPageNumber = 0;
-  std::optional<uint16_t> pendingPageJump;
-  // Set when navigating to a footnote href with a fragment (e.g. #note1).
-  // Cleared on the next render after the new section loads and resolves it to a page.
-  std::string pendingAnchor;
-  int pagesUntilFullRefresh = 0;
-  int cachedSpineIndex = 0;
-  int cachedChapterTotalPageCount = 0;
+  NavigationTarget navTarget;
+  int pagesUntilFullRefresh =
+      1;  // initialized to freq in onEnter(); 1 triggers HALF on first render if somehow not reset
   unsigned long lastPageTurnTime = 0UL;
   unsigned long pageTurnDuration = 0UL;
-  // Signals that the next render should reposition within the newly loaded section
-  // based on a cross-book percentage jump.
-  bool pendingPercentJump = false;
-  // Normalized 0.0-1.0 progress within the target spine item, computed from book percentage.
-  float pendingSpineProgress = 0.0f;
+  bool pendingHalfRefreshAfterImagePage = false;
+  // Force-refresh button: -1 = none, else a HalDisplay::RefreshMode to apply on the next
+  // normal render of the CURRENT page (overrides the fast/half cadence for that one render).
+  // Used by BTN_FORCE_REFRESH / BTN_FORCE_FAST_REFRESH so the user's manual refresh re-displays
+  // the current page in the requested mode instead of raw-flushing a possibly pre-rendered buffer.
+  int8_t forceRefreshModeNextRender_ = -1;
+  // Refresh mode + display-mode byte of the page just shown, captured at its triggerDisplay
+  // before the deferred-AA grayscale display overwrites the renderer's live last-mode. Logged
+  // by the page summary so it reflects the page, not the AA pass.
+  HalDisplay::RefreshMode lastPageRefreshMode_ = HalDisplay::RefreshMode::FAST_REFRESH;
+  uint8_t lastPageDisplayModeByte_ = 0;
+  // True when secondary display buffer allocation failed; while set we prefer
+  // conservative refresh policy and skip grayscale AA to reduce ghosting.
+  bool secondaryBufferDegraded_ = false;
+  // Guard against repeated reboot attempts in a single reader session.
+  bool fragmentationRecoveryRestartAttempted_ = false;
+  // True for the duration of the per-page image warm pass (secondary buffer released,
+  // JPEG/PNG decode in progress, secondary buffer realloc pending). RenderLock already
+  // excludes Background-B/C from running during this window (they bail on
+  // RenderLock::peek()); this flag is a second, explicit guard so that invariant doesn't
+  // silently depend on renderContents() never yielding mid-warm-pass. Checked by
+  // stepBackgroundSectionBuild() and stepCurrentSectionBuild() before they start any
+  // heap-hungry work.
+  bool imageProcessingActive_ = false;
+  // Arms forceHalfRefreshAfterPopup_ for the NEXT incremental section build, marking that build's
+  // popup -> content transition as "dramatic" and worth a clean HALF baseline (vs. the routine,
+  // frequent forward-reading crossing into a still-building Background-B section, where forcing
+  // HALF made every section traversal pay a slow refresh). Two dramatic cases set it:
+  //   - cold open of a book (set in onEnter()); valid only for the FIRST section entry, so any
+  //     non-incremental entry — a cache hit or a blocking build — clears it (see buildSection),
+  //     ensuring a cached re-open's first uncached forward crossing is NOT treated as dramatic.
+  //   - a deliberate jump to a possibly-uncached section (chapter/percent/footnote): those sites
+  //     arm a HALF refresh override via ReaderUtils::enforceExitFullRefresh(), which the indexing
+  //     popup would otherwise consume, leaving the content page a FAST diff. buildSection detects
+  //     that pending override (renderer.hasRefreshOverridePending()) and arms the post-popup HALF
+  //     too, so the override paints the popup and the flag paints the content — both clean.
+  bool coldOpenHalfRefreshArmed_ = true;
+  // True after the "Indexing..." popup is drawn for a build flagged as a dramatic transition (see
+  // coldOpenHalfRefreshArmed_), until the first real page replaces it on screen. That first page is
+  // forced to HALF_REFRESH instead of the normal FAST cadence, establishing a clean baseline for the
+  // popup -> content transition. Consumed by whichever path shows the first real page:
+  // displayBuildPage() for a multi-slice build, or renderContents() directly when the build finishes
+  // in a single slice (e.g. a one-page cover) and never goes through displayBuildPage at all.
+  bool forceHalfRefreshAfterPopup_ = false;
+  // When true, large images on the current page are decoded instead of shown as placeholders.
+  // Reset to false on every page turn so the next image page starts with a placeholder again.
+  bool forceLoadLargeImages = false;
+  // Set after each render: true if the current page contains at least one placeholder image.
+  bool pageHasPlaceholders = false;
+  bool showTruncatedSectionHintThisRender = false;
+  uint8_t truncatedSectionHintRendersRemaining = 0;
+  int lastWarnedTruncatedSpineIndex = -1;
+  struct RenderPhaseStats {
+    unsigned long prewarmMs = 0UL;
+    unsigned long bwRenderMs = 0UL;
+    unsigned long displayMs = 0UL;
+    unsigned long bwStoreMs = 0UL;      // unused (sequential path)
+    unsigned long grayLsbMs = 0UL;      // LSB+MSB render+copy (planes phase)
+    unsigned long grayMsbMs = 0UL;      // unused (sequential path)
+    unsigned long grayDisplayMs = 0UL;  // displayGrayBuffer() waveform
+    unsigned long bwRestoreMs = 0UL;    // BW re-render + cleanupGrayscaleWithFrameBuffer()
+    unsigned long totalMs = 0UL;
+  };
+  struct LastRenderStats {
+    bool valid = false;
+    bool cacheRebuilt = false;
+    bool usedGrayscale = false;
+    bool hadImages = false;
+    bool imagePageWithAA = false;
+    bool forcedHalfRefresh = false;
+    uint8_t orientation = 0;
+    uint8_t imageRendering = 0;
+    bool embeddedStyle = false;
+    bool textAntiAliasing = false;
+    int effectiveFontId = 0;
+    int spineIndex = 0;
+    int pageIndex = 0;
+    int pageCount = 0;
+    int footnoteCount = 0;
+    int marginTop = 0;
+    int marginRight = 0;
+    int marginBottom = 0;
+    int marginLeft = 0;
+    uint16_t viewportWidth = 0;
+    uint16_t viewportHeight = 0;
+    unsigned long sectionLoadMs = 0UL;
+    unsigned long pageLoadMs = 0UL;
+    unsigned long requestRenderMs = 0UL;
+    RenderPhaseStats phases;
+    uint32_t freeHeapBefore = 0;
+    uint32_t largestFreeBlockBefore = 0;
+    uint32_t freeHeapAfter = 0;
+    uint32_t largestFreeBlockAfter = 0;
+    uint32_t fontCacheHits = 0;
+    uint32_t fontCacheMisses = 0;
+    uint32_t fontDecompressMs = 0;
+    uint16_t fontUniqueGroups = 0;
+    uint32_t fontPageBufferBytes = 0;
+    uint32_t fontPageGlyphsBytes = 0;
+    uint32_t fontPeakTempBytes = 0;
+    uint32_t fontGetBitmapTimeUs = 0;
+    uint32_t fontGetBitmapCalls = 0;
+  };
+#if ENABLE_BENCHMARKS
+  struct BenchmarkAggregate {
+    int renderCount = 0;
+    int imagePageCount = 0;
+    int cacheRebuildCount = 0;
+    int maxFootnotes = 0;
+    unsigned long totalRequestRenderMs = 0UL;
+    unsigned long minRequestRenderMs = 0UL;
+    unsigned long maxRequestRenderMs = 0UL;
+    unsigned long totalRenderMs = 0UL;
+    unsigned long minRenderMs = 0UL;
+    unsigned long maxRenderMs = 0UL;
+    unsigned long totalSectionLoadMs = 0UL;
+    unsigned long totalPageLoadMs = 0UL;
+    RenderPhaseStats totalPhases;
+    uint32_t totalFontCacheHits = 0;
+    uint32_t totalFontCacheMisses = 0;
+    uint32_t totalFontDecompressMs = 0;
+    uint32_t totalFontGetBitmapTimeUs = 0;
+    uint32_t totalFontGetBitmapCalls = 0;
+    uint32_t minFreeHeapAfter = 0;
+    uint32_t maxFreeHeapAfter = 0;
+  };
+#endif  // ENABLE_BENCHMARKS
+  LastRenderStats lastRenderStats;
+  // Pre-rendered next page: frame buffer holds page content (no status bar) ready to display.
+  // Set by the pre-render pass in render(); consumed and cleared by the fast path in pageTurn().
+  // Invalidated (ready=false) on any navigation that is not a simple forward page turn.
+  struct PreRenderedPage {
+    bool ready = false;
+    int spineIndex = -1;
+    int pageIndex = -1;
+    unsigned long renderDurationMs = 0UL;
+    unsigned long completedAtMs = 0UL;
+  };
+  PreRenderedPage preRenderedPage;
+  // Debug-only Background B (section pre-analysis) progress, surfaced as a small
+  // status-bar overlay when DEBUG_BACKGROUND_WORK is enabled. Background A's state is
+  // derived at draw time from pendingPreRender / preRenderedPage, so only B needs a
+  // field. -1 means no background build is active.
+  int8_t backgroundBuildPercent_ = -1;
+  // --- Background B (idle build of the next consecutive sections' caches) ---
+  // Lookahead cursor: spine index the B state below currently targets; -1 when B has no
+  // target. Walks forward from currentSpineIndex+1 toward the book end as each target settles,
+  // stopping once BG_BUILD_LOOKAHEAD_PAGES of runway is built ahead (see below), then idles
+  // until navigation re-anchors the window.
+  int backgroundBuildSpineIndex_ = -1;
+  // Reading position the lookahead window is anchored at. When it no longer matches
+  // currentSpineIndex (any navigation) the held B state is stale and the window restarts.
+  int backgroundBuildBaseSpine_ = -1;
+  // Pages B has laid out ahead in the current window (sum of pageCounts of the subsequent
+  // sections built/cached since the last re-anchor). Combined with the current section's unread
+  // tail, this is the runway the page-budget gate compares against BG_BUILD_LOOKAHEAD_PAGES.
+  // Reset only on re-anchor; preserved across the per-target resetBackgroundBuild() in Settled.
+  int backgroundWindowPagesBuilt_ = 0;
+  // Section being built (or already built) for backgroundBuildSpineIndex_. Owned here
+  // until buildSection() adopts it on a consecutive boundary cross or discards it on any
+  // other navigation. Its destructor aborts a partial build and deletes the partial file.
+  std::unique_ptr<Section> backgroundSection_;
+  // Uncompressed size of the target spine's XHTML (fetched once in the Probe step).
+  // Sizes the inflate ring share of the extraction heap gate.
+  size_t backgroundBuildInflatedSize_ = 0;
+  // Last WaitHeap gate evaluation; the heap-walk checks re-run at most ~1×/s.
+  unsigned long backgroundBuildGateCheckMs_ = 0;
+  // One-shot Background-A re-arm latch (see serviceBackgroundWork): the (spine, page)
+  // whose pre-render was already retried after the deferred AA released its memory.
+  // Bounds retries to one per displayed page so an image-only next page (which can
+  // never produce a pre-render) doesn't re-trigger the pass every idle tick.
+  int preRenderRearmSpine_ = -1;
+  int preRenderRearmPage_ = -1;
+  // One-shot-per-target probe/settle latch so idle ticks don't re-hit the SD every loop:
+  //   Probe    — not yet checked whether the target's cache already exists
+  //   WaitHeap — cache missing; waiting for the heap gates to pass (rechecked each tick)
+  //   Building — backgroundSection_ has an in-flight incremental build
+  //   Settled  — done for this target (built / cached / failed); advances the cursor to the
+  //              next section in the lookahead window (or idles if the window is exhausted)
+  enum class BackgroundBuildState : uint8_t { Probe, WaitHeap, Building, Settled };
+  BackgroundBuildState backgroundBuildState_ = BackgroundBuildState::Probe;
+  // --- Background C (incremental build of the CURRENT section while the reader watches) ---
+  // When the spine the user just entered has no cache, buildSection() starts an in-place
+  // incremental build owned by `section` and hands the slicing to stepCurrentSectionBuild()
+  // on the loop task, so input stays responsive. The render task only ever draws (the
+  // SectionBuilding pass). State below coordinates that hand-off.
+  //
+  // Page last drawn by the SectionBuilding pass (-1 = none yet / popup showing). Stops the
+  // pass redrawing the same page every idle tick.
+  int buildDisplayedPage_ = -1;
+  // True once the "Indexing" popup has been drawn for the current pending page, so the pass
+  // doesn't re-flush it every tick. Cleared whenever a real page is drawn or the build ends.
+  bool buildingPopupShown_ = false;
+  // Spine for which the incremental build failed/degraded and must be retried with the old
+  // blocking (secondary-buffer-released) path instead of Background-C. -1 = no such latch.
+  int forceBlockingBuildSpine_ = -1;
+  // Spine whose RESIDENT Background-C build aborted on the proactive low-heap guard and must be
+  // retried as IncrementalReleased (buffer freed, still sliced — the first page still appears
+  // mid-build). Distinct from forceBlockingBuildSpine_: a low-heap abort is a headroom problem
+  // the release solves, not a parse failure, so it must not collapse to the blocking path
+  // (which indexes the whole section before showing anything). -1 = no such latch.
+  int forceReleasedBuildSpine_ = -1;
+  // Debug-only Background A glyph for the status-bar overlay. The transient flags
+  // (pendingPreRender / preRenderedPage.ready) are cleared at the top of render()
+  // before the status bar is drawn, so the overlay could never sample a non-idle
+  // state. Instead we latch per-page provenance here just before the status bar
+  // draws: 'x' = this page was served from the pre-render buffer (a Background-A
+  // hit), '-' = it was rendered fresh (a miss). Drawn only under the flag.
+  char backgroundAGlyph_ = '-';
+  // Debug-only counters flushed to serial every ~5s by serviceBackgroundDebugLog() when
+  // DEBUG_BACKGROUND_WORK is enabled. "Runs" counts how often each background routine was
+  // invoked with work to do; "completes" counts how often it finished a unit (a pre-rendered
+  // page for A, a fully built section for B). Cheap monotonic counters; no release-build cost
+  // since the logger is compiled out when the flag is 0.
+  struct BackgroundWorkCounters {
+    uint32_t aRuns = 0;       // pre-render pass entered with a page to render
+    uint32_t aCompletes = 0;  // pre-render produced a ready next page
+    uint32_t bRuns = 0;       // section-build step ran a slice of work
+    uint32_t bCompletes = 0;  // section build reached Done
+  };
+  BackgroundWorkCounters bgCounters_;
+  unsigned long lastBgDebugLogMs_ = 0UL;
+  // Emit the background-work counters to serial roughly every 5s. No-op unless
+  // DEBUG_BACKGROUND_WORK is set. Called from loop().
+  void serviceBackgroundDebugLog();
+  struct PageTurnStatsWindow {
+    uint16_t turns = 0;
+    uint16_t preRenderHits = 0;
+    uint16_t preRenderMisses = 0;
+    unsigned long totalPreRenderMs = 0UL;
+    unsigned long totalIdleSlackMs = 0UL;
+  };
+  static constexpr uint16_t PAGE_TURN_STATS_WINDOW_SIZE = 10;
+  PageTurnStatsWindow pageTurnStatsWindow;
+  // Set by render() after a normal page render to request a pre-render of the next page.
+  bool pendingPreRender = false;
+  // Deferred grayscale (Phase 8): after the BW display pass, defer the AA render until the
+  // next idle loop tick (no navigation input pending). This makes rapid page turns feel faster
+  // — only the BW pass runs while flipping; AA runs once when the user pauses.
+  // Cleared by loop() after running the deferred pass, and on every page turn.
+  struct PendingGrayscale {
+    bool active = false;
+    std::shared_ptr<Page> page;  // page whose text needs the AA pass
+    int fontId = 0;
+    int marginLeft = 0;
+    int contentTop = 0;
+    bool fastLut = false;
+  };
+  PendingGrayscale pendingGrayscale_;
+  // Set by pageTurn() fast path to tell render() the frame buffer already holds the next page
+  // content and only the status bar + display flush are needed.
+  bool usePreRenderedBuffer = false;
+  // Progress save is posted by render() and consumed by loop() to keep SD I/O off the render task.
+  // render() writes spineIndex/page/pageCount then sets pending with release semantics so loop()
+  // sees a coherent snapshot when it observes pending==true via acquire.
+  struct PendingProgressSave {
+    std::atomic<bool> pending{false};
+    int spineIndex = 0;
+    int page = 0;
+    int pageCount = 0;
+  };
+  PendingProgressSave pendingProgressSave;
   bool pendingScreenshot = false;
-  bool pendingSyncSaveError = false;
   bool skipNextButtonCheck = false;  // Skip button processing for one frame after subactivity exit
+  bool finishedBookActivityStarted_ = false;
+  ReaderUtils::InputDrainGuard inputDrainGuard;
   bool automaticPageTurnActive = false;
-  bool ignoreBackUntilRelease = false;  // Suppress Back bleed-through after dictionary chain exit
-  // Tracks whether this book is currently removed from Recent Books by the
-  // removeReadBooksFromRecents feature (set at End-of-Book, cleared if paged back in).
-  bool recentsEntryRemoved = false;
-  // Set when the reader is left at end-of-book and SETTINGS.moveFinishedToReadFolder is on.
-  // Consumed in onExit() to relocate the finished book into /Read/.
-  bool pendingReadFolderMove = false;
+  // Pages turned in the current reader session. Used to gate auto-push-on-close: a brief
+  // inspection of a book should not trigger a network round-trip. Reset on every reader
+  // entry; not persisted, since "session" means the lifetime of this activity instance.
+  int sessionPagesAdvanced = 0;
+  // -1 means use global SETTINGS value.
+  int8_t bookEmbeddedStyleOverride = -1;
+  int8_t bookImageRenderingOverride = -1;
+  int8_t bookFontFamilyOverride = -1;
+  std::string bookSdFontFamilyOverride;
+  int8_t bookFontSizeOverride = -1;
+  int8_t bookBionicReadingOverride = -1;
+  int8_t bookParagraphAlignmentOverride = -1;
+  int8_t bookTextAntiAliasingOverride = -1;
+  int8_t bookHyphenationOverride = -1;
+  int8_t bookGuideDotsOverride = -1;
+  int8_t bookInlineFootnotePreviewsOverride = -1;
+
+  // Bookmarks (starred pages)
+  BookmarkStore bookmarkStore;
 
   // Footnote support
   std::vector<FootnoteEntry> currentPageFootnotes;
@@ -49,25 +467,204 @@ class EpubReaderActivity final : public Activity {
   SavedPosition savedPositions[MAX_FOOTNOTE_DEPTH] = {};
   int footnoteDepth = 0;
 
-  void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
+  // --- render() pass dispatch (see RenderPass) ---
+  // Opportunistically restore the secondary display buffer if a prior OOM degraded it.
+  void recoverSecondaryBufferIfNeeded();
+  // Realloc the secondary buffer, evicting rebuildable caches (FDC page slots, CSS
+  // resolve caches) that a released build may have planted inside the freed hole and
+  // retrying once before reporting failure. Shared by the post-build and opportunistic
+  // recovery paths.
+  bool reallocSecondaryEvictingCaches();
+  // One-time foreground gather of the book-level footnote preview cache (footnotes.bin),
+  // with a "Gathering footnotes" popup. No-op when previews are effectively off or the
+  // cache already exists. Returns true when the cache is usable.
+  bool ensureFootnotePreviewCache();
+  // True once footnotes.bin is known to exist for this book (primed in onEnter, set by
+  // ensureFootnotePreviewCache). Gates Background-B so it never bakes a preview-enabled
+  // section variant before the cache is gathered.
+  bool footnotePreviewCacheReady_ = false;
+  // Clamp currentSpineIndex into [0, spineCount]. spineCount itself is the finished-book sentinel.
+  void clampSpineIndex(int spineCount);
+  // Compute oriented + padded margins and the derived viewport for this render.
+  RenderLayout computeRenderLayout() const;
+  // Select which pass this render() invocation should run, from pending flags + reader state.
+  RenderPass classifyRenderPass() const;
+  // FinishedBook pass: transition to the finished-book flow. Consumes the lock.
+  void renderFinishedBookPass(RenderLock& lock, int spineCount);
+  // PreRender pass (Background A): render the next page's content into the framebuffer only.
+  void renderPreRenderPass(const RenderLayout& layout);
+  // BufferDisplay pass: framebuffer already holds the next page; add status bar + flush.
+  // Returns true if the page was displayed (render() should return); false if the fast path
+  // could not be taken (load failed / image page) and render() must fall through to Normal.
+  bool renderBufferDisplayPass(const RenderLayout& layout);
+  // BuildSection pass: construct/load the section cache for currentSpineIndex and resolve the
+  // nav target. Returns true if a section is ready to render; false if render() should return
+  // (build failed, finished-book handoff, or a requestUpdate retry was posted).
+  bool buildSection(const RenderLayout& layout);
+  // Outcome of compileSectionCache(). Restarting means a fragmented-heap recovery reboot was
+  // triggered and the caller must return immediately without further work.
+  enum class BuildOutcome : uint8_t { Built, Failed, Restarting };
+  // Draws the indexing popup, then builds the section cache file for the current section.
+  // Prefers an in-place build that keeps the secondary display buffer (preserving the fast-
+  // refresh baseline); falls back to releasing the buffer — for parse/decode headroom — when
+  // heap is tight or the in-place attempt fails. On the released path it pre-decodes images
+  // eagerly and reallocates the buffer (arming a half-refresh); the in-place path defers images
+  // to lazy per-page decode and leaves the baseline intact for a normal fast refresh.
+  BuildOutcome compileSectionCache(const RenderLayout& layout, bool embeddedStyle, uint8_t imageRendering);
+  // True when heap is ample enough to build the current section WITHOUT releasing the secondary
+  // buffer (the in-place path). Reuses Section::heapAllowsEmbeddedStyle for CSS books.
+  // inflatedSize is the spine's uncompressed size: the extraction phase holds an inflate ring
+  // sized to the entry (≤32 KB), a per-spine cost the static floors don't cover — a big spine
+  // must clear floor+ring or the resident build is doomed to the low-heap abort. 0 = unknown
+  // (fall back to the static floors alone).
+  bool heapAllowsInPlaceBuild(bool embeddedStyle, size_t inflatedSize) const;
+  // Normal pass: load the current page from the section cache, render it, persist progress.
+  void renderNormalPass(RenderLock& lock, const RenderLayout& layout);
+  // SectionBuilding pass: while Background-C builds the current section, draw the requested
+  // page from the in-progress LUT once it's been written (text-only pages only), or an
+  // "Indexing" popup until then. Does no build work itself — that's stepCurrentSectionBuild().
+  void renderSectionBuildingPass(RenderLock& lock, const RenderLayout& layout);
+
+  // --- idle-time background work ---
+  // Called by loop() when input is idle and no page turn is pending. Dispatches the
+  // cooperative background routines in priority order, giving each a small time slice:
+  //   1. deferred grayscale AA (visible quality of the page just shown)
+  //   2. Background A — pre-render of the next page (scheduled via pendingPreRender)
+  //   3. Background B — idle section pre-analysis (only once A is finished; not yet implemented)
+  // Each routine must be partial-work-capable and yield promptly so the next loop tick
+  // can service input. Returns nothing; routines self-gate on their own pending flags.
+  void serviceBackgroundWork();
+  // Runs the deferred grayscale AA pass for the page just displayed, if one is pending and
+  // the display bus is free. Serialises against the render task via RenderLock. No-op when
+  // nothing is pending. Extracted from loop()'s idle branch.
+  void runDeferredGrayscalePass();
+  // Background B: advance the idle build of the next consecutive section by one bounded
+  // step (state probe, heap gate, or one ~BG_BUILD_BUDGET_MS parse slice). Runs only after
+  // Background A has had its slice (A keeps priority: it drives perceived page-turn speed).
+  // Serialises SD access against the render task via RenderLock; skips the tick instead of
+  // blocking when the render task is busy.
+  void stepBackgroundSectionBuild();
+  // Background C: advance the incremental build of the CURRENT section (the one the reader is
+  // looking at) by one bounded slice. Runs only while `section` has an active build, with the
+  // highest reader-build priority (ahead of A and B). On a newly built target page or on
+  // completion it posts a requestUpdate() so the render task draws it; on completion it resolves
+  // the nav target and transitions back to READING; on a failed/degraded build it latches a
+  // blocking-rebuild fallback. Serialises against the render task via RenderLock.
+  void stepCurrentSectionBuild();
+  // How the current section's (re)build should run. Resident/Released are both incremental
+  // Background-C builds (responsive, build-while-you-read); they differ only in whether the
+  // secondary buffer stays in RAM or is freed for headroom on a tight heap. Blocking is the old
+  // synchronous path, used only when C can't apply (latch set, no buffer, or a CSS-fallback
+  // rebuild — decided by the caller).
+  enum class SectionBuildMode : uint8_t {
+    Blocking,             // synchronous build (no mid-build display)
+    IncrementalResident,  // Background-C, secondary buffer kept resident
+    IncrementalReleased,  // Background-C, secondary buffer released for headroom, restored after
+  };
+  // Pick the build mode (blocking-fallback latch / buffer presence aside). X3 always releases
+  // (its baseline lives in the controller, so a resident buffer only starves the build); X4
+  // releases for CSS books (resident reliably css-degrades) and for non-CSS books that don't fit
+  // the in-place floors, keeping the buffer resident only for non-CSS builds that do fit.
+  // inflatedSize: the spine's uncompressed size (see heapAllowsInPlaceBuild); 0 = unknown.
+  SectionBuildMode chooseSectionBuildMode(bool embeddedStyle, size_t inflatedSize) const;
+  // Render params for a section build of `spineIndex`, identical to what buildSection()
+  // passes to createSectionFile — B must build the exact variant the foreground will load.
+  Section::BuildParams makeSectionBuildParams() const;
+  // Drop all Background-B state (aborting a partial build and deleting its partial cache
+  // file via ~Section). Resets the overlay percent.
+  void resetBackgroundBuild();
+
+  void renderContents(RenderLock& lock, std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
+  // Renders page content into the frame buffer (prewarm + BW pass) without drawing the status bar
+  // or flushing to the display. Used by the pre-render pass so the status bar can be superimposed
+  // at display time with live values (clock, battery).
+  void renderPageContentOnly(const Page& page, int orientedMarginTop, int orientedMarginRight, int orientedMarginBottom,
+                             int orientedMarginLeft);
+  // Draws a single text-only page from an in-progress Background-C build (no AA, no pre-render
+  // arming). Releases the lock before the waveform wait (like renderContents) so a C build
+  // slice can run on the loop task during the refresh.
+  void displayBuildPage(RenderLock& lock, const Page& page, const RenderLayout& layout);
+  // Draws the status bar over the current frame buffer and flushes to the display.
+  // Handles the refresh cycle and grayscale AA pass. page must be the same page
+  // that was last rendered into the buffer (needed for image AA re-render).
+  void displayPreRenderedPage(const Page& page, int orientedMarginTop, int orientedMarginRight,
+                              int orientedMarginBottom, int orientedMarginLeft);
+  // If the frame buffer currently holds a pre-rendered next page, redraw the current page
+  // into it (no status bar, no flush). Restores the invariant other activities — notably
+  // SleepActivity's OVERLAY mode — rely on when transitioning out of the reader.
+  void restoreCurrentPageToBufferIfPreRendered();
   void renderStatusBar() const;
-  void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
-  bool saveProgress(int spineIndex, int currentPage, int pageCount);
+  // Debug overlay: draws the background-work indicators (A: '.'/'x', B: section build %)
+  // in a status-bar corner. Compiled to a no-op unless DEBUG_BACKGROUND_WORK is set.
+  void renderBackgroundDebugOverlay() const;
+  // Snapshot of the three status-bar signals that can change while a page is otherwise idle.
+  // Compared in shouldSkipPeriodicUpdate() to suppress no-op minute-tick re-renders that on
+  // X3 panels accumulate visible speckle via repeated no-diff FAST refreshes.
+  mutable int lastStatusBarPage = -1;
+  mutable int lastStatusBarBattery = -1;
+  mutable int lastStatusBarClockMinute = -1;
+  bool maybeRestartForFragmentedHeap(uint32_t freeHeap, uint32_t contigHeap);
+  void saveProgress(int spineIndex, int currentPage, int pageCount);
+  // Writes the canonical EPUB progress.bin layout: spine(2) + page(2) + pageCount(2) + percent(1).
+  // Used by the per-page saveProgress() and by transient writers (sync restore, bookmark jump) so
+  // the on-disk format stays consistent regardless of caller. Static (and shared across the split
+  // EpubReaderActivity/EpubReaderSync translation units) since it needs no instance state.
+  static bool writeReaderProgressCache(const std::string& cachePath, int spineIndex, int currentPage, int pageCount,
+                                       uint8_t percent);
   // Jump to a percentage of the book (0-100), mapping it to spine and page.
   void jumpToPercent(int percent);
-  void openReaderMenu();
-  // framebufferContainsPage = true means the caller guarantees the framebuffer
-  // currently shows the page at the renderer's oriented page margins. The
-  // DictionaryWordSelectActivity will skip its initial clearScreen +
-  // page->render in that case. Only the hold-to-lookup path can pass true;
-  // the reader-menu → Lookup path must pass false because the menu has
-  // overwritten the framebuffer.
-  void openWordSelect(bool framebufferContainsPage);
   void onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction action);
+  void launchKOReaderSync(SyncLaunchMode mode = SyncLaunchMode::COMPARE);
+  // Reader-close auto-push gate. Returns true if AUTO_PUSH was launched (the caller
+  // must not perform its own exit — the sync activity will route to home on completion).
+  // Returns false when any of the gates fails (setting off, no credentials, < 3 pages),
+  // letting the caller take its normal exit path.
+  bool tryAutoPushOnClose();
+  // Consume a persisted standalone KOReader sync session for this EPUB. Remote
+  // apply writes the mapped reopen position into progress.bin before the normal
+  // reader startup path reads it. Upload-complete leaves the existing local
+  // progress.bin untouched and simply clears the pending session marker.
+  void applyPendingSyncSession();
+  // Consume a persisted bookmark-jump request (from GlobalBookmarksActivity) for
+  // this book. Rewrites progress.bin to the bookmarked position before the normal
+  // reader startup path reads it.
+  void applyPendingBookmarkJump();
   void applyOrientation(uint8_t orientation);
+  void applyTextDarkness(uint8_t textDarkness);
   void toggleAutoPageTurn(uint8_t selectedPageTurnOption);
+  void stopAutomaticPageTurn();
+  void applyBookReaderOverrides(int8_t embeddedStyleOverride, int8_t imageRenderingOverride, int8_t fontFamilyOverride,
+                                const std::string& sdFontFamilyOverride, int8_t fontSizeOverride,
+                                bool bionicReadingOverride, int8_t paragraphAlignmentOverride);
+  // Wider variant that also covers AA, hyphenation and guide dots. Used by
+  // QuickOverridesActivity; the narrower overload above funnels through here,
+  // preserving the AA/hyphenation/guide-dots values currently held on this activity.
+  void applyBookReaderOverrides(int8_t embeddedStyleOverride, int8_t imageRenderingOverride, int8_t fontFamilyOverride,
+                                const std::string& sdFontFamilyOverride, int8_t fontSizeOverride,
+                                int8_t bionicReadingOverride, int8_t paragraphAlignmentOverride,
+                                int8_t textAntiAliasingOverride, int8_t hyphenationOverride, int8_t guideDotsOverride,
+                                int8_t inlineFootnotePreviewsOverride);
+  void openReaderMenu();
+  void openQuickOverrides();
+  bool getEffectiveEmbeddedStyle() const;
+  bool getEffectiveBionicReading() const;
+  uint8_t getEffectiveImageRendering() const;
+  uint8_t getEffectiveParagraphAlignment() const;
+  bool getEffectiveTextAntiAliasing() const;
+  bool getEffectiveHyphenation() const;
+  bool getEffectiveGuideDots() const;
+  bool getEffectiveInlineFootnotePreviews() const;
+  int getEffectiveReaderFontId() const;
+  float getEffectiveReaderLineCompression() const;
+  bool stepPageState(bool isForwardTurn);
   void pageTurn(bool isForwardTurn);
+#if ENABLE_BENCHMARKS
+  void runRenderBenchmark();
+  std::string buildRenderBenchmarkReport(const LastRenderStats& startSnapshot, const BenchmarkAggregate& aggregate,
+                                         int forwardTurns, unsigned long forwardMs, int backwardTurns,
+                                         unsigned long backwardMs) const;
+#endif  // ENABLE_BENCHMARKS
 
   // Footnote navigation
   void navigateToHref(const std::string& href, bool savePosition = false);
@@ -81,6 +678,15 @@ class EpubReaderActivity final : public Activity {
   void loop() override;
   void render(RenderLock&& lock) override;
   bool isReaderActivity() const override { return true; }
-  ScreenshotInfo getScreenshotInfo() const override;
-  void onOrientationChanged(uint8_t orientation) override { applyOrientation(orientation); }
+  bool preventAutoSleep() override { return section && section->hasActiveBuild(); }
+  // A pending pre-render leaves the *next* page in the frame buffer; redraw the current page
+  // so a screenshot (or any raw frame-buffer capture) matches what the user sees.
+  void prepareFramebufferForCapture() override { restoreCurrentPageToBufferIfPreRendered(); }
+  bool shouldSkipPeriodicUpdate() const override;
+  void onButtonAction(CrossPointSettings::BUTTON_ACTION action) override;
+
+  // Renders the last saved page to the frame buffer without flushing to display.
+  // Used by SleepActivity to prepare the background for the overlay sleep mode.
+  // Returns false if the page cannot be loaded (missing cache / file error).
+  static bool drawCurrentPageToBuffer(const std::string& filePath, GfxRenderer& renderer);
 };

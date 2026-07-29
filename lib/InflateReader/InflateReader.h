@@ -44,12 +44,25 @@ class InflateReader {
   InflateReader(const InflateReader&) = delete;
   InflateReader& operator=(const InflateReader&) = delete;
 
-  // Initialise decompressor. streaming=true allocates a 32KB ring buffer needed
-  // when read() or readAtMost() will be called multiple times.
+  // Initialise decompressor. streaming=true allocates the back-reference ring buffer
+  // needed when read() or readAtMost() will be called multiple times.
+  // expectedOutputSize (streaming only): total uncompressed size of the stream when
+  // known, 0 when unknown. A deflate back-reference can never reach further back than
+  // the bytes produced so far, so the ring is sized min(32 KB, expectedOutputSize) —
+  // a 3 KB chapter then costs a 3 KB ring instead of 32 KB. Pass 0 for the full window.
   // Returns false only in streaming mode if the ring buffer allocation fails.
-  bool init(bool streaming = false);
+  bool init(bool streaming = false, size_t expectedOutputSize = 0);
 
-  // Release the ring buffer and reset internal state.
+  // Streaming init over a CALLER-OWNED ring buffer (e.g. carved from a build
+  // arena): no allocation here, no free in deinit(). ringSize should come from
+  // ringSizeFor() so the caller can budget before allocating.
+  bool initWithExternalRing(uint8_t* ring, size_t ringSize);
+
+  // Ring size init(true, expectedOutputSize) would allocate — lets an external
+  // allocator reserve exactly the right amount (min(32 KB, max(size, 512))).
+  static size_t ringSizeFor(size_t expectedOutputSize);
+
+  // Release the ring buffer (if owned) and reset internal state.
   void deinit();
 
   // Set the entire compressed input as a contiguous memory buffer.
@@ -63,11 +76,6 @@ class InflateReader {
   // Consume the 2-byte zlib header (CMF + FLG) from the input stream.
   // Call this once before the first read() when input is zlib-wrapped (e.g. PNG IDAT).
   void skipZlibHeader();
-
-  // Parse and consume the gzip header from the input stream via uzlib_gzip_parse_header().
-  // Call this once before read()/readAtMost() when input is a .dict.dz gzip file.
-  // Returns true if the header is valid, false if the stream is not a valid gzip file.
-  bool skipGzipHeader();
 
   // Decompress exactly len bytes into dest.
   // Returns false if the stream ends before producing len bytes, or on error.
@@ -87,4 +95,5 @@ class InflateReader {
  private:
   uzlib_uncomp decomp = {};
   uint8_t* ringBuffer = nullptr;
+  bool ownsRing_ = true;
 };

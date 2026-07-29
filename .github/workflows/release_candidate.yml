@@ -1,20 +1,25 @@
-name: Compile Release Candidate
+name: Publish Release Candidate
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - "release/**"
+
+permissions:
+  contents: write
 
 jobs:
   build-release-candidate:
-    if: startsWith(github.ref_name, 'release/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+          fetch-depth: 0
 
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.14'
+          python-version: "3.14"
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -25,23 +30,84 @@ jobs:
       - name: Install PlatformIO Core
         run: uv pip install --system -U https://github.com/pioarduino/platformio-core/archive/refs/tags/v6.1.19.zip
 
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
       - name: Extract env
         run: |
-          echo "SHORT_SHA=${GITHUB_SHA::7}" >> $GITHUB_ENV
-          echo "BRANCH_SUFFIX=${GITHUB_REF_NAME#release/}" >> $GITHUB_ENV
+          VERSION="$(python3 - <<'PY'
+          import configparser
 
-      - name: Build CrossPoint Release Candidate
+          config = configparser.ConfigParser()
+          config.read("platformio.ini")
+          version = config["crosspoint"]["version"].strip()
+          if version.count(".") == 1:
+              version = f"{version}.0"
+          print(version)
+          PY
+          )"
+
+          NEXT_RC="$(python3 - "$VERSION" <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          version = sys.argv[1]
+          pattern = re.compile(rf"^{re.escape(version)}-rc\.(\d+)(?:\.\d+)?$")
+
+          highest = 0
+          tags = subprocess.check_output(
+              ["git", "tag", "-l", f"{version}-rc.*"],
+              text=True,
+          )
+          for tag in tags.splitlines():
+              match = pattern.match(tag)
+              if match:
+                  highest = max(highest, int(match.group(1)))
+
+          print(highest + 1)
+          PY
+          )"
+
+          echo "RC_TAG=${VERSION}-rc.${NEXT_RC}" >> $GITHUB_ENV
+          echo "RELEASE_NOTES_PATH=${RUNNER_TEMP}/release-notes.md" >> $GITHUB_ENV
+
+      - name: Build Witch(hunt) Reader Release Candidate
         env:
-          CROSSPOINT_RC_HASH: ${{ env.SHORT_SHA }}
+          CROSSPOINT_RC_VERSION: ${{ env.RC_TAG }}
         run: pio run -e gh_release_rc
 
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+      - name: Patch min_chip_rev_full to 0
+        run: python3 scripts/patch_min_chip_rev.py .pio/build/gh_release_rc/firmware.bin
+
+      - name: Generate release notes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/generate_release_notes.py \
+            --output "${RELEASE_NOTES_PATH}" \
+            --target-sha "${GITHUB_SHA}" \
+            --current-label "${RC_TAG}" \
+            --release-scope any \
+            --exclude-tag "${RC_TAG}"
+
+      - name: Publish prerelease assets
+        if: ${{ env.ACT != 'true' }}
+        uses: softprops/action-gh-release@v2
         with:
-          name: CrossPoint-RC-${{ env.BRANCH_SUFFIX }}
-          path: |
+          tag_name: ${{ env.RC_TAG }}
+          target_commitish: ${{ github.sha }}
+          name: CrossPoint ${{ env.RC_TAG }}
+          body_path: ${{ env.RELEASE_NOTES_PATH }}
+          prerelease: true
+          files: |
             .pio/build/gh_release_rc/bootloader.bin
             .pio/build/gh_release_rc/firmware.bin
             .pio/build/gh_release_rc/firmware.elf
             .pio/build/gh_release_rc/firmware.map
             .pio/build/gh_release_rc/partitions.bin
+          fail_on_unmatched_files: true

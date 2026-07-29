@@ -1,5 +1,8 @@
 #include "Logging.h"
 
+#include <HalClock.h>
+
+#include <algorithm>
 #include <string>
 
 #define MAX_ENTRY_LEN 256
@@ -15,6 +18,14 @@ RTC_NOINIT_ATTR size_t logHead = 0;
 // never properly initialized.
 RTC_NOINIT_ATTR uint32_t rtcLogMagic;
 static constexpr uint32_t LOG_RTC_MAGIC = 0xDEADBEEF;
+
+// When true, LOG_* output is withheld from the serial wire (still ring-buffered).
+// Single writer (the active transfer activity) / single reader (logPrintf on the
+// loop task); a plain volatile bool is sufficient on the 32-bit C3.
+static volatile bool serialWireMuted = false;
+
+void setSerialWireMuted(bool muted) { serialWireMuted = muted; }
+bool isSerialWireMuted() { return serialWireMuted; }
 
 void addToLogRingBuffer(const char* message) {
   // Add the message to the ring buffer, overwriting old messages if necessary.
@@ -38,10 +49,17 @@ void logPrintf(const char* level, const char* origin, const char* format, ...) {
   va_start(args, format);
   char buf[MAX_ENTRY_LEN];
   char* c = buf;
-  // add timestamp, level and origin
+  // add timestamp, wall clock, level and origin
   {
     unsigned long ms = millis();
-    int len = snprintf(c, sizeof(buf), "[%lu] [%s] [%s] ", ms, level, origin);
+    char wallClock[12];
+    HalClock::formatLogTime(wallClock, sizeof(wallClock));
+    int len;
+    if (wallClock[0] != '\0') {
+      len = snprintf(c, sizeof(buf), "[%lu %s] [%s] [%s] ", ms, wallClock, level, origin);
+    } else {
+      len = snprintf(c, sizeof(buf), "[%lu] [%s] [%s] ", ms, level, origin);
+    }
     // error while writing => return
     if (len < 0) {
       va_end(args);
@@ -59,7 +77,7 @@ void logPrintf(const char* level, const char* origin, const char* format, ...) {
     }
   }
   va_end(args);
-  if (logSerial) {
+  if (logSerial && !serialWireMuted) {
     logSerial.print(buf);
   }
   addToLogRingBuffer(buf);

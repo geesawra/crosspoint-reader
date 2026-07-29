@@ -7,6 +7,7 @@
 #include <Wire.h>
 #include <freertos/semphr.h>
 
+#include <atomic>
 #include <cassert>
 
 #include "HalGPIO.h"
@@ -20,12 +21,23 @@ class HalPowerManager {
 
   // I2C fuel gauge configuration for X3 battery monitoring
   bool _batteryUseI2C = false;                   // True if using I2C fuel gauge (X3), false for ADC (X4)
-  mutable int _batteryCachedPercent = 0;         // Last read battery percentage (0-100)
+  mutable int _batteryCachedPercent = 0;         // Last read battery percentage — X3: 0-100, X4: 0-1000 (scaled)
+  mutable bool _batterySeeded = false;           // True once the smoothing filter has a first real sample (X4)
   mutable unsigned long _batteryLastPollMs = 0;  // Timestamp of last battery read in milliseconds
 
   enum LockMode { None, NormalSpeed };
-  LockMode currentLockMode = None;
-  SemaphoreHandle_t modeMutex = nullptr;  // Protect access to currentLockMode
+  std::atomic<LockMode> currentLockMode{None};
+  SemaphoreHandle_t modeMutex = nullptr;  // Protect Lock acquire/release ordering
+  // Task that holds the current NormalSpeed lock (nullptr when none). Guarded by
+  // modeMutex. Needed by enterWaveformWait(): the render task holds a Lock for
+  // the whole render() pass, and the waveform wait happens inside it — the
+  // downclock is safe when the lock holder IS the waiting task (its code only
+  // resumes after exitWaveformWait() restores the clock), but not when another
+  // task holds the lock and keeps running.
+  TaskHandle_t lockOwnerTask_ = nullptr;
+  // True while the CPU clock is dropped for an e-ink waveform wait (see
+  // enterWaveformWait / exitWaveformWait). Guarded by modeMutex.
+  bool waveformLowPower_ = false;
 
  public:
   static constexpr int LOW_POWER_FREQ = 10;                    // MHz
@@ -37,9 +49,24 @@ class HalPowerManager {
   // Control CPU frequency for power saving
   void setPowerSaving(bool enabled);
 
-  // Setup wake up GPIO and enter deep sleep
-  // Should be called inside main loop() to handle the currentLockMode
-  void startDeepSleep(HalGPIO& gpio) const;
+  // Waveform-wait power hooks, installed on the display driver by HalDisplay:
+  // drop the CPU clock while the render task sleeps on the e-ink BUSY-ISR
+  // semaphore (nothing can run during the waveform — background work gates on
+  // isRefreshPending()/the render lock), restore it before the post-waveform
+  // SPI work. enterWaveformWait() is a no-op when WiFi is active, a
+  // NormalSpeed lock is held by ANOTHER task, or the CPU is already in idle
+  // low-power mode. The render task's own per-render Lock does not block it:
+  // that holder is the waiting task itself and only resumes after the clock
+  // is restored. Runs on the render task; tolerant of the loop task's
+  // concurrent setPowerSaving() calls (same relaxed model as setPowerSaving).
+  void enterWaveformWait();
+  void exitWaveformWait();
+
+  // Setup wake up GPIO and enter deep sleep.
+  // When keepClockAlive is true, GPIO13 stays HIGH so the LP timer keeps
+  // running during sleep (~3-4 mA extra).  This allows HalClock to compute
+  // elapsed sleep time and restore the wall clock accurately on wake.
+  void startDeepSleep(HalGPIO& gpio, bool keepClockAlive = false) const;
 
   // Get battery percentage (range 0-100)
   uint16_t getBatteryPercentage() const;

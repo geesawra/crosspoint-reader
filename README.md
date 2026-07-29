@@ -1,344 +1,182 @@
-# CrossPoint Reader
-
-> [!TIP]
-> This is my own personal fork of CrossPoint - I may have removed features that you rely upon, so please double-check.
-> There are several missing features, broken bones, and lots of LLM-assisted development.
-> It may or may not follow upstream, use at your risk.
-
-Firmware for the **Xteink X4** e-paper display reader (unaffiliated with Xteink).
-Built using **PlatformIO** and targeting the **ESP32-C3** microcontroller.
-
-[![Fund contributors](https://img.shields.io/badge/%F0%9F%91%91_Fund_contributors-royalty.dev-BB953A?style=for-the-badge&labelColor=1a1a1a)](https://app.royalty.dev/crosspoint-reader/crosspoint-reader)
-
-CrossPoint is open-source e-reader firmware - community-built, fully hackable, free forever. It's maintained by a growing community of developers and readers who believe your device should do what you want - not what a manufacturer decided for you.
-
-**Now running on:** ESP32C3-based Xteink [X4](https://www.xteink.com/products/xteink-x4) and [X3](https://www.xteink.com/products/xteink-x3).
-
-![CrossPoint Reader running on Xteink device](./docs/images/cover.jpg)
-
-## What can CrossPoint do?
-
-- **Reader engine**: EPUB 2/3 rendering with embedded-style option, image handling, hyphenation, kerning, chapter navigation, footnotes, go-to-percent, auto page turn, orientation control, focus reading, KOReader progress sync and more. 
-
-- **Various formats**: native handling for `.epub`, `.xtc/.xtch`, `.txt`, and `.bmp`.
-
-- **Screenshots.**
-
-- **Custom fonts**: install your favorite fonts on the SD card.
-
-- **Tilt page turn (X3 only)**.
-
-- **Read-it-Later** (fork-specific): Instapaper-backed reading list — browse, read, star, archive, and bulk-download saved articles as EPUBs.
-
-- **Library workflow**: folder browser, hidden-file toggle, long-press delete, recent books, SD-cache management.
-
-- **Wireless workflows**:
-  
-  - File transfer web UI
-  - EPUB Optimizer
-  - Web settings UI/API (edit many device settings from browser)
-  - WebSocket fast uploads
-  - WebDAV handler
-  - AP mode (hotspot) and STA mode (join existing WiFi), both with QR helpers
-  - Calibre wireless connect flow
-  - OPDS browser with saved servers (up to 8), search, pagination, and direct download
-  - OTA update checks and installs from GitHub releases
-
-- **Customization**: multiple themes (Classic, Lyra, Lyra Extended, RoundedRaff), sleep screen modes, front/side button remapping, status bar controls, power-button behavior, refresh cadence, and more.
-
-- **Localization**: 22 UI languages and counting.
-
-### Coming soon:
-
-- RTL support — Arabic, Hebrew, and Farsi.
-
-- Bookmarks.
-
-- Dictionary lookup — inline word lookup without leaving the reader.
-
-- More themes.
-
-- Much more! stay tuned.
-
----
-
-## Fork additions
-
-This repository is a **fork** of the original [CrossPoint Reader](https://github.com/crosspoint-reader/crosspoint-reader) project.
-The sections below summarise what this fork adds or changes compared to upstream.
-
-### Added features (not in upstream)
-
-| Feature | Description |
-|---------|-------------|
-| **Auto-rotate (X3 only)** | Automatic screen orientation detection via the QMI8658 accelerometer. Rotates the reader in real time when the device is turned, with a 500 ms debounce. Position is preserved across rotations via percentage-based remapping. |
-| **Instapaper / Read-it-Later** | Full Instapaper integration — browse, read, star, archive, and bulk-download your saved articles as EPUBs. Built on a generic multi-provider framework for future services. |
-| **CSS lazy-loading** | CSS rules are loaded on-demand from an indexed SD cache instead of all-at-once, reducing peak RAM usage during EPUB rendering. |
-| **"Both Forward" side button layout** | New side-button arrangement where both the front and back buttons advance the page forward. |
-| **Bookerly font** | Bookerly is retained as a reader font. Upstream replaced it with Noto Serif for licensing reasons; this fork restores it and removes OpenDyslexic instead. |
-| **Smart WiFi auto-connect** | When connecting to WiFi, scans for available networks first and auto-connects to the strongest saved network in range — not just the last-used one. From Settings you see the full scan list so you can always override. |
-| **Custom wallpaper script** | `convert_wallpaper.py` to prepare personal sleep-screen images. |
-| **Crash dump decoder** | `decode_crash.py` to translate raw ESP32-C3 crash logs into readable stack traces. |
-
-### Notable fixes (not in upstream)
-
-* Prevents sticky full-refresh after text-only page OOM in the reader.
-* Resets `pagesUntilFullRefresh` counter when entering a book.
-* Streams images into the EPUB ZIP incrementally to avoid OOM on Instapaper articles with many images.
-* Raises the per-image download size cap from 150 KiB to 512 KiB.
-* Caps per-side horizontal CSS inset at 2 em to prevent excessive paragraph indentation.
-
-### Read-it-Later setup
-
-CrossPoint includes a generic **Read-it-Later** framework that can sync saved
-articles from multiple services. Currently **Instapaper** is supported out of
-the box; additional providers can be added in the future.
-
-#### Instapaper
-
-CrossPoint reads your Instapaper bookmarks using the
-[Full API](https://www.instapaper.com/api/full), so you first need an OAuth consumer
-token — apply at [instapaper.com/developers/applications/create](https://www.instapaper.com/developers/applications/create).
-
-Once you have a consumer key and secret, run the helper script on your
-computer to exchange your account credentials for a persistent access token
-pair:
-
-```sh
-python3 scripts/instapaper_auth.py \
-    --consumer-key   YOUR_CONSUMER_KEY \
-    --consumer-secret YOUR_CONSUMER_SECRET \
-    --username        you@example.com
-# password is prompted interactively
-```
-
-Copy the resulting `instapaper.txt` to your SD card at
-`/.crosspoint/instapaper.txt`. From the home screen, select
-**Read-it-Later** → **Instapaper** to browse your Unread, Starred and Archive
-folders. Opened articles are cached on the SD card and can be re-read offline.
-
-### Additional tools
-
-* `scripts/convert_wallpaper.py` — Convert and resize images to custom sleep-screen wallpapers.
-* `scripts/instapaper_auth.py` — Exchange your Instapaper username/password for persistent OAuth tokens.
-* `tools/decode_crash.py` — Decode ESP32-C3 crash dumps into human-readable stack traces.
-
----
-
-## USB-locked devices (Xteink Unlocker)
-
-Some Xteink units purchased from third-party stores (e.g. AliExpress) ship with USB flashing locked from the factory.
-If your device is locked, you will need to use the **Xteink Unlocker** tool available at
-https://crosspointreader.com/#unlock-tool before you can flash CrossPoint.
-
-**You do not need this tool if you bought your device directly from xteink.com.** Those units are not locked.
-
-**Not sure if your device is locked?** Power it on, connect the USB-C cable, and try flashing via the web flasher first (see
-[Install firmware](#install-firmware) below). If the browser's serial device picker does not show your device, try a different
-USB port or browser before assuming the device is locked. Only reach for the unlocker if the device still doesn't appear.
-
-> ### ⚠️ WARNING: READ THIS BEFORE USING THE UNLOCKER ⚠️
-> 
-> **The only officially supported firmwares in the unlock tool are CrossPoint and CrossInk.**
-> 
-> Flashing any other firmware on a USB-locked device may **permanently brick the device** or leave it **permanently
-> stuck on that firmware with no recovery path**. Once USB flashing is re-locked, your only way back is via OTA, and if
-> the firmware you flashed doesn't support OTA, **there is no way out**.
-> 
-> **The Papyrix fork has removed OTA update support from its code.** If you flash Papyrix onto a
-> USB-locked unit, you will have **zero update or recovery path** and will be stuck on it forever. **Do not flash
-> Papyrix (or any other unsupported firmware) on a locked device.**
-
-## Install firmware
-
-### Web installer (recommended)
-
-1. Connect your device to your computer via USB-C and wake/unlock the device
-2. Go to https://crosspointreader.com/#flash-tools, select device (X3 or X4), and choose an official CrossPoint release.
-
-### Web installer (specific version)
-
-1. Connect your device to your computer via USB-C and wake/unlock the device
-2. Download a `firmware.bin` from [Releases](https://github.com/crosspoint-reader/crosspoint-reader/releases), local build, or continuous integration artifact.
-3. Go to https://crosspointreader.com/#flash-tools, select device (X3 or X4), click "Custom .bin" and upload a `firmware.bin`.
-
-### Revert to Official Firmware
-
-To revert to the official firmware, you can also flash the latest official firmware using https://crosspointreader.com/#flash-tools.
-
-### Command line
-
-1. Install [`esptool`](https://github.com/espressif/esptool):
-
-```bash
-pip install esptool
-```
-
-2. Download `firmware.bin` from the [releases page](https://github.com/crosspoint-reader/crosspoint-reader/releases).
-3. Connect your device via USB-C.
-4. Find the device port. On Linux, run `dmesg` after connecting. On macOS:
-
-```bash
-log stream --predicate 'subsystem == "com.apple.iokit"' --info
-```
-
-5. Flash:
-
-```bash
-esptool.py --chip esp32c3 --port /dev/ttyACM0 --baud 921600 write_flash 0x10000 /path/to/firmware.bin
-```
-
-Adjust `/dev/ttyACM0` to match your system.
-
-### Manual
-
-See [Development quick start](#development-quick-start) below.
-
----
-
-## Custom SD-card fonts
-
-Convert your own TTF/OTF files into `.cpfont` files that load from the SD card. No firmware reflash is needed.
-
-1. Go to https://crosspointreader.com/fonts and open the "SD-card font builder" form.
-2. Upload up to four styles (regular, bold, italic, bold-italic), set the family name, point sizes, and Unicode range.
-3. Download the generated `.cpfont` files.
-4. Copy them to your SD card under `/fonts/YourFont/` (or `/.fonts/YourFont/` to hide the folder).
-5. Select the font on the device from the font settings.
-
-Conversion runs the firmware repo's `lib/EpdFont/scripts/fontconvert_sdcard.py` script unmodified, so output matches a local host build.
-
----
-
-## Documentation
-
-- [User Guide](./USER_GUIDE.md)
-- [Web server usage](./docs/webserver.md)
-- [Web server endpoints](./docs/webserver-endpoints.md)
-- [Project scope](./SCOPE.md)
-- [Contributing docs](./docs/contributing/README.md)
-
----
-
-## Development quick start
-
-### Prerequisites
-
-- [pioarduino](https://github.com/pioarduino/pioarduino) or VS Code + pioarduino plugin
-- Python 3.8+
-- `clang-format` 21
-- USB-C cable supporting data transfer
-
-### Setup
-
-```bash
-git clone --recursive https://github.com/crosspoint-reader/crosspoint-reader
-cd crosspoint-reader
-
-# if cloned without --recursive:
-git submodule update --init --recursive
-```
-
-### Build / flash / monitor
-
-```bash
-pio run --target upload
-```
-
-### Contributor pre-PR checks
-
-```bash
-./bin/clang-format-fix
-pio check -e default
-pio run -e default
-```
-
-### Debugging
-
-After flashing the new features, it’s recommended to capture detailed logs from the serial port.
-
-First, make sure all required Python packages are installed:
-
-```python
-python3 -m pip install pyserial colorama matplotlib
-```
-
-After that run the script:
-
-```sh
-# For Linux
-# This was tested on Debian and should work on most Linux systems.
-python3 scripts/debugging_monitor.py
-
-# For macOS
-python3 scripts/debugging_monitor.py /dev/cu.usbmodem2101
-```
-
-Minor adjustments may be required for Windows.
-
----
-
-## Internals
-
-CrossPoint Reader is pretty aggressive about caching data down to the SD card to minimise RAM usage. The ESP32-C3 only has ~380KB of usable RAM, so we have to be careful. A lot of the decisions made in the design of the firmware were based on this constraint.
-
-### Data caching
-
-The first time chapters of a book are loaded, they are cached to the SD card. Subsequent loads are served from the 
-cache. This cache directory exists at `.crosspoint` on the SD card. The structure is as follows:
-
-```text
-.crosspoint/
-├── epub_<hash>/         # one directory per book, named by content hash
-│   ├── progress.bin     # reading position (chapter, page, etc.)
-│   ├── cover.bmp        # generated cover image
-│   ├── book.bin         # metadata: title, author, spine, TOC
-│   └── sections/        # per-chapter layout cache
-│       ├── 0.bin
-│       ├── 1.bin
-│       └── ...
-```
-
-Removing `/.crosspoint` clears all cached metadata and forces a full regeneration on next open. Note: the cache isn't cleared automatically when you delete a book, and moving a file to a new path resets its reading progress.
-
-For more details on the internal file structures, see the [file formats document](./docs/file-formats.md).
-
----
-
-## Contributing
-
-Contributions are welcome. If you're new to the codebase, start with the [contributing docs](./docs/contributing/README.md). For things to work on, check the [ideas discussion board](https://github.com/crosspoint-reader/crosspoint-reader/discussions/categories/ideas) — leave a comment before starting so we don't duplicate effort.
-
-Everyone here is a volunteer, so please be respectful and patient. For governance and community expectations, see [GOVERNANCE.md](./GOVERNANCE.md).
-
----
-
-## Community forks
-
-One of the best things about open source is that anyone can take the code in a different direction. If you need something outside CrossPoint's [scope](./SCOPE.md), check out the community forks:
-
-- [CrossInk](https://github.com/uxjulia/CrossInk) — Typography and reading tracking: Bionic Reading (bolds word stems to create fixation points), guide dots between words, improved paragraph indents, and replaces the default fonts with ChareInk/Lexend/Bitter.
-
-- [papyrix-reader](https://github.com/bigbag/papyrix-reader) — Adds FB2 and MD format support. Actively maintained with Arabic script support. Custom themes via SD card.
-
-- [crosspet](https://github.com/trilwu/crosspet) — A Vietnamese fork that adds a Tamagotchi-style virtual chicken that grows based on your reading milestones (pages read, streaks, care). Also: Flashcards, Weather, Pomodoro timer, and mini-games.
-
-- [crosspoint-reader (jpirnay)](https://github.com/jpirnay/crosspoint-reader) — Faster integration of functionality. Tracks upstream PRs and integrates the good ones ahead of the official merge.
-
-- [crosspoint-reader-cjk](https://github.com/aBER0724/crosspoint-reader-cjk) — Purpose-built for Chinese, Japanese, and Korean reading.
-
-- [inx](https://github.com/obijuankenobiii/inx) — Completely reimagines the user interface with tabbed navigation.
-
-- ~~[PlusPoint](https://github.com/ngxson/pluspoint-reader) — custom JS apps support.~~ (Unmaintained)
-
-- [crosspoint-reader-papers3](https://github.com/juicecultus/crosspoint-reader-papers3) — Crosspoint port for M5Stack Paper S3. 
-
-**Note:** Many of these features will make their way into CrossPoint over time. We maintain a slower pace to ensure rock-solid stability and squash bugs before they reach your device.
-
-Want to build your own device? Be sure to check out the [de-link](https://github.com/iandchasse/de-link) project.
-
----
-
-CrossPoint Reader is **not affiliated with Xteink or any device manufacturer**.
-
-Huge shoutout to [diy-esp32-epub-reader](https://github.com/atomic14/diy-esp32-epub-reader), which inspired this project.
+# Witch(hunt) Reader
+
+This firmware is based on the [crosspoint-reader](https://github.com/crosspoint-reader/crosspoint-reader) for the XTEINK X3/X4, a great piece of software by Dave Allie and others.
+
+
+# What this reader does differently
+- Speed - rendering should be *fast*
+- CSS layout - a lot of effort have gone into rendering 
+- Memory - where others fail Witch Reader still works
+- Proper KOReader Snychronisation
+- Additional sleep screens support (information overlay, transparent pictures over current reader screen)
+- Clock-Support for X4 and X3
+- Weather information panel
+- Multiple under-the-hood performance improvements
+- Book information screen
+- Markdown-support
+- WiFi captive portal support
+- Supporting ~~strikethrough~~, superscript / subscript and tables
+- Support for used defined actions on double-click / long-click per button 
+- Background preprocessing of sections, so hopefully you will see fewer of the infamous "Indexing" messages
+- A lot of smaller quality of life improvements 
+
+# What this reader doesn't
+* Great UI design is not necessarily/obviously not a forte of mine, so if you look for a polished look and feel, I would recommend going e.g. to [CrossInk](https://github.com/uxjulia/crossink), a great piece of work by uxJulia
+* Support for CJK (Chinese Japanese Korean) - look at https://github.com/aBER0724/crosspoint-reader-cjk
+* Right-to-left rendering support (Hebrew, Arabic) - choose the original [CrossPoint](https://github.com/crosspoint-reader/crosspoint-reader) firmware
+* The most memory efficient reader might still be [MicroReader](https://github.com/CidVonHighwind/microreader) by CidVonHighwind
+
+All of them have their strengths and constraints (as has Witch reader), so they deserve a testrun before you decide which one is right for you
+
+
+# Feature comparison with CrossPoint
+
+A feature-by-feature comparison of **Witch Reader** against its ancestor,
+**[CrossPoint Reader](https://github.com/crosspoint-reader/crosspoint-reader)**, focused on what
+a user actually sees and does on the device.
+
+> **Snapshot of 2026-06-19.** Both projects are under active and dynamic development, so individual
+> rows may change quickly — treat this as a point-in-time picture rather than a guarantee. The
+> entries were verified against the current source of both projects rather than commit history,
+> since the two have effectively diverged.
+
+Legend: ✅ supported · ⚠️ partial / basic · ❌ not supported.
+
+## Rendering & Typography
+
+| Feature | Witch Reader | CrossPoint |
+| --- | :---: | :---: |
+| Floating images / text wrap around figures | ✅ left/right float, text wraps beside figure | ❌ falls back to block placement |
+| Tables | ✅ real grid (colspan, header cells, multi-column) | ⚠️ flattened to text ("Row X, Cell Y:") |
+| Images inside tables | ✅ | ❌ |
+| Small-caps (`font-variant`) | ✅ | ❌ |
+| Strikethrough (`line-through`) | ✅ rendered | ❌ parsed but never drawn |
+| Superscript / subscript | ✅ | ✅ |
+| Underline | ✅ | ✅ |
+| CSS `line-height` | ✅ | ❌ |
+| CSS `font-size` scaling (em/rem/%) | ✅ | ❌ |
+| CSS margin collapsing | ✅ proper collapsing | ✅ proper collapsing |
+| GIF images | ✅ custom decoder | ❌ JPEG + PNG only |
+| JPEG / PNG decode | ✅ TJpgDec (IRAM) + uzlib PNG | ✅ JPEGDEC + PNGdec |
+| Large-image placeholders & tall-image cropping | ✅ | ❌ |
+| Grayscale image caches | ✅ | ⚠️ minimal |
+| Heading fonts (h1–h3) | ✅ crisp taller real fonts | ⚠️ single font size per block |
+| Horizontal rules | ✅ | ✅ |
+| Hyphenation (9 languages) | ✅ | ✅ |
+| Bionic / focus reading | ✅ | ✅ |
+| Anti-aliasing toggle | ✅ (+ fast AA, max-darkness mode) | ✅ |
+| Markdown (`.md`) rendering | ✅ headings, tables, HR, code, lists, TOC | ❌ shown as raw plain text |
+| **Right-to-left / BiDi (Hebrew, Arabic)** | ❌ **not supported** | ✅ full BiDi + Hebrew font + CSS `direction` |
+| Drop caps | ❌ | ❌ |
+
+## Reading Experience, Library & Navigation
+
+| Feature | Witch Reader | CrossPoint |
+| --- | :---: | :---: |
+| Background prerendering | ✅  | ❌ |
+| Background indexing | ✅ (up to 3 sections ahead during reading pauses, not obstructing the reading experience) | ⚠️ (next section during the last 5 pages, partially blocking the reader) |
+| Custom fonts | ✅  | ✅ |
+| Sizes per font family | 4 | 3 |
+| SD font rendering | ✅ on-demand glyph from memory | ⚠️ on demand-glyph from SD-card |  
+| File browser sorting (name / date / size / type, asc/desc) | ✅ | ❌ name-only, fixed |
+| File context menu (open, mark-read, info, set sleep screen, flash `.bin`…) | ✅ | ❌ open / delete only |
+| Large-folder handling (SD-backed index, bounded RAM) | ✅ | ❌ all in RAM |
+| Cover carousel home view | ✅ | ❌ |
+| Cover-grid Recent Books view | ✅ | ❌ plain text list |
+| Book Info screen (metadata, cover, paged description) | ✅ | ❌ |
+| Global (cross-book) bookmarks | ✅ jump into any book at a page | ❌ |
+| Named starred pages | ✅ custom names | ⚠️ unnamed progress snapshots |
+| Reading statistics (streaks, time, pages/min, per-book ETA, sparkline) | ✅ | ❌ |
+| Interactive "finished book" flow (open next, series detection, move folder) | ✅ | ⚠️ passive screen |
+| Jump to printed page | ✅ | ❌ |
+| Jump to percent | ✅ | ✅ |
+| Quick per-book overrides while reading (font, images, hyphenation, bionic…) | ✅ | ❌ |
+| Footnotes | ✅ richer navigation, inline expansion | ✅ |
+| TOC / chapter selection | ✅ | ✅ |
+| Browser breadcrumb footer + continuous page-jump | ❌ dropped | ✅ |
+
+## System, Settings, Network & Input
+
+| Feature | Witch Reader | CrossPoint |
+| --- | :---: | :---: |
+| Clock on X4 | ✅ software clock (X3 **and** X4) | ❌ X3 only (DS3231 hardware RTC) |
+| Weather panel (Open-Meteo, forecast, 48h graph) | ✅ from Home menu | ❌ |
+| Timezone auto-detect (IP geolocation + DST) | ✅ | ⚠️ l offset picker |
+| Time sync (NTP) | ✅ | ✅ (X3) |
+| Sleep screens: transparent overlay over reader page | ✅ | ❌ |
+| Sleep screens: PNG with alpha | ✅ | ❌ BMP only |
+| Sleep screens: info overlay (title/chapter/page/percent) | ✅ | ❌ |
+| Sleep screens: sequential image pick | ✅ | ⚠️ random only |
+| KOReader sync | ✅ auto bidirectional, on-device settings, differential refresh | ⚠️ proper sync + automatic resolution, no on-device registration |
+| Per-button custom actions (23 actions × short/double/long) | ✅ + overview screen | ❌ physical remap + a few toggles |
+| Captive-portal login (client detect + QR to authorize) | ✅ | ❌ AP-side only |
+| System information screen | ✅ | ❌ |
+| OTA / SD firmware update | ✅ | ✅ |
+| Categorized settings submenus | ✅ | ⚠️ flat list |
+| OPDS / Calibre / web upload | ✅ (+ format badges, signal widget, streaming) | ✅ |
+| USB file transfer (serial protocol, Calibre plugin, `serial_cmd.py`) | ✅ wire-compatible with MicroReader | ❌ |
+| USB file manager plugin (Total/Double Commander WFX, [x4-filemanager-plugin](https://github.com/jpirnay/x4-filemanager-plugin)) | ✅ | ❌ |
+| Memory management | ✅ lean libraries, more on demand memory | ⚠️ limited memory management |
+
+## At a glance
+
+**Choose Witch Reader for:** speed, richer CSS and typography (floats, real tables, small-caps,
+strikethrough, line-height), GIF and better image handling, Markdown, a weather panel, a clock on
+the X4, reading statistics, global bookmarks, a cover carousel, fully customizable per-button
+gestures, automatic KOReader sync, and a deeper settings/system surface.
+
+**Choose CrossPoint for:** right-to-left languages (Hebrew / Arabic) — the one user-facing
+capability Witch Reader genuinely lacks — plus  a
+couple of small browser-navigation conveniences. It is also the leaner, simpler codebase.
+
+# Rendering comparisons
+Rendering examples from [Alice in Wonderland](https://www.gutenberg.org/ebooks/28885)
+| Item 	|Witch Reader |	Micro Reader 1) 2) | CrossPoint |	Stock |
+| --- | --- | --- | --- | --- |
+| Floating images 1 | <img src="docs/images/comparison/01_leftfig.png">  | <img src="docs/images/comparison/01_leftfig_mr.png"> | <img src="docs/images/comparison/01_leftfig_cpr.png">   |    |
+| Floating images 2 | <img src="docs/images/comparison/02_rightfig.png">  | <img src="docs/images/comparison/02_rightfig_mr.png">   | <img src="docs/images/comparison/02_rightfig_cpr.png">   |    |
+| CSS Rendering | <img src="docs/images/comparison/03_render.png"> <br> <img width="480" height="800" alt="screen" src="https://github.com/user-attachments/assets/ee11c062-b3cf-4543-8954-7e45f77ba772" /> | <img src="docs/images/comparison/03_render_mr.png">  | <img src="docs/images/comparison/03_render_cpr.png"> |    |
+| Graphics | <img src="docs/images/comparison/04_graphic.png">  | <img src="docs/images/comparison/04_graphic_mr.png">  | <img src="docs/images/comparison/04_graphic_cpr.png">  |    |
+| Images in tables | <img src="docs/images/comparison/05_tablegraphic.png">  | <img src="docs/images/comparison/05_tablegraphic_mr.png">  | <img src="docs/images/comparison/05_tablegraphic_cpr.png">  |    |
+
+1) Apologies for the poor image quality of the microreader screenshots, i needed to make photos with my mobile, as I couldn't figure out how to create screenshots from within the reader
+   
+2) The Rendering of the Mouse poem in MicroReader is even more refined, it manages to deal with different font sizes, too
+
+# Attributions
+If in doubt consider all the work being done here based on the work of others - especially crosspoint reader (as the ancestor of this version) and microreader have been a great source of inspiration.
+
+## Project ancestry & inspiration
+- **crosspoint-reader** by Dave Allie and others — the direct ancestor this firmware is forked from. https://github.com/crosspoint-reader/crosspoint-reader (MIT).
+- **MicroReader** by CidVonHighwind — a source of inspiration, and still the most memory-efficient reader for the X4. https://github.com/CidVonHighwind/microreader
+  - The **USB serial file transfer** feature ([`lib/SerialTransfer`](lib/SerialTransfer), `SerialTransferActivity`) is a clean-room, wire-compatible reimplementation of MicroReader's serial protocol — independently written from its `tools/serial_cmd.py`, with no firmware code copied — so MicroReader's host tools (its Calibre device plugin and `serial_cmd.py`) work against this firmware too. Full credit to CidVonHighwind for the original protocol and host tooling.
+- **FreeInk SDK** - the shared X3/X4 hardware/display/utility libraries, included as a submodule. https://github.com/Free-Ink/freeink-sdk (to which we contributed our buffer memory management, the split display update cycle and some other goodies we previously had in our own sdk, see below)
+- **CrossPoint XDK** (No longer used, but ancestry) — the shared X3/X4 hardware/display/utility libraries, included as a submodule. https://github.com/jpirnay/crosspoint-xdk (modified fork of https://github.com/crosspoint-reader/community-sdk ).
+
+## Vendored third-party components (`lib/`)
+These are bundled directly in the repository. Each retains its upstream copyright header in source.
+
+- **TJpgDec — Tiny JPEG Decompressor** by ChaN (R0.03) — baseline-JPEG decode engine for the EPUB image path. http://elm-chan.org/fsw/tjpgd/ — Copyright (C) 2021 ChaN, BSD-1-Clause. Vendored under [`lib/TJpgDec`](lib/TJpgDec); modified from upstream in `tjpgdcnf.h` (config + the `JD_FASTPATH` IRAM macro) and `tjpgd.c` (the `JD_FASTPATH` annotations on the hot decode functions, plus a `BYTECLIP` clamp on the grayscale output path fixing an upstream wrap-around bug — black speckle in high-contrast covers when `JD_FASTDECODE≥1`); `tjpgd.h` is verbatim.
+- **yxml** by Yoran Heling — the XML/HTML SAX parser backend (`SaxParser`), used by the EPUB and OPDS parsers. https://dev.yorhel.nl/yxml — Copyright (c) 2013-2014 Yoran Heling, MIT. Vendored under [`lib/SaxParser`](lib/SaxParser).
+- **uzlib** by Joergen Ibsen and Paul Sokolovsky — tiny DEFLATE/inflate, used for ZIP/EPUB extraction and PNG inflate. https://github.com/pfalcon/uzlib — Copyright (c) 2003 Joergen Ibsen, (c) 2014-2018 Paul Sokolovsky, zlib license. Vendored under [`lib/uzlib`](lib/uzlib).
+- **QR-Code-generator (qrcodegen)** by Project Nayuki — QR code generation. https://github.com/nayuki/QR-Code-generator — Copyright (c) Project Nayuki, MIT. Vendored under [`lib/QRCode`](lib/QRCode).
+
+## External libraries (PlatformIO `lib_deps`)
+Pulled from the PlatformIO registry at build time.
+
+- **ArduinoJson** by Benoît Blanchon — JSON parsing/serialization. https://github.com/bblanchon/ArduinoJson — MIT.
+- **arduinoWebSockets** by Markus Sattler — WebSocket client (KOReader sync). https://github.com/Links2004/arduinoWebSockets — LGPL-2.1.
+
+# Why this name
+Originally this fork was called CrossPoint++ - it had a small userbase and then I made an honest mistake by reusing the crosspoint fork, providing ample reference in the PRs and the release notes of code origin and authorship but was losing the github commit author information in the progress when I copied code over instead of taking the tedious (and correct) way of cherrypicking the original commit and post-cleanup effort.
+
+Another crosspoint developer approached me pointing this flaw out and I agreed to change the future integration work. What I did not care for was that persons attitude and way of communicating, and I told him so.
+
+Then all hell broke lose, ending up in insults, harassment and plain lies in other forums without even caring for feedback (a good cause for any lawsuit for slander). So I took the repo down and just continued the development for my own benefit.
+
+Still I wanted others to benefit from my progress, so here we are again:
+
+Witch(hunt) Reader (name for obvious reasons) 
+
+- So if you are one of those who felt poorly appreciated: please accept my apologies, that was never my intent, and I have taken a lot of effort to replace code / to properly attribute the origin of code or ideas
+- If you are one of those who felt the need to raise a witchhunt, to lie, to libel: just go away - trolls aren't welcome here or more clearly: F*** OFF

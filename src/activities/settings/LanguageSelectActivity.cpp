@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <iterator>
 
-#include "CrossPointSettings.h"
 #include "I18nKeys.h"
 #include "MappedInputManager.h"
 #include "fontIds.h"
@@ -37,40 +36,16 @@ void LanguageSelectActivity::loop() {
     return;
   }
 
-  const int pageItems = UITheme::getNumberOfItemsPerPage(renderer, true, false, true, false);
-
   // Handle navigation
-  buttonNavigator.onNextRelease([this] {
-    selectedIndex = ButtonNavigator::nextIndex(static_cast<int>(selectedIndex), totalItems);
-    requestUpdate();
-  });
-
-  buttonNavigator.onPreviousRelease([this] {
-    selectedIndex = ButtonNavigator::previousIndex(static_cast<int>(selectedIndex), totalItems);
-    requestUpdate();
-  });
-
-  buttonNavigator.onNextContinuous([this, pageItems] {
-    selectedIndex = ButtonNavigator::nextPageIndex(static_cast<int>(selectedIndex), totalItems, pageItems);
-    requestUpdate();
-  });
-
-  buttonNavigator.onPreviousContinuous([this, pageItems] {
-    selectedIndex = ButtonNavigator::previousPageIndex(static_cast<int>(selectedIndex), totalItems, pageItems);
-    requestUpdate();
-  });
+  buttonNavigator.onNextList(selectedIndex, totalItems, [this] { requestUpdate(); });
+  buttonNavigator.onPreviousList(selectedIndex, totalItems, [this] { requestUpdate(); });
 }
 
 void LanguageSelectActivity::handleSelection() {
-  const uint8_t langIndex = SORTED_LANGUAGE_INDICES[selectedIndex];
-
   {
     RenderLock lock(*this);
-    I18N.setLanguage(static_cast<Language>(langIndex));
+    I18N.setLanguage(static_cast<Language>(SORTED_LANGUAGE_INDICES[selectedIndex]));
   }
-
-  SETTINGS.language = langIndex;
-  SETTINGS.saveToFile();
 
   // Return to previous page
   onBack();
@@ -79,18 +54,18 @@ void LanguageSelectActivity::handleSelection() {
 void LanguageSelectActivity::render(RenderLock&&) {
   renderer.clearScreen();
 
-  const auto pageWidth = renderer.getScreenWidth();
-  const auto pageHeight = renderer.getScreenHeight();
   auto metrics = UITheme::getInstance().getMetrics();
+  const Rect contentRect = UITheme::getContentRect(renderer, true, false);
 
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_LANGUAGE));
+  GUI.drawHeader(renderer, Rect{contentRect.x, metrics.topPadding, contentRect.width, metrics.headerHeight},
+                 tr(STR_LANGUAGE));
 
   // Current language marker
   const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
-  const int contentHeight = pageHeight - contentTop - metrics.buttonHintsHeight - metrics.verticalSpacing;
+  const int contentHeight = contentRect.height - contentTop - metrics.verticalSpacing;
   const auto currentLang = static_cast<uint8_t>(I18N.getLanguage());
   GUI.drawList(
-      renderer, Rect{0, contentTop, pageWidth, contentHeight}, totalItems, selectedIndex,
+      renderer, Rect{contentRect.x, contentTop, contentRect.width, contentHeight}, totalItems, selectedIndex,
       [this](int index) { return I18N.getLanguageName(static_cast<Language>(SORTED_LANGUAGE_INDICES[index])); },
       nullptr, nullptr,
       [this, currentLang](int index) { return SORTED_LANGUAGE_INDICES[index] == currentLang ? tr(STR_SELECTED) : ""; },

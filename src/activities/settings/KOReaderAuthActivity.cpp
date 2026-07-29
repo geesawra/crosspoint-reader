@@ -1,7 +1,9 @@
 #include "KOReaderAuthActivity.h"
 
+#include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <I18n.h>
+#include <Logging.h>
 #include <WiFi.h>
 
 #include "KOReaderCredentialStore.h"
@@ -11,6 +13,19 @@
 #include "activities/network/WifiSelectionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+
+namespace {
+// Release secondary framebuffer + font cache before TLS to free a large
+// contiguous heap block (~36 KB needed). The activity already silentRestart()s
+// on exit so the buffer never needs to be reallocated.
+void trimMemoryBeforeTls(const GfxRenderer& renderer) {
+  if (auto* cache = renderer.getFontCacheManager()) cache->clearCache();
+  if (renderer.hasSecondaryBuffer() && renderer.releaseSecondaryBuffer()) {
+    LOG_DBG("KOSync", "Released secondary framebuffer before TLS (~52 KB contiguous)");
+    renderer.setSingleBufferFastDiff(true);
+  }
+}
+}  // namespace
 
 void KOReaderAuthActivity::onWifiSelectionComplete(const bool success) {
   if (!success) {
@@ -25,12 +40,22 @@ void KOReaderAuthActivity::onWifiSelectionComplete(const bool success) {
 
   {
     RenderLock lock(*this);
-    state = AUTHENTICATING;
-    statusMessage = tr(STR_AUTHENTICATING);
+    if (mode == Mode::REGISTER) {
+      state = REGISTERING;
+      statusMessage = tr(STR_REGISTERING);
+    } else {
+      state = AUTHENTICATING;
+      statusMessage = tr(STR_AUTHENTICATING);
+    }
   }
-  requestUpdate();
+  requestUpdateAndWait();  // show status before blocking TLS call
+  trimMemoryBeforeTls(renderer);
 
-  performAuthentication();
+  if (mode == Mode::REGISTER) {
+    performRegistration();
+  } else {
+    performAuthentication();
+  }
 }
 
 void KOReaderAuthActivity::performAuthentication() {
@@ -44,6 +69,35 @@ void KOReaderAuthActivity::performAuthentication() {
     } else {
       state = FAILED;
       errorMessage = KOReaderSyncClient::errorString(result);
+      const char* detail = KOReaderSyncClient::lastFailureDetail();
+      if (detail && detail[0]) {
+        errorMessage += " — ";
+        errorMessage += detail;
+      }
+    }
+  }
+  requestUpdate();
+}
+
+void KOReaderAuthActivity::performRegistration() {
+  const auto result = KOReaderSyncClient::registerUser();
+
+  {
+    RenderLock lock(*this);
+    if (result == KOReaderSyncClient::OK) {
+      state = SUCCESS;
+      statusMessage = tr(STR_REGISTER_SUCCESS);
+    } else if (result == KOReaderSyncClient::USER_EXISTS) {
+      state = USER_EXISTS;
+      errorMessage = KOReaderSyncClient::errorString(result);
+    } else {
+      state = FAILED;
+      errorMessage = KOReaderSyncClient::errorString(result);
+      const char* detail = KOReaderSyncClient::lastFailureDetail();
+      if (detail && detail[0]) {
+        errorMessage += " — ";
+        errorMessage += detail;
+      }
     }
   }
   requestUpdate();
@@ -77,21 +131,31 @@ void KOReaderAuthActivity::render(RenderLock&&) {
   renderer.clearScreen();
 
   const auto& metrics = UITheme::getInstance().getMetrics();
-  const auto pageWidth = renderer.getScreenWidth();
-  const auto pageHeight = renderer.getScreenHeight();
+  const Rect contentRect = UITheme::getContentRect(renderer, true, false);
 
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_KOREADER_AUTH));
+  GUI.drawHeader(renderer, Rect{contentRect.x, metrics.topPadding, contentRect.width, metrics.headerHeight},
+                 tr(STR_KOREADER_AUTH));
   const auto height = renderer.getLineHeight(UI_10_FONT_ID);
-  const auto top = (pageHeight - height) / 2;
+  const auto top = contentRect.y + (contentRect.height - height) / 2;
 
-  if (state == AUTHENTICATING) {
+  if (state == AUTHENTICATING || state == REGISTERING) {
     renderer.drawCenteredText(UI_10_FONT_ID, top, statusMessage.c_str());
   } else if (state == SUCCESS) {
-    renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_AUTH_SUCCESS), true, EpdFontFamily::BOLD);
+    const char* successMsg = (mode == Mode::REGISTER) ? tr(STR_REGISTER_SUCCESS) : tr(STR_AUTH_SUCCESS);
+    renderer.drawCenteredText(UI_10_FONT_ID, top, successMsg, true, EpdFontFamily::BOLD);
     renderer.drawCenteredText(UI_10_FONT_ID, top + height + 10, tr(STR_SYNC_READY));
-  } else if (state == FAILED) {
-    renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_AUTH_FAILED), true, EpdFontFamily::BOLD);
+  } else if (state == USER_EXISTS) {
+    renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_USERNAME_TAKEN), true, EpdFontFamily::BOLD);
     renderer.drawCenteredText(UI_10_FONT_ID, top + height + 10, errorMessage.c_str());
+  } else if (state == FAILED) {
+    const char* failedMsg = (mode == Mode::REGISTER) ? tr(STR_REGISTER_FAILED) : tr(STR_AUTH_FAILED);
+    renderer.drawCenteredText(UI_10_FONT_ID, top, failedMsg, true, EpdFontFamily::BOLD);
+    const auto lines = renderer.wrappedText(UI_10_FONT_ID, errorMessage.c_str(), contentRect.width - 20, 4);
+    int y = top + height + 10;
+    for (const auto& line : lines) {
+      renderer.drawCenteredText(UI_10_FONT_ID, y, line.c_str());
+      y += height;
+    }
   }
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
@@ -100,7 +164,7 @@ void KOReaderAuthActivity::render(RenderLock&&) {
 }
 
 void KOReaderAuthActivity::loop() {
-  if (state == SUCCESS || state == FAILED) {
+  if (state == SUCCESS || state == FAILED || state == USER_EXISTS) {
     if (mappedInput.wasPressed(MappedInputManager::Button::Back) ||
         mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
       finish();

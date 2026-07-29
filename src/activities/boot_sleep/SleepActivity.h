@@ -1,7 +1,18 @@
 #pragma once
-#include "activities/Activity.h"
+
+#include <string>
+
+#include "../Activity.h"
 
 class Bitmap;
+
+struct BookOverlayInfo {
+  std::string title;
+  std::string author;
+  std::string progressText;
+  std::string chapterName;
+  std::string progressSuffix;
+};
 
 class SleepActivity final : public Activity {
  public:
@@ -13,9 +24,12 @@ class SleepActivity final : public Activity {
   void renderDefaultSleepScreen() const;
   void renderCustomSleepScreen() const;
   void renderCoverSleepScreen() const;
-  void renderBitmapSleepScreen(const Bitmap& bitmap) const;
-  void renderLastScreenSleepScreen() const;
+  void renderBitmapSleepScreen(const Bitmap& bitmap, const BookOverlayInfo& overlayInfo) const;
   void renderBlankSleepScreen() const;
+  void renderOverlaySleepScreen() const;
+  // Quick Resume: leaves the framebuffer (reader page) intact and overlays a small moon icon.
+  void renderLastScreenSleepScreen() const;
+  BookOverlayInfo getBookOverlayInfo(const std::string& bookPath) const;
 
-  bool fromTimeout = false;
+  const bool fromTimeout = false;
 };

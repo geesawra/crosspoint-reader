@@ -15,24 +15,6 @@ void utf8TruncateChars(std::string& str, size_t numChars);
 // incomplete trailing bytes are excluded.
 int utf8SafeTruncateBuffer(const char* buf, int len);
 
-// Returns true for CJK characters that allow line breaks on either side without hyphenation.
-// Covers CJK Unified Ideographs, Hiragana, Katakana, Hangul Syllables, CJK punctuation,
-// and fullwidth forms — the ranges where word boundaries are implicit per character.
-inline bool utf8IsCjkBreakable(const uint32_t cp) {
-  return (cp >= 0x3000 && cp <= 0x303F)        // CJK Symbols and Punctuation
-         || (cp >= 0x3040 && cp <= 0x309F)     // Hiragana
-         || (cp >= 0x30A0 && cp <= 0x30FF)     // Katakana
-         || (cp >= 0x3400 && cp <= 0x4DBF)     // CJK Extension A
-         || (cp >= 0x4E00 && cp <= 0x9FFF)     // CJK Unified Ideographs
-         || (cp >= 0xAC00 && cp <= 0xD7AF)     // Hangul Syllables
-         || (cp >= 0xF900 && cp <= 0xFAFF)     // CJK Compatibility Ideographs
-         || (cp >= 0xFE30 && cp <= 0xFE4F)     // CJK Compatibility Forms
-         || (cp >= 0xFF01 && cp <= 0xFF60)     // Fullwidth Latin / Punctuation
-         || (cp >= 0xFF65 && cp <= 0xFFEF)     // Halfwidth Katakana / Hangul
-         || (cp >= 0x20000 && cp <= 0x2A6DF)   // CJK Extension B
-         || (cp >= 0x2A700 && cp <= 0x2B73F);  // CJK Extension C
-}
-
 // Returns true for Unicode combining diacritical marks that should not advance the cursor.
 inline bool utf8IsCombiningMark(const uint32_t cp) {
   return (cp >= 0x0300 && cp <= 0x036F)      // Combining Diacritical Marks
@@ -41,27 +23,13 @@ inline bool utf8IsCombiningMark(const uint32_t cp) {
          || (cp >= 0xFE20 && cp <= 0xFE2F);  // Combining Half Marks
 }
 
-// Encode a Unicode codepoint to UTF-8. Writes 1-4 bytes to buf (must be >= 4 bytes).
-// Returns the number of bytes written.
-int utf8EncodeCodepoint(uint32_t cp, char* buf);
+// Returns true for any combining mark relevant to Vietnamese NFC composition,
+// including U+031B (COMBINING HORN) which falls outside the standard mark range.
+inline bool utf8IsVietnameseCombining(const uint32_t cp) { return utf8IsCombiningMark(cp) || cp == 0x031B; }
 
-// Append a Unicode codepoint as UTF-8 to a string.
-void utf8AppendCodepoint(std::string& str, uint32_t cp);
-
-// Returns true if the string ends with '-' or soft-hyphen (U+00AD = 0xC2 0xAD in UTF-8).
-inline bool utf8EndsWithHyphen(const char* str, size_t len) {
-  if (len == 0) return false;
-  if (str[len - 1] == '-') return true;
-  return len >= 2 && static_cast<uint8_t>(str[len - 2]) == 0xC2 && static_cast<uint8_t>(str[len - 1]) == 0xAD;
-}
-
-// Remove trailing '-' or soft-hyphen (U+00AD) from string.
-inline void utf8RemoveTrailingHyphen(std::string& str) {
-  if (str.empty()) return;
-  if (str.back() == '-') {
-    str.pop_back();
-  } else if (str.size() >= 2 && static_cast<uint8_t>(str[str.size() - 2]) == 0xC2 &&
-             static_cast<uint8_t>(str[str.size() - 1]) == 0xAD) {
-    str.erase(str.size() - 2);
-  }
-}
+// Apply lightweight NFC-like normalization for Vietnamese precomposed characters.
+// Converts NFD sequences (base vowel + combining marks) into NFC precomposed
+// codepoints from the U+1EA0-U+1EF9 range. Safe no-op for already-NFC text.
+// Handles both canonical NFD ordering and the "natural" order produced by
+// macOS, Word, and older Vietnamese publishing tools.
+std::string utf8NfcNorm(std::string s);

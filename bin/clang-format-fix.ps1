@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Formats all C/C++ source and header files in the repository, excluding
-    generated, vendored, and build directories (open-x4-sdk, builtinFonts,
+    generated, vendored, and build directories (freeink-sdk, builtinFonts,
     hyphenation tries, uzlib, .pio, *.generated.h).
 
     The clang-format binary path is resolved once and cached in
@@ -92,10 +92,11 @@ function Resolve-ClangFormat {
 $clangFormat = Resolve-ClangFormat
 
 $exclude = @(
-    'open-x4-sdk'
+    'freeink-sdk'
     'lib\EpdFont\builtinFonts'
     'lib\Epub\Epub\hyphenation\generated'
     'lib\uzlib'
+    'build'
     '.pio'
     '.venv'
 )
@@ -109,16 +110,16 @@ function Test-Excluded($fullPath) {
 }
 
 if ($g) {
-    # Only git-modified *.cpp / *.h files
+    # Only git-modified *.cpp / *.c / *.h files
     # Covers both staged and unstaged changes
     $files = @(git -C $repoRoot diff --name-only HEAD) +
              @(git -C $repoRoot diff --name-only --cached) |
         Sort-Object -Unique |
-        Where-Object { $_ -match '\.(cpp|h)$' } |
+        Where-Object { $_ -match '\.(cpp|c|h)$' } |
         ForEach-Object { Get-Item (Join-Path $repoRoot $_) -ErrorAction SilentlyContinue } |
         Where-Object { $_ -and -not (Test-Excluded $_.FullName) }
 } else {
-    $files = Get-ChildItem -Path $repoRoot -Recurse -Include *.cpp, *.h -File |
+    $files = Get-ChildItem -Path $repoRoot -Recurse -Include *.cpp, *.c, *.h -File |
         Where-Object { -not (Test-Excluded $_.FullName) }
 }
 

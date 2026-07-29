@@ -1,10 +1,24 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <vector>
 
 struct WifiCredential {
   std::string ssid;
   std::string password;  // Plaintext in memory; obfuscated with hardware key on disk
+  // Connection hint cached on successful connect. All-zero BSSID or channel==0 means
+  // "no hint, do a full scan". Used to skip channel scanning on reconnect.
+  uint8_t bssid[6] = {0, 0, 0, 0, 0, 0};
+  uint8_t channel = 0;
+
+  // Last observed IP configuration, retained for connection diagnostics. Reconnects
+  // use DHCP because leases, gateways, and DNS servers can change independently of BSSID.
+  // cacheTimestamp is epoch seconds at capture; 0 means "unknown time, no TTL enforced".
+  uint8_t ip[4] = {0, 0, 0, 0};
+  uint8_t gateway[4] = {0, 0, 0, 0};
+  uint8_t mask[4] = {0, 0, 0, 0};
+  uint8_t dns[4] = {0, 0, 0, 0};
+  uint32_t cacheTimestamp = 0;
 };
 
 class WifiCredentialStore;
@@ -24,13 +38,12 @@ class WifiCredentialStore {
   static WifiCredentialStore instance;
   std::vector<WifiCredential> credentials;
   std::string lastConnectedSsid;
+  std::string lastKnownMacAddress;
 
   static constexpr size_t MAX_NETWORKS = 8;
 
   // Private constructor for singleton
   WifiCredentialStore() = default;
-
-  bool loadFromBinaryFile();
 
   friend bool JsonSettingsIO::saveWifi(const WifiCredentialStore&, const char*);
   friend bool JsonSettingsIO::loadWifi(WifiCredentialStore&, const char*, bool*);
@@ -52,6 +65,16 @@ class WifiCredentialStore {
   bool removeCredential(const std::string& ssid);
   const WifiCredential* findCredential(const std::string& ssid) const;
 
+  // Update cached BSSID/channel hint and last observed IP configuration in one write.
+  // ip/gw/mask/dns may be all-zero. cacheTimestamp is epoch seconds (0 if unsynced).
+  // Persists only if anything changed.
+  bool updateConnectionCache(const std::string& ssid, const uint8_t bssid[6], uint8_t channel, const uint8_t ip[4],
+                             const uint8_t gateway[4], const uint8_t mask[4], const uint8_t dns[4],
+                             uint32_t cacheTimestamp);
+  // Clear all cached hint + IP for this credential (after a hint-based connect failed
+  // and we want the next attempt to start fresh with full scan + DHCP).
+  bool clearConnectionCache(const std::string& ssid);
+
   // Get all stored credentials (for UI display)
   const std::vector<WifiCredential>& getCredentials() const { return credentials; }
 
@@ -62,6 +85,10 @@ class WifiCredentialStore {
   void setLastConnectedSsid(const std::string& ssid);
   const std::string& getLastConnectedSsid() const;
   void clearLastConnectedSsid();
+
+  // Last known device MAC (formatted as AA-BB-CC-DD-EE-FF for instant UI display)
+  void setLastKnownMacAddress(const std::string& mac);
+  const std::string& getLastKnownMacAddress() const;
 
   // Clear all credentials
   void clearAll();

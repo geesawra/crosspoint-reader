@@ -1,10 +1,16 @@
 #include "ZipFile.h"
 
+#include <BufferedFileIO.h>
+#include <BuildArena.h>
 #include <HalStorage.h>
 #include <InflateReader.h>
 #include <Logging.h>
+#include <Memory.h>
 
 #include <algorithm>
+#include <cstring>
+
+#include "../Epub/Epub/HashUtils.h"
 
 struct ZipInflateCtx {
   InflateReader reader;  // Must be first — callback casts uzlib_uncomp* to ZipInflateCtx*
@@ -17,28 +23,6 @@ struct ZipInflateCtx {
 namespace {
 constexpr uint16_t ZIP_METHOD_STORED = 0;
 constexpr uint16_t ZIP_METHOD_DEFLATED = 8;
-
-// RAII zip: opens the zip if not already open, closes on destruction only if
-// it performed the open.  Removes the wasOpen/close boilerplate from every method.
-class ScopedOpenClose final {
- public:
-  [[nodiscard]] explicit ScopedOpenClose(ZipFile& zf) : zf(zf), needsClose(!zf.isOpen()) {
-    if (needsClose) ok = zf.open();
-  }
-  ~ScopedOpenClose() {
-    if (needsClose && ok) zf.close();
-  }
-  ScopedOpenClose(const ScopedOpenClose&) = delete;
-  ScopedOpenClose& operator=(const ScopedOpenClose&) = delete;
-  ScopedOpenClose(ScopedOpenClose&&) = delete;
-  ScopedOpenClose& operator=(ScopedOpenClose&&) = delete;
-  explicit operator bool() const { return ok || !needsClose; }
-
- private:
-  ZipFile& zf;
-  bool needsClose = false;
-  bool ok = true;  // true when zip was already open (no open() call needed)
-};
 
 int zipReadCallback(uzlib_uncomp* uncomp) {
   auto* ctx = reinterpret_cast<ZipInflateCtx*>(uncomp);
@@ -56,71 +40,44 @@ int zipReadCallback(uzlib_uncomp* uncomp) {
 }
 }  // namespace
 
-bool ZipFile::loadAllFileStatSlims() {
-  const ScopedOpenClose zip{*this};
-  if (!zip) return false;
-
-  if (!loadZipDetails()) return false;
-
-  file.seek(zipDetails.centralDirOffset);
-
-  uint32_t sig;
-  char itemName[256];
-  fileStatSlimCache.clear();
-  fileStatSlimCache.reserve(zipDetails.totalEntries);
-
-  while (file.available()) {
-    file.read(&sig, 4);
-    if (sig != 0x02014b50) break;  // End of list
-
-    FileStatSlim fileStat = {};
-
-    file.seekCur(6);
-    file.read(&fileStat.method, 2);
-    file.seekCur(8);
-    file.read(&fileStat.compressedSize, 4);
-    file.read(&fileStat.uncompressedSize, 4);
-    uint16_t nameLen, m, k;
-    file.read(&nameLen, 2);
-    file.read(&m, 2);
-    file.read(&k, 2);
-    file.seekCur(8);
-    file.read(&fileStat.localHeaderOffset, 4);
-
-    if (nameLen < sizeof(itemName)) {
-      file.read(itemName, nameLen);
-      itemName[nameLen] = '\0';
-      fileStatSlimCache.emplace(itemName, fileStat);
+static std::string normalizeZipPath(const char* filename) {
+  std::string normalized;
+  normalized.reserve(strlen(filename));
+  for (const char* p = filename; *p; ++p) {
+    if (*p == '\\') {
+      normalized.push_back('/');
     } else {
-      // Skip over oversized entry names to avoid writing past fixed buffer.
-      file.seekCur(nameLen);
+      normalized.push_back(*p);
     }
-
-    // Skip the rest of this entry (extra field + comment)
-    file.seekCur(m + k);
   }
+  while (!normalized.empty() && normalized.front() == '/') {
+    normalized.erase(normalized.begin());
+  }
+  return normalized;
+}
 
-  // Set cursor to start of central directory for sequential access
-  lastCentralDirPos = zipDetails.centralDirOffset;
-  lastCentralDirPosValid = true;
-
-  return true;
+static std::string normalizeZipPathLower(const char* filename) {
+  std::string normalized = normalizeZipPath(filename);
+  for (char& ch : normalized) {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+  return normalized;
 }
 
 bool ZipFile::loadFileStatSlim(const char* filename, FileStatSlim* fileStat) {
-  if (!fileStatSlimCache.empty()) {
-    const auto it = fileStatSlimCache.find(filename);
-    if (it != fileStatSlimCache.end()) {
-      *fileStat = it->second;
-      return true;
-    }
+  const std::string normalizedFilename = normalizeZipPath(filename);
+  const std::string normalizedFilenameLower = normalizeZipPathLower(filename);
+
+  const ScopedOpenClose zip{*this};
+  if (!zip) {
+    LOG_ERR("ZIP", "loadFileStatSlim: failed to open zip for %s", filename);
     return false;
   }
 
-  const ScopedOpenClose zip{*this};
-  if (!zip) return false;
-
-  if (!loadZipDetails()) return false;
+  if (!loadZipDetails()) {
+    LOG_ERR("ZIP", "loadFileStatSlim: loadZipDetails failed for %s", filename);
+    return false;
+  }
 
   // Phase 1: Try scanning from cursor position first
   uint32_t startPos = lastCentralDirPosValid ? lastCentralDirPos : zipDetails.centralDirOffset;
@@ -167,8 +124,20 @@ bool ZipFile::loadFileStatSlim(const char* filename, FileStatSlim* fileStat) {
       file.read(itemName, nameLen);
       itemName[nameLen] = '\0';
 
-      if (strcmp(itemName, filename) == 0) {
-        // Found it! Update cursor to next entry
+      // Normalize once, then build lowercase via in-place transform — one alloc, not two.
+      std::string normalizedItemName = normalizeZipPath(itemName);
+      if (normalizedItemName == normalizedFilename) {
+        file.seekCur(m + k);
+        lastCentralDirPos = file.position();
+        lastCentralDirPosValid = true;
+        found = true;
+        break;
+      }
+
+      std::string normalizedItemNameLower = normalizedItemName;
+      for (char& ch : normalizedItemNameLower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      if (normalizedItemNameLower == normalizedFilenameLower) {
+        LOG_DBG("ZIP", "loadFileStatSlim: case-insensitive match for %s => %s", filename, itemName);
         file.seekCur(m + k);
         lastCentralDirPos = file.position();
         lastCentralDirPosValid = true;
@@ -182,6 +151,11 @@ bool ZipFile::loadFileStatSlim(const char* filename, FileStatSlim* fileStat) {
 
     // Skip extra field + comment
     file.seekCur(m + k);
+  }
+
+  if (!found) {
+    LOG_DBG("ZIP", "loadFileStatSlim: entry not found after scan: %s (normalized=%s)", filename,
+            normalizedFilename.c_str());
   }
 
   return found;
@@ -229,44 +203,136 @@ bool ZipFile::loadZipDetails() {
     return false;  // Minimum EOCD size is 22 bytes
   }
 
-  // We scan the last 1KB (or the whole file if smaller) for the EOCD signature
-  // 0x06054b50 is stored as 0x50, 0x4b, 0x05, 0x06 in little-endian
-  const int scanRange = fileSize > 1024 ? 1024 : fileSize;
-  const auto buffer = static_cast<uint8_t*>(malloc(scanRange));
+  // Scan backwards from end-of-file for the EOCD signature (0x06054b50).
+  // ZIP spec allows up to 65535+22 bytes of comment after EOCD, so the
+  // signature can be up to 65557 bytes from the end.  To avoid a large
+  // heap allocation on the memory-constrained ESP32-C3, we use a fixed
+  // 4KB window that starts at end-of-file and steps backwards only when
+  // no signature is found, checking the window nearest EOF first.  This
+  // guarantees we resolve to the EOCD nearest EOF (the correct one per
+  // spec) instead of a false PK\x05\x06 sequence earlier in the file,
+  // and it keeps the common case (no archive comment) to a single 4KB
+  // read instead of scanning the full 65557-byte region.  Each step
+  // overlaps the previous window by 21 bytes so an EOCD record spanning
+  // a window boundary is never missed (EOCD minimum size is 22 bytes).
+  constexpr size_t BUF_SIZE = 4096;
+  constexpr size_t MAX_SCAN = 65557;
+  constexpr size_t OVERLAP = 21;  // EOCD min size - 1
+
+  auto buffer = makeUniqueNoThrow<uint8_t[]>(BUF_SIZE);
   if (!buffer) {
-    LOG_ERR("ZIP", "Failed to allocate memory for EOCD scan buffer");
+    LOG_ERR("ZIP", "Failed to allocate EOCD scan buffer (%zu bytes)", BUF_SIZE);
     return false;
   }
 
-  file.seek(fileSize - scanRange);
-  file.read(buffer, scanRange);
+  const size_t totalScannable = fileSize < MAX_SCAN ? fileSize : MAX_SCAN;
+  const size_t scanFloor = fileSize - totalScannable;
 
-  // Scan backwards for the signature
-  int foundOffset = -1;
-  for (int i = scanRange - 22; i >= 0; i--) {
-    constexpr uint32_t signature = 0x06054b50;
-    if (*reinterpret_cast<uint32_t*>(&buffer[i]) == signature) {
-      foundOffset = i;
-      break;
+  size_t windowEnd = fileSize;
+  while (true) {
+    const size_t windowStart = windowEnd > scanFloor + BUF_SIZE ? windowEnd - BUF_SIZE : scanFloor;
+    const size_t windowLen = windowEnd - windowStart;
+    if (windowLen < 22) break;  // Not enough bytes left to hold an EOCD record
+
+    if (!file.seek(windowStart)) {
+      LOG_ERR("ZIP", "EOCD scan: seek to %zu failed", windowStart);
+      return false;
     }
+
+    size_t filled = 0;
+    while (filled < windowLen) {
+      const int n = file.read(buffer.get() + filled, windowLen - filled);
+      if (n <= 0) {
+        LOG_ERR("ZIP", "EOCD scan: read failed in window [%zu, %zu), got %zu/%zu bytes", windowStart, windowEnd, filled,
+                windowLen);
+        return false;
+      }
+      filled += static_cast<size_t>(n);
+    }
+
+    // Search this window from the end towards the start so the match
+    // nearest EOF wins within the window (only one EOCD exists per valid
+    // ZIP, but this keeps behaviour well-defined if a comment happens to
+    // contain the signature bytes).
+    for (int i = static_cast<int>(windowLen) - 22; i >= 0; i--) {
+      uint32_t candidate;
+      memcpy(&candidate, &buffer[i], sizeof(candidate));
+      if (candidate == 0x06054b50) {
+        memcpy(&zipDetails.totalEntries, &buffer[i + 10], sizeof(zipDetails.totalEntries));
+        memcpy(&zipDetails.centralDirOffset, &buffer[i + 16], sizeof(zipDetails.centralDirOffset));
+        zipDetails.isSet = true;
+        LOG_DBG("ZIP", "EOCD found at offset %zu in file", windowStart + static_cast<size_t>(i));
+        return true;
+      }
+    }
+
+    if (windowStart <= scanFloor) break;
+    windowEnd = windowStart + OVERLAP;
   }
 
-  if (foundOffset == -1) {
-    LOG_ERR("ZIP", "EOCD signature not found in zip file");
-    free(buffer);
-    return false;
+  LOG_ERR("ZIP", "EOCD signature not found in zip file (scanned last %zu bytes)", totalScannable);
+  return false;
+}
+
+bool ZipFile::contentFingerprint(uint64_t* out) {
+  if (!out) return false;
+  if (!loadZipDetails()) return false;
+  const ScopedOpenClose zip{*this};
+  if (!zip) return false;
+
+  // Incremental FNV-1a 64 mixing helpers (same constants as HashUtils).
+  uint64_t hash = 14695981039346656037ull;
+  const auto mixBytes = [&hash](const void* data, const size_t len) {
+    const auto* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len; i++) {
+      hash ^= p[i];
+      hash *= 1099511628211ull;
+    }
+  };
+  const auto mixPod = [&mixBytes](const auto v) { mixBytes(&v, sizeof(v)); };
+
+  // Buffered walk: the per-entry field reads below would otherwise be ~12
+  // separate FsFile calls per entry (~1.5 ms each on device — seconds for a
+  // 1000+-entry book). Through the 4 KB window they collapse into a few
+  // sequential SD reads; the per-entry skips stay inside the window for free.
+  file.seek(zipDetails.centralDirOffset);
+  serialization::BufferedFileReader reader(file);
+  char nameBuf[256];
+  uint32_t entries = 0;
+  uint32_t sig;
+  while (reader.readPod(sig) && sig == 0x02014b50) {
+    reader.seek(reader.position() + 6);  // versionMadeBy, versionNeeded, flags
+    uint16_t method, nameLen, extraLen, commentLen;
+    uint32_t crc32, compSz, uncompSz, localOff;
+    if (!reader.readPod(method)) return false;
+    // DOS mod time + date: excluded so a content-identical re-zip matches
+    reader.seek(reader.position() + 4);
+    if (!reader.readPod(crc32) || !reader.readPod(compSz) || !reader.readPod(uncompSz) || !reader.readPod(nameLen) ||
+        !reader.readPod(extraLen) || !reader.readPod(commentLen)) {
+      return false;
+    }
+    reader.seek(reader.position() + 8);  // disk#, internal attrs, external attrs
+    if (!reader.readPod(localOff)) return false;
+
+    // Name in bounded chunks: entry names may exceed the stack buffer.
+    size_t nameRemaining = nameLen;
+    while (nameRemaining > 0) {
+      const size_t take = nameRemaining < sizeof(nameBuf) ? nameRemaining : sizeof(nameBuf);
+      if (!reader.read(nameBuf, take)) return false;
+      mixBytes(nameBuf, take);
+      nameRemaining -= take;
+    }
+    mixPod(crc32);
+    mixPod(uncompSz);
+    mixPod(method);
+    mixPod(localOff);
+    entries++;
+
+    reader.seek(reader.position() + extraLen + commentLen);
   }
-
-  // Now extract the values we need from the EOCD record
-  // Relative positions within EOCD:
-  // Offset 10: Total number of entries (2 bytes)
-  // Offset 16: Offset of start of central directory with respect to the starting disk number (4 bytes)
-  zipDetails.totalEntries = *reinterpret_cast<uint16_t*>(&buffer[foundOffset + 10]);
-  zipDetails.centralDirOffset = *reinterpret_cast<uint32_t*>(&buffer[foundOffset + 16]);
-  zipDetails.isSet = true;
-
-  free(buffer);
-  return true;
+  mixPod(entries);
+  *out = hash;
+  return entries > 0;
 }
 
 bool ZipFile::open() {
@@ -278,7 +344,6 @@ bool ZipFile::open() {
 
 bool ZipFile::close() {
   if (file) {
-    // Explicit close() required: member variable persists beyond function scope
     file.close();
   }
   lastCentralDirPos = 0;
@@ -296,7 +361,7 @@ bool ZipFile::getInflatedFileSize(const char* filename, size_t* size) {
   return true;
 }
 
-int ZipFile::fillUncompressedSizes(std::deque<SizeTarget>& targets, std::deque<uint32_t>& sizes) {
+int ZipFile::fillUncompressedSizes(const std::deque<SizeTarget>& targets, std::deque<uint32_t>& sizes) {
   if (targets.empty()) {
     return 0;
   }
@@ -336,7 +401,7 @@ int ZipFile::fillUncompressedSizes(std::deque<SizeTarget>& targets, std::deque<u
       file.read(itemName, nameLen);
       itemName[nameLen] = '\0';
 
-      uint64_t hash = fnvHash64(itemName, nameLen);
+      uint64_t hash = HashUtils::fnvHash64(itemName, nameLen);
       SizeTarget key = {hash, nameLen, 0};
 
       auto it = std::lower_bound(targets.begin(), targets.end(), key, [](const SizeTarget& a, const SizeTarget& b) {
@@ -504,7 +569,8 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
     ctx.readBuf = fileReadBuffer;
     ctx.readBufSize = chunkSize;
 
-    if (!ctx.reader.init(true)) {
+    // Ring sized to the entry (≤32 KB) — frees up to ~29 KB during small-entry streams.
+    if (!ctx.reader.init(true, static_cast<size_t>(inflatedDataSize))) {
       LOG_ERR("ZIP", "Failed to init inflate reader");
       free(outputBuffer);
       free(fileReadBuffer);
@@ -559,3 +625,285 @@ bool ZipFile::readFileToStream(const char* filename, Print& out, const size_t ch
   LOG_ERR("ZIP", "Unsupported compression method");
   return false;
 }
+
+size_t ZipFile::readBytesFromEntry(const char* filename, uint8_t* outBuf, const size_t maxBytes) {
+  if (!outBuf || maxBytes == 0) return 0;
+
+  const ScopedOpenClose zip{*this};
+  if (!zip) return 0;
+
+  FileStatSlim fileStat = {};
+  if (!loadFileStatSlim(filename, &fileStat)) return 0;
+
+  return readBytesFromStat(fileStat, outBuf, maxBytes);
+}
+
+size_t ZipFile::readBytesFromStat(const FileStatSlim& fileStat, uint8_t* outBuf, const size_t maxBytes) {
+  if (!outBuf || maxBytes == 0) return 0;
+
+  const ScopedOpenClose zip{*this};
+  if (!zip) return 0;
+
+  const long fileOffset = getDataOffset(fileStat);
+  if (fileOffset < 0) return 0;
+
+  file.seek(fileOffset);
+  const size_t wantBytes = std::min(maxBytes, static_cast<size_t>(fileStat.uncompressedSize));
+
+  if (fileStat.method == ZIP_METHOD_STORED) {
+    const int n = file.read(outBuf, wantBytes);
+    return n > 0 ? static_cast<size_t>(n) : 0;
+  }
+
+  if (fileStat.method == ZIP_METHOD_DEFLATED) {
+    // Streaming inflate (32KB ring buffer) is the preferred path.  It can fail
+    // if a 32KB ring buffer can't be allocated while another inflate is live
+    // (e.g. reading image headers mid-XHTML stream).  In that case fall back to
+    // one-shot inflate: read a bounded compressed chunk and decompress it all at
+    // once without a ring buffer.
+    constexpr size_t READ_BUF = 512;
+    auto* readBuf = static_cast<uint8_t*>(malloc(READ_BUF));
+    if (!readBuf) return 0;
+
+    ZipInflateCtx ctx;
+    ctx.file = &file;
+    ctx.fileRemaining = fileStat.compressedSize;
+    ctx.readBuf = readBuf;
+    ctx.readBufSize = READ_BUF;
+
+    if (ctx.reader.init(true)) {
+      ctx.reader.setReadCallback(zipReadCallback);
+
+      size_t totalOut = 0;
+      while (totalOut < wantBytes) {
+        size_t produced;
+        const size_t remaining = wantBytes - totalOut;
+        const InflateStatus status = ctx.reader.readAtMost(outBuf + totalOut, remaining, &produced);
+        totalOut += produced;
+        if (status == InflateStatus::Done || status == InflateStatus::Error) break;
+      }
+
+      free(readBuf);
+      return totalOut;
+    }
+
+    // Streaming ring buffer unavailable — fall back to one-shot inflate.
+    // Read a bounded compressed chunk (4× the desired output as a rough overhead
+    // estimate, capped at the actual compressed size) and decompress in one shot.
+    free(readBuf);
+    const size_t compChunkSize = std::min(static_cast<size_t>(fileStat.compressedSize), wantBytes * 4);
+    auto* compBuf = static_cast<uint8_t*>(malloc(compChunkSize));
+    if (!compBuf) return 0;
+
+    const size_t compRead = file.read(compBuf, compChunkSize);
+    if (compRead == 0) {
+      free(compBuf);
+      return 0;
+    }
+
+    InflateReader oneShot;
+    oneShot.init(false);
+    oneShot.setSource(compBuf, compRead);
+
+    // One-shot read: decompress up to wantBytes; partial output is still useful
+    // (e.g. a JPEG SOF marker within the first kHeaderBufSize bytes).
+    size_t produced = 0;
+    const InflateStatus status = oneShot.readAtMost(outBuf, wantBytes, &produced);
+    free(compBuf);
+    if (status == InflateStatus::Error && produced == 0) return 0;
+    return produced;
+  }
+
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// ZipFile::EntryReader — resumable per-entry inflate
+// ---------------------------------------------------------------------------
+
+struct ZipFile::EntryReader::Impl {
+  ZipFile& zf;
+  size_t chunkSize;
+  // Optional arena backing (see EntryReader ctor doc): readBuf + inflate ring
+  // are carved from one block reserved at open(), released in reset().
+  BuildArena* arena = nullptr;
+  BuildArena::Block arenaBlock;
+
+  uint16_t method = 0;  // ZIP_METHOD_STORED or ZIP_METHOD_DEFLATED
+  FsFile file;
+  size_t inflatedSize_ = 0;
+  size_t bytesProduced_ = 0;
+  bool error_ = false;
+  bool done_ = false;
+
+  // Stored-entry tracking
+  size_t storedRemaining = 0;
+
+  // Deflated-entry state. ZipInflateCtx.reader must remain first (callback cast).
+  ZipInflateCtx ctx = {};
+  uint8_t* readBuf = nullptr;
+
+  explicit Impl(ZipFile& zf_, size_t chunkSize_, BuildArena* arena_) : zf(zf_), chunkSize(chunkSize_), arena(arena_) {}
+  ~Impl() { reset(); }
+  Impl(const Impl&) = delete;
+  Impl& operator=(const Impl&) = delete;
+
+  void reset() {
+    if (readBuf) {
+      ctx.reader.deinit();  // external ring: deinit only clears state, no free
+      if (!arena) free(readBuf);
+      readBuf = nullptr;
+    }
+    if (arena && arenaBlock.valid()) {
+      arena->release(arenaBlock);
+    }
+    ctx.file = nullptr;
+    ctx.fileRemaining = 0;
+    ctx.readBuf = nullptr;
+    ctx.readBufSize = 0;
+    if (file) file.close();
+    inflatedSize_ = 0;
+    bytesProduced_ = 0;
+    storedRemaining = 0;
+    method = 0;
+    error_ = false;
+    done_ = false;
+  }
+};
+
+ZipFile::EntryReader::EntryReader(ZipFile& zf, const size_t chunkSize, BuildArena* arena)
+    : impl_(std::make_unique<Impl>(zf, chunkSize, arena)) {}
+
+ZipFile::EntryReader::~EntryReader() = default;
+ZipFile::EntryReader::EntryReader(EntryReader&&) noexcept = default;
+ZipFile::EntryReader& ZipFile::EntryReader::operator=(EntryReader&&) noexcept = default;
+
+bool ZipFile::EntryReader::open(const char* filename) {
+  impl_->reset();
+
+  FileStatSlim fileStat = {};
+  if (!impl_->zf.loadFileStatSlim(filename, &fileStat)) {
+    LOG_ERR("ZIP", "EntryReader::open: entry not found: %s", filename);
+    return false;
+  }
+  const long dataOffset = impl_->zf.getDataOffset(fileStat);
+  if (dataOffset < 0) {
+    LOG_ERR("ZIP", "EntryReader::open: bad data offset for %s", filename);
+    return false;
+  }
+
+  impl_->inflatedSize_ = fileStat.uncompressedSize;
+  impl_->method = fileStat.method;
+
+  if (!Storage.openFileForRead("ZIP", impl_->zf.filePath, impl_->file)) {
+    LOG_ERR("ZIP", "EntryReader::open: failed to open zip file");
+    return false;
+  }
+  impl_->file.seek(static_cast<size_t>(dataOffset));
+
+  if (fileStat.method == ZIP_METHOD_STORED) {
+    impl_->storedRemaining = fileStat.uncompressedSize;
+    return true;
+  }
+
+  if (fileStat.method == ZIP_METHOD_DEFLATED) {
+    if (impl_->arena) impl_->arenaBlock = impl_->arena->reserveBlock();
+    impl_->readBuf = impl_->arena ? static_cast<uint8_t*>(impl_->arena->alloc(impl_->chunkSize))
+                                  : static_cast<uint8_t*>(malloc(impl_->chunkSize));
+    if (!impl_->readBuf) {
+      LOG_ERR("ZIP", "EntryReader::open: OOM allocating read buffer");
+      impl_->file.close();
+      return false;
+    }
+    impl_->ctx.file = &impl_->file;
+    impl_->ctx.fileRemaining = fileStat.compressedSize;
+    impl_->ctx.readBuf = impl_->readBuf;
+    impl_->ctx.readBufSize = impl_->chunkSize;
+    // Ring sized to the entry (≤32 KB): small chapters cost a small ring, which is what
+    // makes holding the reader across background-build slices affordable.
+    bool ringOk;
+    if (impl_->arena) {
+      const size_t ringSize = InflateReader::ringSizeFor(fileStat.uncompressedSize);
+      auto* ring = static_cast<uint8_t*>(impl_->arena->alloc(ringSize));
+      ringOk = ring && impl_->ctx.reader.initWithExternalRing(ring, ringSize);
+    } else {
+      ringOk = impl_->ctx.reader.init(true, fileStat.uncompressedSize);
+    }
+    if (!ringOk) {
+      LOG_ERR("ZIP", "EntryReader::open: OOM initialising inflate ring buffer");
+      if (!impl_->arena) free(impl_->readBuf);
+      impl_->readBuf = nullptr;
+      if (impl_->arena && impl_->arenaBlock.valid()) {
+        impl_->arena->release(impl_->arenaBlock);
+      }
+      impl_->file.close();
+      return false;
+    }
+    impl_->ctx.reader.setReadCallback(zipReadCallback);
+    return true;
+  }
+
+  LOG_ERR("ZIP", "EntryReader::open: unsupported compression method %u", fileStat.method);
+  impl_->file.close();
+  return false;
+}
+
+bool ZipFile::EntryReader::step(uint8_t* out, const size_t cap, size_t* produced, bool* done) {
+  *produced = 0;
+  *done = false;
+
+  if (impl_->done_) {
+    *done = true;
+    return true;
+  }
+  if (impl_->error_) return false;
+
+  if (impl_->method == ZIP_METHOD_STORED) {
+    if (impl_->storedRemaining == 0) {
+      impl_->done_ = true;
+      *done = true;
+      return true;
+    }
+    const size_t toRead = cap < impl_->storedRemaining ? cap : impl_->storedRemaining;
+    const int n = impl_->file.read(out, toRead);
+    if (n <= 0) {
+      LOG_ERR("ZIP", "EntryReader::step: stored read error");
+      impl_->error_ = true;
+      return false;
+    }
+    impl_->storedRemaining -= static_cast<size_t>(n);
+    impl_->bytesProduced_ += static_cast<size_t>(n);
+    *produced = static_cast<size_t>(n);
+    if (impl_->storedRemaining == 0) {
+      impl_->done_ = true;
+      *done = true;
+    }
+    return true;
+  }
+
+  if (impl_->method == ZIP_METHOD_DEFLATED) {
+    size_t p = 0;
+    const InflateStatus status = impl_->ctx.reader.readAtMost(out, cap, &p);
+    impl_->bytesProduced_ += p;
+    *produced = p;
+    if (status == InflateStatus::Done) {
+      impl_->done_ = true;
+      *done = true;
+      return true;
+    }
+    if (status == InflateStatus::Error) {
+      LOG_ERR("ZIP", "EntryReader::step: inflate error");
+      impl_->error_ = true;
+      return false;
+    }
+    return true;
+  }
+
+  impl_->error_ = true;
+  return false;
+}
+
+void ZipFile::EntryReader::close() { impl_->reset(); }
+bool ZipFile::EntryReader::isOpen() const { return impl_ && static_cast<bool>(impl_->file); }
+size_t ZipFile::EntryReader::inflatedSize() const { return impl_ ? impl_->inflatedSize_ : 0; }
+size_t ZipFile::EntryReader::bytesProduced() const { return impl_ ? impl_->bytesProduced_ : 0; }

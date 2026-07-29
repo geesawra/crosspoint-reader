@@ -5,6 +5,8 @@
 
 #include "StreamingJsonParser.h"
 
+// Ported from crosspoint-reader/crosspoint-reader (MIT),
+// initially authored in PR #1810 by znelson and contributors.
 class ReleaseJsonParser {
  public:
   ReleaseJsonParser();
@@ -22,6 +24,8 @@ class ReleaseJsonParser {
   size_t getFirmwareSize() const;
 
  private:
+  bool inReleaseObject() const;
+
   enum class Position : uint8_t {
     TOP_LEVEL,
     IN_ASSETS_ARRAY,
@@ -64,5 +68,6 @@ class ReleaseJsonParser {
 
   char currentAssetName[32];
   char currentAssetUrl[512];
+  bool topLevelArray;
   size_t currentAssetSize;
 };

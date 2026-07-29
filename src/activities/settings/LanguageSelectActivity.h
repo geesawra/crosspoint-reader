@@ -5,7 +5,7 @@
 
 #include <functional>
 
-#include "activities/Activity.h"
+#include "../Activity.h"
 #include "components/UITheme.h"
 #include "util/ButtonNavigator.h"
 

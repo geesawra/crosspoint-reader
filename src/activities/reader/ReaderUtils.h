@@ -5,12 +5,37 @@
 #include <HalTiltSensor.h>
 #include <Logging.h>
 
+#include <cstdint>
+
+#include "ButtonEventManager.h"
 #include "MappedInputManager.h"
 
 namespace ReaderUtils {
 
 constexpr unsigned long GO_HOME_MS = 1000;
-constexpr unsigned long SKIP_HOLD_MS = 700;
+
+// Round-half-up integer division clamped to [0, 100], used as the percent byte appended to
+// progress.bin so the home screen can render a per-book badge without re-loading the document.
+// All reader types must funnel through this so the displayed value matches across formats.
+inline uint8_t pageProgressPercentByte(int currentPage, int totalPages) {
+  if (totalPages <= 0 || currentPage < 0) {
+    return 0;
+  }
+  const long numerator = static_cast<long>(currentPage + 1) * 200L + totalPages;
+  const long percent = numerator / (2L * totalPages);
+  if (percent < 0) return 0;
+  if (percent > 100) return 100;
+  return static_cast<uint8_t>(percent);
+}
+
+// Round-half-up clamp for a pre-computed [0,1] progress fraction (used by EPUB, where progress
+// is byte-weighted across spine items rather than a simple page ratio).
+inline uint8_t fractionProgressPercentByte(float fraction) {
+  const int percent = static_cast<int>(fraction * 100.0f + 0.5f);
+  if (percent < 0) return 0;
+  if (percent > 100) return 100;
+  return static_cast<uint8_t>(percent);
+}
 
 inline void applyOrientation(GfxRenderer& renderer, const uint8_t orientation) {
   switch (orientation) {
@@ -31,69 +56,134 @@ inline void applyOrientation(GfxRenderer& renderer, const uint8_t orientation) {
   }
 }
 
+// Suppresses input processing on activity entry until the user has released all buttons and a
+// clean frame (no pending press/release events) has been observed. Without this, the power-button
+// hold used to wake the device leaks into detectPageTurn() and triggers a page turn or chapter
+// skip (the wake-hold easily exceeds skipChapterMs).
+// Each reader holds an instance, calls arm() in onEnter(), and calls shouldDrain() at the top
+// of loop() — returning early when it returns true.
+struct InputDrainGuard {
+  bool active = false;
+
+  void arm() { active = true; }
+
+  bool shouldDrain(const MappedInputManager& input) {
+    if (!active) {
+      return false;
+    }
+    using B = MappedInputManager::Button;
+    const bool anyHeld = input.isPressed(B::Back) || input.isPressed(B::Confirm) || input.isPressed(B::Left) ||
+                         input.isPressed(B::Right) || input.isPressed(B::Up) || input.isPressed(B::Down) ||
+                         input.isPressed(B::Power) || input.isPressed(B::PageBack) || input.isPressed(B::PageForward);
+    if (anyHeld || input.wasAnyPressed() || input.wasAnyReleased()) {
+      return true;
+    }
+    active = false;
+    return false;
+  }
+};
+
 struct PageTurnResult {
   bool prev;
   bool next;
-  bool fromTilt;
 };
 
 inline PageTurnResult detectPageTurn(const MappedInputManager& input) {
-  const bool usePress = SETTINGS.longPressButtonBehavior == SETTINGS.OFF;
-  const bool tiltNext = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedForward();
-  const bool tiltPrev = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedBack();
-  const bool swapFront =
-      SETTINGS.frontButtonFollowOrientation && (SETTINGS.orientation == CrossPointSettings::INVERTED ||
-                                                SETTINGS.orientation == CrossPointSettings::LANDSCAPE_CCW);
-  const auto prevButton = swapFront ? MappedInputManager::Button::Right : MappedInputManager::Button::Left;
-  const auto nextButton = swapFront ? MappedInputManager::Button::Left : MappedInputManager::Button::Right;
-  const bool prev =
-      tiltPrev ||
-      (usePress ? (input.wasPressed(MappedInputManager::Button::PageBack) || input.wasPressed(prevButton))
-                : (input.wasReleased(MappedInputManager::Button::PageBack) || input.wasReleased(prevButton)));
-  const bool powerTurn = SETTINGS.shortPwrBtn == CrossPointSettings::SHORT_PWRBTN::PAGE_TURN &&
-                         input.wasReleased(MappedInputManager::Button::Power);
-  const bool next = tiltNext || (usePress ? (input.wasPressed(MappedInputManager::Button::PageForward) || powerTurn ||
-                                             input.wasPressed(nextButton))
-                                          : (input.wasReleased(MappedInputManager::Button::PageForward) || powerTurn ||
-                                             input.wasReleased(nextButton)));
-  return {prev, next, tiltPrev || tiltNext};
+  // Only treat wasReleased as a page turn when the button's short-press action is default.
+  // Non-default short-press actions are dispatched by the global dispatcher in main.cpp;
+  // counting wasReleased as well would double-fire the action.
+  // Also suppress immediate page-turns if a double-click action is configured for the button,
+  // because the button event system delays short events until the double-click window expires.
+  using BA = CrossPointSettings::BUTTON_ACTION;
+  using TA = CrossPointSettings::TILT_GESTURE_ACTION;
+  const bool tiltNegative = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedForward();
+  const bool tiltPositive = SETTINGS.tiltPageTurn && halTiltSensor.wasTiltedBack();
+  bool tiltPrev = false;
+  bool tiltNext = false;
+  auto applyTiltAction = [&](uint8_t action) {
+    if (action == TA::TILT_ACT_NEXT_PAGE) {
+      tiltNext = true;
+    } else if (action == TA::TILT_ACT_PREV_PAGE) {
+      tiltPrev = true;
+    }
+  };
+  if (tiltPositive) {
+    applyTiltAction(SETTINGS.tiltPositiveAction);
+  }
+  if (tiltNegative) {
+    applyTiltAction(SETTINGS.tiltNegativeAction);
+  }
+  const bool prevButtonReleased = (SETTINGS.btnShortPageBack == BA::BTN_DEFAULT &&
+                                   !globalButtonEvents().hasDoubleAction(MappedInputManager::Button::PageBack) &&
+                                   !globalButtonEvents().wasLongPressDispatched(MappedInputManager::Button::PageBack) &&
+                                   input.wasReleased(MappedInputManager::Button::PageBack)) ||
+                                  (SETTINGS.btnShortLeft == BA::BTN_DEFAULT &&
+                                   !globalButtonEvents().hasDoubleAction(MappedInputManager::Button::Left) &&
+                                   !globalButtonEvents().wasLongPressDispatched(MappedInputManager::Button::Left) &&
+                                   input.wasReleased(MappedInputManager::Button::Left));
+  const bool nextButtonReleased =
+      (SETTINGS.btnShortPageForward == BA::BTN_DEFAULT &&
+       !globalButtonEvents().hasDoubleAction(MappedInputManager::Button::PageForward) &&
+       !globalButtonEvents().wasLongPressDispatched(MappedInputManager::Button::PageForward) &&
+       input.wasReleased(MappedInputManager::Button::PageForward)) ||
+      (SETTINGS.btnShortRight == BA::BTN_DEFAULT &&
+       !globalButtonEvents().hasDoubleAction(MappedInputManager::Button::Right) &&
+       !globalButtonEvents().wasLongPressDispatched(MappedInputManager::Button::Right) &&
+       input.wasReleased(MappedInputManager::Button::Right));
+
+  const bool prev = tiltPrev || prevButtonReleased;
+  const bool next = tiltNext || nextButtonReleased;
+  return {prev, next};
 }
 
 inline void displayWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntilFullRefresh) {
+  const int freq = SETTINGS.getRefreshFrequency();
+  if (freq == 0) {
+    renderer.displayBuffer();
+    return;
+  }
   if (pagesUntilFullRefresh <= 1) {
+    LOG_DBG("RCY", "displayWithRefreshCycle: HALF (counter=%d freq=%d)", pagesUntilFullRefresh, freq);
     renderer.displayBuffer(HalDisplay::HALF_REFRESH);
-    pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();
+    pagesUntilFullRefresh = freq;
   } else {
+    LOG_DBG("RCY", "displayWithRefreshCycle: fast (counter=%d freq=%d)", pagesUntilFullRefresh, freq);
     renderer.displayBuffer();
     pagesUntilFullRefresh--;
   }
 }
 
-// Grayscale anti-aliasing pass. Renders content twice (LSB + MSB) to build
-// the grayscale buffer. Only the content callback is re-rendered — status bars
-// and other overlays should be drawn before calling this.
-// Kept as a template to avoid std::function overhead; instantiated once per reader type.
-template <typename RenderFn>
-void renderAntiAliased(GfxRenderer& renderer, RenderFn&& renderFn) {
-  if (!renderer.storeBwBuffer()) {
-    LOG_ERR("READER", "Failed to store BW buffer for anti-aliasing");
-    return;
+// Resolve the refresh-cycle mode for the next page and advance the counter.
+// Split out of triggerWithRefreshCycle() so callers that fire the refresh
+// through a different mechanism (e.g. triggerDisplayAsync for the inline AA
+// path) share the exact same cycle policy and logging.
+inline HalDisplay::RefreshMode nextRefreshCycleMode(int& pagesUntilFullRefresh) {
+  const int freq = SETTINGS.getRefreshFrequency();
+  if (freq == 0) {
+    return HalDisplay::FAST_REFRESH;
   }
+  if (pagesUntilFullRefresh <= 1) {
+    LOG_DBG("RCY", "triggerWithRefreshCycle: HALF (counter=%d freq=%d)", pagesUntilFullRefresh, freq);
+    pagesUntilFullRefresh = freq;
+    return HalDisplay::HALF_REFRESH;
+  }
+  LOG_DBG("RCY", "triggerWithRefreshCycle: fast (counter=%d freq=%d)", pagesUntilFullRefresh, freq);
+  pagesUntilFullRefresh--;
+  return HalDisplay::FAST_REFRESH;
+}
 
-  renderer.clearScreen(0x00);
-  renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
-  renderFn();
-  renderer.copyGrayscaleLsbBuffers();
+// Non-blocking variant: trigger the display refresh and return immediately.
+// completeDisplay() must be called later (on the same task) to wait for the
+// waveform and do post-refresh SPI work.
+inline void triggerWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntilFullRefresh) {
+  renderer.triggerDisplay(nextRefreshCycleMode(pagesUntilFullRefresh));
+}
 
-  renderer.clearScreen(0x00);
-  renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
-  renderFn();
-  renderer.copyGrayscaleMsbBuffers();
-
-  renderer.displayGrayBuffer();
-  renderer.setRenderMode(GfxRenderer::BW);
-
-  renderer.restoreBwBuffer();
+inline void enforceExitFullRefresh(const GfxRenderer& renderer) {
+  // Reader exits can leave visible ghosting when the next screen is rendered with a fast LUT.
+  // Schedule the next displayed screen to use a half refresh, rather than refreshing
+  // the current reader screen as it closes.
+  renderer.setNextDisplayRefreshMode(HalDisplay::HALF_REFRESH);
 }
 
 }  // namespace ReaderUtils

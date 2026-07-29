@@ -9,9 +9,7 @@
 
 #include <Xtc.h>
 
-#include <string>
-#include <utility>
-
+#include "ReaderUtils.h"
 #include "activities/Activity.h"
 
 class XtcReaderActivity final : public Activity {
@@ -19,17 +17,9 @@ class XtcReaderActivity final : public Activity {
 
   uint32_t currentPage = 0;
   int pagesUntilFullRefresh = 0;
-
-  enum class StatusBarOverlayPosition { Bottom, Top };
-  struct StatusBarInfo {
-    int currentPage;
-    int pageCount;
-    std::string title;
-  };
+  ReaderUtils::InputDrainGuard inputDrainGuard;
 
   void renderPage();
-  void renderStatusBarOverlay(StatusBarOverlayPosition position) const;
-  StatusBarInfo getStatusBarInfo() const;
   void saveProgress() const;
   void loadProgress();
 
@@ -41,6 +31,10 @@ class XtcReaderActivity final : public Activity {
   void loop() override;
   void render(RenderLock&&) override;
   bool isReaderActivity() const override { return true; }
-  ScreenshotInfo getScreenshotInfo() const override;
-  void onOrientationChanged(uint8_t orientation) override;
+  void onButtonAction(CrossPointSettings::BUTTON_ACTION action) override;
+
+  // Renders the last saved page to the frame buffer without flushing to display.
+  // Used by SleepActivity to prepare the background for the overlay sleep mode.
+  // Returns false if the page cannot be loaded (missing cache / file error).
+  static bool drawCurrentPageToBuffer(const std::string& filePath, GfxRenderer& renderer);
 };
