@@ -48,6 +48,9 @@
 #include "KOReaderCredentialStore.h"
 #include "KOReaderDocumentId.h"
 #include "MappedInputManager.h"
+#ifdef READ_IT_LATER_ENABLED
+#include "ProgressSync.h"
+#endif
 #include "QrDisplayActivity.h"
 #include "QuickOverridesActivity.h"
 #include "ReaderActivity.h"
@@ -466,6 +469,18 @@ void EpubReaderActivity::onExit() {
   // controller's retained RED RAM instead of its host baseline (ghosting). No-op on X3.
   renderer.setSingleBufferFastDiff(false);
   UITheme::getInstance().getMutableTheme().onBookWillClose(epub ? epub->getPath() : "", epub.get(), nullptr, nullptr);
+#ifdef READ_IT_LATER_ENABLED
+  // Push final read-progress back to the Read-it-Later provider when closing
+  // a synthesized article EPUB. Best-effort: silently skipped if WiFi is down
+  // or the file is not owned by any provider. Must run BEFORE `epub.reset()`.
+  if (epub && section) {
+    const int pageCount = section->pageCount;
+    const float chapterProgress =
+        (pageCount > 0) ? (static_cast<float>(section->currentPage + 1) / static_cast<float>(pageCount)) : 0.0f;
+    const float bookProgress = epub->calculateProgress(currentSpineIndex, chapterProgress);
+    ProgressSync::pushForPath(epub->getPath(), bookProgress);
+  }
+#endif
   epub.reset();
   currentPageFootnotes.clear();
   currentPageFootnotes.shrink_to_fit();
